@@ -1,0 +1,84 @@
+[project]
+name = "cipher-pipeline"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "thomasotoole222", email = "thomasotoole222@gmail.com" }
+]
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "google-api-python-client>=2.201.0",
+    "google-auth>=2.59.1",
+    "httpx>=0.28.1",
+    "opentelemetry-api>=1.45.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.0",
+    "opentelemetry-instrumentation-httpx>=0.66b0",
+    "opentelemetry-instrumentation-psycopg>=0.66b0",
+    "opentelemetry-sdk>=1.45.0",
+    "polars>=1.44.2",
+    "psycopg[binary,pool]>=3.3.6",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+]
+
+[project.scripts]
+cipher-pipeline = "cipher_pipeline.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "DTZ", "S", "ASYNC", "RUF"]
+extend-select = [
+    "D",      # pydocstyle: docstring presence and formatting
+    "ERA",    # eradicate: flags commented-out code
+    "TD",     # flake8-todos: enforces TODO format
+    "FIX",    # flake8-fixme: flags TODO/FIXME/HACK left in code
+    "PGH004", # bans blanket "# noqa" without a rule code
+    "RUF100", # flags "# noqa" comments that no longer suppress anything
+    "I",      # isort: import grouping and order
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]   # assert is how pytest tests
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["integration: needs a Postgres container"]
+
+[tool.importlinter]
+root_package = "cipher_pipeline"
+
+[[tool.importlinter.contracts]]
+name = "Pipeline layers"
+type = "layers"
+layers = [
+    "cipher_pipeline.worker",
+    "cipher_pipeline.jobs",
+    "cipher_pipeline.stages | cipher_pipeline.writers | cipher_pipeline.rules",
+    "cipher_pipeline.sources",
+    "cipher_pipeline.db | cipher_pipeline.archive",
+]
+
+[dependency-groups]
+dev = [
+    "import-linter>=2.15",
+    "mypy>=2.4.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "respx>=0.23.1",
+    "ruff>=0.16.10",
+    "testcontainers[postgres]>=4.15.0",
+]
