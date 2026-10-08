@@ -36,6 +36,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import sys
 import threading
 import time
 import traceback
@@ -64,9 +65,12 @@ from opentelemetry.trace import Status, StatusCode, Tracer
 # LOCAL
 from cipher_pipeline._wrapping import around
 
+#: Deployment environment names.
 type Env = Literal["local", "staging", "production"]
+#: The bound task's ``hub.*`` fields.
 type TaskAttributes = Mapping[str, str | int]
 
+#: The bound task's fields; unset outside a task.
 _task: ContextVar[TaskAttributes] = ContextVar("cipher_task")
 
 
@@ -82,7 +86,8 @@ class Instruments:
         source_requests: ``pipeline.source.requests``, every HTTP request made to a source
             API, with ``source``, ``status`` and ``result`` attributes.
         log_dropped: ``pipeline.log.dropped``, every log record not delivered to the
-            collector (failed POST, conversion error, backlog shed or shutdown). No attributes.
+            collector, with a ``reason`` attribute: ``convert``, ``post_error``, ``http_status``,
+            ``rejected``, ``shed``, ``shutdown`` or ``error``.
 
     """
 
@@ -168,8 +173,10 @@ def traced[F: Callable[..., Any]](name: str, **attrs: str) -> Callable[[F], F]:
     are read when the span starts; outside ``bind_task`` the span has only ``attrs``.
 
     If the function raises an ``Exception``, the span records it, gets ``ERROR``
-    status with the exception message, and gets a ``hub.error_class`` attribute
-    taken from the exception's ``error_class`` (or ``"Unexpected"`` if it has none).
+    status with its error class, and gets a ``hub.error_class`` attribute taken from
+    the exception's ``error_class`` (or ``"Unexpected"`` if it has none). The full
+    message stays in the exception event. Any other ``BaseException`` (for example
+    ``CancelledError``) gives ``ERROR`` status with the class name and is not recorded.
     The exception is then re-raised.
 
     Preconditions:
@@ -187,21 +194,13 @@ def traced[F: Callable[..., Any]](name: str, **attrs: str) -> Callable[[F], F]:
             or async generator function.
         RuntimeError: At call time, from ``around``, if the span context manager swallows an
             exception. ``span`` always re-raises, so this should not occur.
-        Exception: At call time, whatever the wrapped function raises, re-raised unchanged.
-
-    Review notes:
-        TODO(review): ``BaseException`` subclasses are not caught. Because OTel's own
-            exception handling is disabled, the span ends with ``UNSET`` status.
-            Cancelled async tasks (``CancelledError``) will look like successes.
-        TODO(review): ``str(exc)`` is written to the span status. If exception messages
-            can contain row data or customer details, they will reach the tracing backend.
-        TODO(review): ``fn``, ``args`` and ``kwargs`` in the inner ``span`` are unused.
-            Prefix them with ``_`` if ``around`` requires that signature.
+        BaseException: At call time, whatever the wrapped function raises (including
+            ``CancelledError`` and ``KeyboardInterrupt``), re-raised unchanged.
 
     """
 
     @contextmanager
-    def span(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> Iterator[None]:
+    def span(_fn: Callable[..., Any], _args: tuple[Any, ...], _kwargs: dict[str, Any]) -> Iterator[None]:
         """Run one call of the wrapped function inside a span. Used by ``around``.
 
         See ``traced`` for the span's attributes and exception handling.
@@ -210,20 +209,19 @@ def traced[F: Callable[..., Any]](name: str, **attrs: str) -> Callable[[F], F]:
             Called only by ``around``, once per call of the wrapped function.
 
         Args:
-            fn: The wrapped function. Unused.
-            args: Positional arguments of the call. Unused.
-            kwargs: Keyword arguments of the call. Unused.
+            _fn: The wrapped function. Unused; ``around`` passes it positionally.
+            _args: Positional arguments of the call. Unused.
+            _kwargs: Keyword arguments of the call. Unused.
 
         Yields:
             None.
 
         Raises:
             Exception: Whatever the wrapped call raised, re-raised unchanged after it is recorded
-                on the span. ``BaseException`` subclasses pass through without being recorded.
-
-        Review notes:
-            TODO(review): ``fn``, ``args`` and ``kwargs`` are unused. Prefix them with
-                ``_`` if ``around`` requires this signature.
+                on the span.
+            BaseException: Any other ``BaseException`` (for example ``CancelledError`` or
+                ``KeyboardInterrupt``), re-raised unchanged after the span gets ``ERROR``
+                status with the class name. It is not recorded and gets no ``hub.error_class``.
 
         """
         tracer = trace.get_tracer("cipher_pipeline")
@@ -239,8 +237,11 @@ def traced[F: Callable[..., Any]](name: str, **attrs: str) -> Callable[[F], F]:
                 named = getattr(exc, "error_class", None)
                 error_class = named if isinstance(named, str) else "Unexpected"
                 active.record_exception(exc)
-                active.set_status(Status(StatusCode.ERROR, str(exc)))
+                active.set_status(Status(StatusCode.ERROR, error_class))
                 active.set_attribute("hub.error_class", error_class)
+                raise
+            except BaseException as exc:
+                active.set_status(Status(StatusCode.ERROR, type(exc).__name__))
                 raise
 
     return around(span)
@@ -300,13 +301,11 @@ class JsonFormatter(logging.Formatter):
         trace_id, span_id: Present only when set by ``ContextFilter`` and non-empty.
         hub.*: The task fields from ``record.cipher_task``, flattened into the top level.
         exc: Formatted traceback, present only when the record has exception info.
+        stack: The record's ``stack_info``, present only when it was logged with
+            ``stack_info=True``.
 
     Use with ``ContextFilter`` on the same handler, or the trace and task keys
     will be missing.
-
-    Review notes:
-        TODO(review): ``stack_info`` is dropped, so ``logger.info(..., stack_info=True)``
-            loses its stack.
     """
 
     def format(self, record: logging.LogRecord) -> str:
@@ -343,6 +342,8 @@ class JsonFormatter(logging.Formatter):
             line["exc"] = self.formatException(record.exc_info)
         elif record.exc_text:
             line["exc"] = record.exc_text
+        if record.stack_info:
+            line["stack"] = record.stack_info
         return json.dumps(line, default=str)
 
 #: Maps Python log levels to OpenTelemetry severity numbers and text.
@@ -350,9 +351,6 @@ class JsonFormatter(logging.Formatter):
 #: ordered highest first. A record takes the first row whose level it meets or
 #: exceeds, and always gets the base number of that OTel range (for example
 #: ERROR is always 17, never 18 to 20).
-#:
-#: TODO(review): Replace the original "WRAP AROUND" comment. It does not say
-#:     what the risk is. Confirm against the lookup code.
 _SEVERITY = (
     (logging.CRITICAL, 21, "CRITICAL"),
     (logging.ERROR, 17, "ERROR"),
@@ -376,9 +374,11 @@ _FLUSH_TIMEOUT = 5.0
 #: records. Beyond that the oldest records are shed and counted in
 #: ``pipeline.log.dropped``.
 _BACKLOG_BATCHES = 10
+#: Longest ``exception.stacktrace`` sent, in characters; longer traces keep their end.
+_MAX_STACKTRACE = 32_768
 
 
-class OtlpLogShipper:  # Creates batches of records and POSTs them to the collector
+class OtlpLogShipper:
     """Batch log records from a queue and POST them to an OTLP/HTTP collector.
 
     ``_EagerQueueHandler`` puts records on ``queue`` with ``msg`` already formatted and any
@@ -388,17 +388,11 @@ class OtlpLogShipper:  # Creates batches of records and POSTs them to the collec
     export request. Records are grouped into one scope per logger name.
 
     Failed batches are not retried. Every record that is lost to a failed POST, a
-    conversion error, a full backlog or shutdown is added to ``dropped``.
+    conversion error, a collector rejection, a full backlog, shutdown or an unexpected
+    error is added to ``dropped``, with a ``reason`` attribute.
 
     Records logged on the shipper's own thread (for example by ``httpx``) are
     discarded to prevent a feedback loop. They are not counted as dropped.
-
-    Review notes:
-        TODO(review): No docstring existed; the trailing comment on the ``class``
-            line duplicates this one. Remove it.
-        TODO(review): A 2xx response can still report rejected records in its
-            ``partial_success`` body. This is ignored, so those records are lost
-            without being counted.
     """
 
     def __init__(
@@ -498,16 +492,11 @@ class OtlpLogShipper:  # Creates batches of records and POSTs them to the collec
             already detached, so nothing new is enqueued.
 
         Returns:
-            None. If ``join`` times out it returns with the thread still running, and
-            nothing reports that.
+            None. If ``join`` times out it returns with the thread still running, after
+            logging a WARNING through this module's logger.
 
         Raises:
             Nothing.
-
-        Review notes:
-            TODO(review): If ``join`` times out, the thread keeps running and this
-                returns anyway. Nothing tells the caller that shutdown was
-                incomplete.
 
         """
         thread = self._thread
@@ -518,6 +507,10 @@ class OtlpLogShipper:  # Creates batches of records and POSTs them to the collec
         self._stopping.set()
         self._queue.put(_WAKE)
         thread.join(timeout=_FLUSH_TIMEOUT)
+        if thread.is_alive():
+            logging.getLogger(__name__).warning(
+                "log shipper did not stop within %.1fs; records still queued are dropped", _FLUSH_TIMEOUT
+            )
 
     def _run(self, client: httpx.Client) -> None:
         """Body of the export thread. Closes ``client`` when it returns.
@@ -537,15 +530,10 @@ class OtlpLogShipper:  # Creates batches of records and POSTs them to the collec
             None.
 
         Raises:
-            Nothing to the caller: it runs on its own thread. Each pass catches ``Exception`` and
-            counts its batch as dropped. An exception from the final ``_shed(keep=0)`` or
-            ``client.close()`` would end the thread, which is already finishing, and is printed
-            by ``threading.excepthook``.
-
-        Review notes:
-            TODO(review): Unexpected exceptions are swallowed with no log or
-                metric other than ``dropped``. A bug here would look like a
-                collector outage.
+            Nothing to the caller: it runs on its own thread. Each pass catches ``Exception``,
+            writes one line naming it to stderr, and counts its batch as dropped with reason
+            ``error``. An exception from the final ``_shed`` or ``client.close()`` would end
+            the thread, which is already finishing, and is printed by ``threading.excepthook``.
 
         """
         own = threading.get_ident()
@@ -557,8 +545,9 @@ class OtlpLogShipper:  # Creates batches of records and POSTs them to the collec
                     self._ship(client, batch)
                     batch.clear()
                     self._shed()
-                except Exception:
-                    self._dropped.add(len(batch))
+                except Exception as exc:
+                    print(f"otlp-log-shipper: {type(exc).__name__}: {exc}", file=sys.stderr)
+                    self._dropped.add(len(batch), {"reason": "error"})
                     self._stopping.wait(0.1)
             while time.monotonic() < self._deadline - _POST_TIMEOUT:
                 rest: list[logging.LogRecord] = []
@@ -567,9 +556,10 @@ class OtlpLogShipper:  # Creates batches of records and POSTs them to the collec
                     if not rest:
                         break
                     self._ship(client, rest)
-                except Exception:
-                    self._dropped.add(len(rest))
-            self._shed(keep=0)
+                except Exception as exc:
+                    print(f"otlp-log-shipper: {type(exc).__name__}: {exc}", file=sys.stderr)
+                    self._dropped.add(len(rest), {"reason": "error"})
+            self._shed(keep=0, reason="shutdown")
         finally:
             client.close()
 
@@ -643,7 +633,7 @@ class OtlpLogShipper:  # Creates batches of records and POSTs them to the collec
             if record is not _WAKE and record.thread != own:
                 batch.append(record)
 
-    def _shed(self, keep: int | None = None) -> None:
+    def _shed(self, keep: int | None = None, *, reason: str = "shed") -> None:
         """Discard the oldest queued records until at most ``keep`` remain.
 
         Discarded records are counted as dropped, except ``_WAKE`` and records from
@@ -656,6 +646,7 @@ class OtlpLogShipper:  # Creates batches of records and POSTs them to the collec
         Args:
             keep: Records to keep. Defaults to ``max_batch * _BACKLOG_BATCHES``.
                 Pass 0 to discard everything at shutdown.
+            reason: ``reason`` attribute for the dropped count.
 
         Returns:
             None.
@@ -675,13 +666,15 @@ class OtlpLogShipper:  # Creates batches of records and POSTs them to the collec
             if record is not _WAKE and record.thread != own:
                 shed += 1
         if shed:
-            self._dropped.add(shed)
+            self._dropped.add(shed, {"reason": reason})
 
     def _ship(self, client: httpx.Client, batch: list[logging.LogRecord]) -> None:
         """Convert ``batch`` to OTLP and POST it in one request.
 
-        Records that fail to convert are dropped individually. If the POST raises
-        or returns a non-2xx status, every converted record is counted as dropped.
+        Records that fail to convert are dropped individually (reason ``convert``). If
+        the POST raises (``post_error``) or returns a non-2xx status (``http_status``),
+        every converted record is counted as dropped. On a 2xx response, records the
+        collector reports as rejected in ``partialSuccess`` are counted (``rejected``).
 
         Preconditions:
             Runs on the shipper thread only.
@@ -697,11 +690,6 @@ class OtlpLogShipper:  # Creates batches of records and POSTs them to the collec
             Nothing: every ``Exception`` from converting a record or from the POST is caught
             and the affected records are counted as dropped.
 
-        Review notes:
-            TODO(review): The POST failure reason (status code, exception) is
-                discarded. Recording it on the ``dropped`` counter as an attribute
-                would make outages much easier to diagnose.
-
         """
         scopes: dict[str, list[dict[str, Any]]] = {}
         built = 0
@@ -710,16 +698,47 @@ class OtlpLogShipper:  # Creates batches of records and POSTs them to the collec
                 scopes.setdefault(record.name, []).append(_log_record(record))
                 built += 1
             except Exception:
-                self._dropped.add(1)
+                self._dropped.add(1, {"reason": "convert"})
         if not built:
             return
         try:
             response = client.post(self._url, json=_export_request(self._resource, scopes))
         except Exception:
-            self._dropped.add(built)
+            self._dropped.add(built, {"reason": "post_error"})
         else:
             if not response.is_success:
-                self._dropped.add(built)
+                self._dropped.add(built, {"reason": "http_status"})
+            else:
+                rejected = _rejected_count(response)
+                if rejected:
+                    self._dropped.add(rejected, {"reason": "rejected"})
+
+
+def _rejected_count(response: httpx.Response) -> int:
+    """Return how many log records the collector rejected in a 2xx export response.
+
+    Reads ``partialSuccess.rejectedLogRecords`` from the OTLP/JSON response body. The
+    count may be a string, as OTLP/JSON encodes int64 values that way.
+
+    Preconditions:
+        ``response`` is a 2xx response to an OTLP/HTTP logs export, with its body read.
+
+    Args:
+        response: The collector's response.
+
+    Returns:
+        The rejected count, or 0 when the body is empty, not JSON, not an object, has no
+        ``partialSuccess`` or no ``rejectedLogRecords``, or the count is not an integer.
+
+    Raises:
+        Nothing: every ``Exception`` while parsing is caught and treated as 0.
+
+    """
+    try:
+        partial = response.json().get("partialSuccess") or {}
+        return int(partial.get("rejectedLogRecords") or 0)
+    except Exception:  # empty or non-JSON body: nothing rejected
+        return 0
 
 
 def _export_request(resource: list[dict[str, Any]], scopes: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -766,8 +785,9 @@ def _log_record(record: logging.LogRecord) -> dict[str, Any]:
         traceId, spanId: Copied from the record when both were set by
             ``ContextFilter``.
         attributes: The ``cipher_task`` fields merged with ``otel_exception``, with
-            exception fields taking precedence on a key collision. Omitted when
-            both are empty.
+            exception fields taking precedence on a key collision, plus
+            ``code.stacktrace`` from ``record.stack_info`` when it is set. Omitted when
+            all are empty.
 
     Preconditions:
         ``record`` was prepared by ``_EagerQueueHandler``.
@@ -803,6 +823,8 @@ def _log_record(record: logging.LogRecord) -> dict[str, Any]:
         **(task if isinstance(task, Mapping) else {}),
         **(exception if isinstance(exception, Mapping) else {}),
     }
+    if isinstance(record.stack_info, str):
+        attributes["code.stacktrace"] = record.stack_info
     if attributes:
         out["attributes"] = _attributes(attributes)
     return out
@@ -816,8 +838,10 @@ def _exception_attributes(record: logging.LogRecord) -> dict[str, str]:
             built-in exceptions (for example ``ValueError`` but
             ``httpx.ConnectError``).
         exception.message: ``str(exc)``, or ``<unprintable {type}>`` if that raises.
-        exception.stacktrace: The full formatted traceback, including chained
-            exceptions.
+        exception.stacktrace: The formatted traceback, including chained exceptions.
+            A trace longer than ``_MAX_STACKTRACE`` characters keeps its last
+            ``_MAX_STACKTRACE`` characters (the most recent frames and the exception
+            line) after a ``[truncated N chars]`` line.
 
     Called by ``_EagerQueueHandler.prepare`` on the original record, on the logging thread,
     before ``exc_info`` is cleared on the queued copy.
@@ -835,12 +859,6 @@ def _exception_attributes(record: logging.LogRecord) -> dict[str, str]:
         Nothing: ``str(exc)`` is guarded, and ``traceback.format_exception`` reports an
         unprintable exception instead of raising.
 
-    Review notes:
-        TODO(review): The stack trace is not truncated. A deep recursion error or
-            long exception chain can produce a very large attribute, and some
-            collectors reject records or requests over a size limit, which drops
-            the whole batch.
-
     """
     exc = record.exc_info[1] if record.exc_info else None
     if exc is None:
@@ -851,10 +869,13 @@ def _exception_attributes(record: logging.LogRecord) -> dict[str, str]:
         message = str(exc)
     except Exception:
         message = f"<unprintable {name}>"
+    stack = "".join(traceback.format_exception(exc))
+    if len(stack) > _MAX_STACKTRACE:
+        stack = f"[truncated {len(stack) - _MAX_STACKTRACE} chars]\n" + stack[-_MAX_STACKTRACE:]
     return {
         "exception.type": name,
         "exception.message": message,
-        "exception.stacktrace": "".join(traceback.format_exception(exc)),
+        "exception.stacktrace": stack,
     }
 
 
@@ -933,23 +954,18 @@ class Telemetry:
         stderr_handler: Root logger handler that writes JSON lines to stderr. ``configure``
             always attaches it.
 
-    Review notes:
-        TODO(review): The trailing comment on ``log_shipper`` says what it is "for"
-            dev environments, when it means it is ``None`` there. Remove it; the
-            attribute docs above cover it.
-
     """
 
     tracer: Tracer
     instruments: Instruments
     tracer_provider: TracerProvider
     meter_provider: MeterProvider
-    log_shipper: OtlpLogShipper | None  # for dev envs where there is no collector
+    log_shipper: OtlpLogShipper | None
     queue_handler: logging.Handler | None = None
     stderr_handler: logging.Handler | None = None
     _once: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
-    def shutdown(self) -> None:  # flushes the spanned metrics and queued logs
+    def shutdown(self) -> None:
         """Flush and shut down all telemetry. Only the first call has any effect.
 
         In order:
@@ -983,10 +999,6 @@ class Telemetry:
                 to ``_FLUSH_TIMEOUT``, but provider shutdown uses the exporters'
                 own timeouts, which default to 30 seconds or more each. Container
                 stop grace periods are often 10 to 30 seconds.
-            TODO(review): The trailing comment on the ``def`` line says it
-                "flushes the spanned metrics", which isn't accurate: it flushes
-                spans and metrics separately, and also detaches handlers and
-                removes instrumentation. Remove it.
 
         """
         if not self._once.acquire(blocking=False):
@@ -1030,13 +1042,6 @@ def _attempt(step: str, action: Callable[[], object]) -> None:
         step 1 it goes to the shipper, after it to stderr, and after step 6 to
         ``logging.lastResort`` at ERROR level.
 
-    Review notes:
-        TODO(review): Return values are ignored, and several steps report failure
-            without raising: ``OtlpLogShipper.stop`` returns normally when its
-            ``join`` times out, and provider shutdowns log export failures rather
-            than raising. Those failures never reach this log message. Have
-            ``stop`` return a success flag and log here when it is ``False``.
-
     """
     try:
         action()
@@ -1061,7 +1066,8 @@ class _EagerQueueHandler(logging.handlers.QueueHandler):
         """Return a copy of ``record`` ready to cross to the shipper thread.
 
         The copy has:
-            msg: The formatted message, or ``str(record.msg)`` if formatting fails.
+            msg: The formatted message. If formatting fails, ``"{msg} (args: {args!r})"``,
+                or ``str(record.msg)`` if that fails too.
             args: ``None``.
             otel_exception: Exception attributes from ``_exception_attributes``,
                 or an empty dict.
@@ -1084,20 +1090,15 @@ class _EagerQueueHandler(logging.handlers.QueueHandler):
         Raises:
             Nothing: formatting is guarded, and ``_exception_attributes`` does not raise.
 
-        Review notes:
-            TODO(review): If formatting fails, the raw template is sent and the
-                arguments are lost, with no sign that anything went wrong. The
-                stock handler would print a "Logging error" report. Consider
-                appending ``repr(record.args)`` to the fallback message.
-            TODO(review): ``stack_info`` is copied but ``_log_record`` never
-                reads it, so ``stack_info=True`` is lost in export.
-
         """
         out = copy.copy(record)
         try:
             out.msg = record.getMessage()
         except Exception:
-            out.msg = str(record.msg)
+            try:
+                out.msg = f"{record.msg} (args: {record.args!r})"
+            except Exception:
+                out.msg = str(record.msg)
         out.args = None
         out.otel_exception = _exception_attributes(record)
         out.exc_info = None
@@ -1105,7 +1106,9 @@ class _EagerQueueHandler(logging.handlers.QueueHandler):
         return out
 
 
+#: Serialises ``configure``.
 _lock = threading.Lock()
+#: The configured ``Telemetry``; set once.
 _active: Telemetry | None = None
 
 
@@ -1125,7 +1128,7 @@ def configure(*, env: Env, worker_id: str, log_level: str) -> Telemetry:
     Resource attributes:
         service.name: ``OTEL_SERVICE_NAME``, or ``pipeline-worker``.
         service.version: ``RAILWAY_GIT_COMMIT_SHA``, or ``dev``.
-        deployment.environment: ``env``.
+        deployment.environment.name: ``env``.
         service.instance.id: ``worker_id``. Must be unique per running worker.
 
     The root logger is set to ``log_level``. The ``httpx`` and ``httpcore`` loggers
@@ -1156,13 +1159,6 @@ def configure(*, env: Env, worker_id: str, log_level: str) -> Telemetry:
             expected to raise: malformed ``OTEL_*`` values are logged and replaced by their
             defaults (checked 2026-10-08).
 
-    Review notes:
-        TODO(review): ``deployment.environment`` is deprecated in current OTel
-            semantic conventions in favour of ``deployment.environment.name``.
-            Some backends only recognise one of them.
-        TODO(review): The counters have no ``unit``. OTel convention would be
-            ``{row}``, ``{request}`` and ``{record}``.
-
     """
     global _active
     with _lock:
@@ -1178,7 +1174,7 @@ def configure(*, env: Env, worker_id: str, log_level: str) -> Telemetry:
             {
                 "service.name": os.environ.get("OTEL_SERVICE_NAME") or "pipeline-worker",
                 "service.version": os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "dev",
-                "deployment.environment": env,
+                "deployment.environment.name": env,
                 "service.instance.id": worker_id,
             }
         )
@@ -1194,9 +1190,9 @@ def configure(*, env: Env, worker_id: str, log_level: str) -> Telemetry:
         meter = meter_provider.get_meter("cipher_pipeline")
         instruments = Instruments(
             task_duration=meter.create_histogram("pipeline.task.duration", unit="s"),
-            rows=meter.create_counter("pipeline.rows"),
-            source_requests=meter.create_counter("pipeline.source.requests"),
-            log_dropped=meter.create_counter("pipeline.log.dropped"),
+            rows=meter.create_counter("pipeline.rows", unit="{row}"),
+            source_requests=meter.create_counter("pipeline.source.requests", unit="{request}"),
+            log_dropped=meter.create_counter("pipeline.log.dropped", unit="{record}"),
         )
         shipper = OtlpLogShipper(endpoint, resource, instruments.log_dropped) if endpoint else None
         queue_handler: logging.Handler | None = None
