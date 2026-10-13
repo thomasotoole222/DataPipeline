@@ -24,9 +24,9 @@ configured, to the collector through ``OtlpLogShipper``. The shipper is a small
 custom OTLP/HTTP exporter that runs on its own thread, never retries, and counts
 every record it fails to deliver in ``pipeline.log.dropped``.
 
-Review notes:
-    TODO(review): Shutdown timing is not bounded end to end. See
-        ``OtlpLogShipper.stop`` and ``Telemetry.shutdown``.
+``Telemetry.shutdown`` finishes within ``_SHUTDOWN_BUDGET`` (10) seconds, even when
+the collector hangs, leaving most of Railway's 30-second stop grace period for the
+rest of the worker.
 """
 
 # STANDARD
@@ -98,9 +98,7 @@ class Instruments:
 
 
 @contextmanager
-def bind_task(
-    *, task_id: str, run_id: str, attempt: int, job: str, shop_id: str, partition: str
-) -> Iterator[None]:
+def bind_task(*, task_id: str, run_id: str, attempt: int, job: str, shop_id: str, partition: str) -> Iterator[None]:
     """Bind a task's ``hub.*`` fields to the current context for the duration of a ``with`` block.
 
     The fields are stored in the ``_task`` context variable. ``ContextFilter`` copies them
@@ -346,6 +344,7 @@ class JsonFormatter(logging.Formatter):
             line["stack"] = record.stack_info
         return json.dumps(line, default=str)
 
+
 #: Maps Python log levels to OpenTelemetry severity numbers and text.
 #: Each row is ``(minimum Python level, OTel SeverityNumber, severity text)``,
 #: ordered highest first. A record takes the first row whose level it meets or
@@ -367,9 +366,14 @@ _WAKE = logging.makeLogRecord({})
 #: httpx timeout in seconds for each phase (connect, write, read, pool) of one export
 #: POST. A slow POST can take longer than this in total.
 _POST_TIMEOUT = 3.0
-#: Seconds ``stop()`` waits for queued records to be sent. Records still queued at the
-#: deadline are discarded and counted in ``pipeline.log.dropped``.
-_FLUSH_TIMEOUT = 5.0
+#: Seconds ``Telemetry.shutdown`` allows for stopping the log shipper.
+_SHIPPER_SHARE = 4.0
+#: Seconds ``Telemetry.shutdown`` allows for shutting down the tracer provider.
+_SPANS_SHARE = 3.0
+#: Seconds ``Telemetry.shutdown`` allows for shutting down the meter provider.
+_METRICS_SHARE = 3.0
+#: Seconds ``Telemetry.shutdown`` allows in total (10.0).
+_SHUTDOWN_BUDGET = _SHIPPER_SHARE + _SPANS_SHARE + _METRICS_SHARE
 #: Backlog limit in batches: the queue holds at most ``max_batch * _BACKLOG_BATCHES``
 #: records. Beyond that the oldest records are shed and counted in
 #: ``pipeline.log.dropped``.
@@ -481,15 +485,19 @@ class OtlpLogShipper:
             raise
         self._thread = thread
 
-    def stop(self) -> None:
+    def stop(self, timeout: float) -> None:
         """Export queued records, then stop the background thread.
 
-        Waits up to ``_FLUSH_TIMEOUT`` seconds. Records still queued when time runs
-        out are discarded and counted as dropped. Does nothing if not started.
+        Waits up to ``timeout`` seconds. Records still queued when time runs out are
+        discarded and counted as dropped. Does nothing if not started.
 
         Preconditions:
             Called from one thread, not concurrently with ``start``. The queue handler is
-            already detached, so nothing new is enqueued.
+            already detached, so nothing new is enqueued. ``timeout`` is at least 0.
+
+        Args:
+            timeout: Seconds to wait for queued records to be sent and the thread to
+                finish. ``Telemetry.shutdown`` passes at most ``_SHIPPER_SHARE``.
 
         Returns:
             None. If ``join`` times out it returns with the thread still running, after
@@ -503,13 +511,13 @@ class OtlpLogShipper:
         if thread is None:
             return
         self._thread = None
-        self._deadline = time.monotonic() + _FLUSH_TIMEOUT
+        self._deadline = time.monotonic() + timeout
         self._stopping.set()
         self._queue.put(_WAKE)
-        thread.join(timeout=_FLUSH_TIMEOUT)
+        thread.join(timeout=timeout)
         if thread.is_alive():
             logging.getLogger(__name__).warning(
-                "log shipper did not stop within %.1fs; records still queued are dropped", _FLUSH_TIMEOUT
+                "log shipper did not stop within %.1fs; records still queued are dropped", timeout
             )
 
     def _run(self, client: httpx.Client) -> None:
@@ -966,18 +974,26 @@ class Telemetry:
     _once: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
     def shutdown(self) -> None:
-        """Flush and shut down all telemetry. Only the first call has any effect.
+        """Flush and shut down all telemetry within ``_SHUTDOWN_BUDGET`` seconds. Only the first call has any effect.
 
         In order:
             1. Detach ``queue_handler`` from the root logger, so no new records
                reach the shipper.
-            2. Stop ``log_shipper``, exporting queued records (see
-               ``OtlpLogShipper.stop`` for the time limit).
+            2. Stop ``log_shipper``, exporting queued records, allowing at most
+               ``_SHIPPER_SHARE`` seconds.
             3. Remove the ``httpx`` and ``psycopg`` instrumentation process-wide.
-            4. Shut down the tracer provider, exporting pending spans.
+            4. Shut down the tracer provider, exporting pending spans, allowing at
+               most ``_SPANS_SHARE`` seconds.
             5. Shut down the meter provider, exporting final metric values,
-               including drops counted while stopping the shipper.
+               including drops counted while stopping the shipper, allowing at most
+               ``_METRICS_SHARE`` seconds.
             6. Detach ``stderr_handler``.
+
+        All steps share one deadline, ``_SHUTDOWN_BUDGET`` seconds after the call
+        starts. Each slow step gets the smaller of its share and the time left, so
+        time a step does not use is not passed on to later steps. A provider
+        shutdown that overruns is abandoned on a daemon thread and may still be
+        running when this returns.
 
         Each step runs through ``_attempt``, so a failure in one does not stop the
         rest. Logs produced during steps 2 to 5 go to stderr only.
@@ -993,48 +1009,72 @@ class Telemetry:
             continues.
             BaseException: For example ``KeyboardInterrupt``, propagates from the step it
                 interrupts and skips the remaining steps. Later calls do not retry them.
-
-        Review notes:
-            TODO(review): Total time is unbounded from here. The shipper waits up
-                to ``_FLUSH_TIMEOUT``, but provider shutdown uses the exporters'
-                own timeouts, which default to 30 seconds or more each. Container
-                stop grace periods are often 10 to 30 seconds.
+                A ``BaseException`` raised inside a provider shutdown ends that step's
+                worker thread only and does not propagate.
 
         """
         if not self._once.acquire(blocking=False):
             return
+        deadline = time.monotonic() + _SHUTDOWN_BUDGET
+
+        def remaining() -> float:
+            """Return the seconds left before the shutdown deadline.
+
+            Preconditions:
+                None.
+
+            Returns:
+                Seconds until ``deadline``, or ``0.0`` once it has passed.
+
+            Raises:
+                Nothing.
+
+            """
+            return max(0.0, deadline - time.monotonic())
+
         root = logging.getLogger()
         if (queue_handler := self.queue_handler) is not None:
             _attempt("detach queue handler", lambda: root.removeHandler(queue_handler))
-        if self.log_shipper is not None:
-            _attempt("stop log shipper", self.log_shipper.stop)
+        if (shipper := self.log_shipper) is not None:
+            _attempt("stop log shipper", lambda: shipper.stop(min(_SHIPPER_SHARE, remaining())))
         _attempt("uninstrument httpx", HTTPXClientInstrumentor().uninstrument)
         _attempt("uninstrument psycopg", PsycopgInstrumentor().uninstrument)
-        _attempt("shut down tracer provider", self.tracer_provider.shutdown)
-        _attempt("shut down meter provider", self.meter_provider.shutdown)
+        _attempt("shut down tracer provider", self.tracer_provider.shutdown, timeout=min(_SPANS_SHARE, remaining()))
+        _attempt("shut down meter provider", self.meter_provider.shutdown, timeout=min(_METRICS_SHARE, remaining()))
         if (stderr_handler := self.stderr_handler) is not None:
             _attempt("detach stderr handler", lambda: root.removeHandler(stderr_handler))
 
 
-def _attempt(step: str, action: Callable[[], object]) -> None:
+def _attempt(step: str, action: Callable[[], object], timeout: float | None = None) -> None:
     """Run one shutdown step, logging any exception instead of raising it.
 
     Used by ``Telemetry.shutdown`` so that one failing step does not prevent the
     rest from running. The return value of ``action`` is ignored.
 
+    With ``timeout``, ``action`` runs on a daemon thread named
+    ``"telemetry-shutdown: {step}"`` and is waited for at most ``timeout`` seconds.
+    If it has not finished by then, a WARNING is logged and the thread is
+    abandoned: it keeps running, and does not keep the process alive at exit.
+
     Preconditions:
-        None.
+        ``timeout``, if given, is at least 0.
 
     Args:
-        step: Short description used in the error message.
+        step: Short description used in the log messages and the thread name.
         action: Zero-argument callable to run.
+        timeout: Seconds to wait for ``action``, or ``None`` to run it on the
+            calling thread with no limit.
 
     Returns:
-        None.
+        None, once ``action`` has finished or, with ``timeout``, once the wait has
+        run out.
 
     Raises:
         Nothing for ``Exception``: it is caught and logged at ERROR with its traceback.
-        BaseException: Propagates from ``action``.
+        BaseException: Propagates from ``action`` when ``timeout`` is ``None``. With
+            ``timeout``, it ends the worker thread and is reported by
+            ``threading.excepthook`` instead. ``RuntimeError`` from starting the
+            thread also propagates.
 
     Notes:
         The failure is logged through ``logging``, so where it ends up depends on
@@ -1043,10 +1083,36 @@ def _attempt(step: str, action: Callable[[], object]) -> None:
         ``logging.lastResort`` at ERROR level.
 
     """
-    try:
-        action()
-    except Exception:
-        logging.getLogger(__name__).exception("telemetry shutdown: %s failed", step)
+
+    def run() -> None:
+        """Run ``action``, logging any exception instead of raising it.
+
+        Preconditions:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            Nothing for ``Exception``: it is caught and logged at ERROR with its traceback.
+            BaseException: Propagates from ``action``.
+
+        """
+        try:
+            action()
+        except Exception:
+            logging.getLogger(__name__).exception("telemetry shutdown: %s failed", step)
+
+    if timeout is None:
+        run()
+        return
+    worker = threading.Thread(target=run, name=f"telemetry-shutdown: {step}", daemon=True)
+    worker.start()
+    worker.join(timeout=timeout)
+    if worker.is_alive():
+        logging.getLogger(__name__).warning(
+            "telemetry shutdown: %s did not finish within %.1fs; abandoned", step, timeout
+        )
 
 
 class _EagerQueueHandler(logging.handlers.QueueHandler):
@@ -1123,7 +1189,9 @@ def configure(*, env: Env, worker_id: str, log_level: str) -> Telemetry:
 
     The OTLP endpoint comes from ``OTEL_EXPORTER_OTLP_ENDPOINT``. It is required
     unless ``env`` is ``"local"``. Without it, spans and metrics are created but not
-    exported, and logs go to stderr only.
+    exported, and logs go to stderr only. The span and metric exporters each allow
+    ``_POST_TIMEOUT`` seconds per export request, so that shutdown can stay within
+    ``_SHUTDOWN_BUDGET``.
 
     Resource attributes:
         service.name: ``OTEL_SERVICE_NAME``, or ``pipeline-worker``.
@@ -1178,8 +1246,8 @@ def configure(*, env: Env, worker_id: str, log_level: str) -> Telemetry:
                 "service.instance.id": worker_id,
             }
         )
-        span_exporter = OTLPSpanExporter() if endpoint else None
-        metric_exporter = OTLPMetricExporter() if endpoint else None
+        span_exporter = OTLPSpanExporter(timeout=_POST_TIMEOUT) if endpoint else None
+        metric_exporter = OTLPMetricExporter(timeout=_POST_TIMEOUT) if endpoint else None
         tracer_provider = TracerProvider(resource=resource)
         if span_exporter is not None:
             tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))

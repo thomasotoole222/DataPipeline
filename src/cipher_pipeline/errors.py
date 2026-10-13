@@ -14,6 +14,9 @@ Public API:
     retry_after_from: Return the delay requested by a ``Retry-After`` header.
     translates_errors: Return a decorator that converts source and network errors into pipeline errors.
     retries: Build a decorator that retries an async function when it raises ``TransientError``.
+    DatabaseUnavailable: A ``TransientError`` raised when the warehouse cannot be reached.
+    DatabaseConflict: A ``TransientError`` raised when the warehouse aborted a transaction because of a conflict.
+    db_errors: Context manager that converts warehouse connection and conflict errors into pipeline errors.
 
 """
 
@@ -30,6 +33,9 @@ from enum import StrEnum
 from typing import Any, ClassVar
 
 import httpx
+import psycopg
+import psycopg_pool
+from _polars_runtime_32._polars_runtime import PyInProcessQuery
 from opentelemetry import trace
 
 from cipher_pipeline._wrapping import around, reject_generators
@@ -320,8 +326,8 @@ class SourceResponseError(Exception):
     ``str(self)`` and the single item in ``self.args`` are the formatted message
     ``"{source}: {status} code={code} path={path} req={request_id}: {message}"``. ``None`` values appear as
     ``None`` in that text. Instances survive ``copy.copy``, ``copy.deepcopy`` and ``pickle`` with ``args`` and all
-    attributes intact. Subclasses that add constructor arguments must store them as instance attributes so that
-    ``__reduce__`` carries them.
+    attributes intact. A subclass that adds constructor arguments must override ``__reduce__`` to pass them back,
+    because the inherited one rebuilds the instance from this class's arguments only.
 
     Attributes:
         source (str): Name of the source that returned the error.
@@ -620,3 +626,139 @@ def retries[**P, R](
         return wrapper
 
     return decorate
+
+
+class DatabaseUnavailable(TransientError):
+    """Signal that the warehouse could not be reached or dropped the connection.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.RETRYABLE``, inherited from ``TransientError``.
+
+    """
+
+    pass
+
+
+class DatabaseConflict(TransientError):
+    """Signal that the warehouse aborted a transaction because of a serialization failure or deadlock.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.RETRYABLE``, inherited from ``TransientError``.
+
+    """
+
+    pass
+
+
+class SchemaMismatch(RuntimeError):
+    """Signal that the warehouse is older than ``REQUIRED_REVISION`` or its ``alembic_version`` cannot be read.
+
+    Raised by ``check_schema`` at start-up, before any task is claimed.
+
+    Deliberately not a ``PipelineError``: retrying cannot fix it, so ``classify`` reports it as
+    ``(Outcome.UNEXPECTED, "Unexpected")`` and it is treated as a bug.
+
+    """
+
+    pass
+
+
+class Interrupted(TransientError):
+    """Signal that a task was stopped before it finished because the worker is shutting down.
+
+    The task is reported as retryable so another run can pick it up.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.RETRYABLE``, inherited from ``TransientError``.
+
+    """
+
+    pass
+
+
+class StartupRefused(RuntimeError):
+    """Signal that the worker refused to start because a start-up check failed.
+
+    Deliberately not a ``PipelineError``: no task is running yet, so there is no outcome to report. If it does reach
+    ``classify``, it is reported as ``(Outcome.UNEXPECTED, "Unexpected")``.
+
+    """
+
+    pass
+
+
+class UnknownJob(PermanentError):
+    """Signal that a task names a job that this build does not define.
+
+    Retrying cannot fix it; only a code or configuration change can.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.FAILED``, inherited from ``PermanentError``.
+
+    """
+
+    pass
+
+
+class JobNotRunnable(PipelineError):
+    """Signal that a task names a known job that cannot be run.
+
+    No subclass outcome is assigned, so ``classify`` reports it as ``(Outcome.UNEXPECTED, "JobNotRunnable")``.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.UNEXPECTED``, inherited from ``PipelineError``.
+
+    """
+
+    pass
+
+
+#: Errors that mean the warehouse is unreachable or the connection was lost.
+_DB_UNAVAILABLE: tuple[type[Exception], ...] = (
+    psycopg.errors.ConnectionException,
+    psycopg.errors.ConnectionFailure,
+    psycopg.errors.SqlclientUnableToEstablishSqlconnection,
+    psycopg.errors.ConnectionDoesNotExist,
+    psycopg.errors.AdminShutdown,
+    psycopg.errors.CrashShutdown,
+    psycopg.errors.CannotConnectNow,
+    psycopg_pool.PoolTimeout,
+)
+#: Errors that mean the transaction lost a conflict with another transaction.
+_DB_CONFLICT: tuple[type[Exception], ...] = (psycopg.errors.SerializationFailure, psycopg.errors.DeadlockDetected)
+
+
+@contextmanager
+def db_errors() -> Iterator[None]:
+    """Convert warehouse connection and conflict errors raised inside the block into pipeline errors.
+
+    An error in ``_DB_CONFLICT`` becomes ``DatabaseConflict``. An error in ``_DB_UNAVAILABLE``, or an exception whose
+    type is exactly ``psycopg.OperationalError``, becomes ``DatabaseUnavailable``. Each replacement has the message
+    ``"warehouse: {exception type name}: {original message}"`` and the original as its ``__cause__``. Every other
+    exception, including other ``psycopg.OperationalError`` subclasses, propagates unchanged.
+
+    Preconditions:
+        None.
+
+    Args:
+        None.
+
+    Yields:
+        None, once.
+
+    Raises:
+        DatabaseConflict: When the block raises an error in ``_DB_CONFLICT``.
+        DatabaseUnavailable: When the block raises an error in ``_DB_UNAVAILABLE`` or a bare
+            ``psycopg.OperationalError``.
+
+    """
+    try:
+        yield
+    except _DB_CONFLICT as exc:
+        raise DatabaseConflict(f"warehouse: {type(exc).__name__}: {exc}") from exc
+    except _DB_UNAVAILABLE as exc:
+        raise DatabaseUnavailable(f"warehouse: {type(exc).__name__}: {exc}") from exc
+    except psycopg.OperationalError as exc:
+        if type(exc) is not psycopg.OperationalError:
+            raise
+        raise DatabaseUnavailable(f"warehouse: {type(exc).__name__}: {exc}") from exc

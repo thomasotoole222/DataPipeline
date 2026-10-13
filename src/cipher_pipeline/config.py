@@ -82,6 +82,7 @@ class Settings(BaseSettings):
         concurrency (int): Concurrency level, from 1 to 4 inclusive. Defaults to 1.
         log_level (Literal["DEBUG", "INFO", "WARNING"]): Log level name. Stored in upper case. Defaults to
             ``"INFO"``.
+        polars_threads(int): The resource allocation to polars, checked against container resources at startup
 
     """
 
@@ -101,6 +102,7 @@ class Settings(BaseSettings):
     )
     concurrency: int = Field(default=1, ge=1, le=4)
     log_level: Literal["DEBUG", "INFO", "WARNING"] = "INFO"
+    polars_threads: int = Field(default=2, ge=1)
 
     @field_validator("warehouse_url")
     @classmethod
