@@ -11,6 +11,8 @@ Public API:
     business_date: Return the calendar date of an instant as observed in a given zone.
     from_epoch: Convert a Unix timestamp in seconds to an aware UTC ``datetime``.
     to_epoch: Convert an aware ``datetime`` to whole seconds since the Unix epoch, floored.
+    MIN_SPLIT: The shortest half ``TimeFrame.halve`` produces when splitting by time, one minute.
+    TimeFrame: A non-empty, half-open span of UTC instants with the time zone that maps it to local dates.
 
 Requirements:
     Python 3.11 or later, for ``datetime.UTC``.
@@ -25,6 +27,7 @@ Example:
 
 """
 
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Final
 from zoneinfo import ZoneInfo
@@ -177,8 +180,8 @@ def from_epoch(seconds: int) -> datetime:
     """
     try:
         return datetime.fromtimestamp(seconds, UTC)
-    except (OverflowError, OSError) as exc:
-        raise ValueError(f"timestamp out of range: {seconds!r}") from exc
+    except (OverflowError, OSError) as err:
+        raise ValueError(f"timestamp out of range: {seconds!r}") from err
 
 
 def to_epoch(dt: datetime) -> int:
@@ -205,3 +208,147 @@ def to_epoch(dt: datetime) -> int:
 
     """
     return (ensure_utc(dt) - _EPOCH) // timedelta(seconds=1)
+
+
+#: The shortest half ``TimeFrame.halve`` produces when splitting by time rather than by whole days.
+MIN_SPLIT: Final = timedelta(minutes=1)
+
+
+@dataclass(frozen=True, slots=True)
+class TimeFrame:
+    """A non-empty, half-open span of UTC instants, with the time zone whose local days it is read in.
+
+    The frame covers instants ``t`` with ``start <= t < end``. Instances are immutable; both bounds are normalised to
+    ``UTC`` on construction, so frames built from the same instants in different offsets compare equal.
+
+    Attributes:
+        start: The first instant in the frame, aware, with ``tzinfo`` set to ``UTC``.
+        end: The first instant after the frame, aware, with ``tzinfo`` set to ``UTC``. Always later than ``start``.
+        zone: The time zone used to map the frame to local calendar dates, by ``dates`` and ``halve``. It does not
+            affect ``start`` or ``end``.
+
+    """
+
+    start: datetime
+    end: datetime
+    zone: ZoneInfo
+
+    def __post_init__(self) -> None:
+        """Normalise both bounds to UTC and reject an empty frame.
+
+        Runs after the dataclass ``__init__``. ``start`` and ``end`` are replaced with their ``ensure_utc`` values
+        through ``object.__setattr__``, because the dataclass is frozen. ``zone`` is stored as given and not checked.
+
+        Preconditions:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: If ``start`` is not earlier than ``end`` after conversion to UTC, or if either bound is naive.
+            TypeError: If either bound is not a ``datetime``.
+            OverflowError: If converting a bound to UTC falls outside the ``datetime`` range.
+            All but the empty-frame ``ValueError`` are raised by ``ensure_utc``.
+
+        """
+        object.__setattr__(self, "start", ensure_utc(self.start))
+        object.__setattr__(self, "end", ensure_utc(self.end))
+        if self.start >= self.end:
+            raise ValueError(f"empty time frame: {self.start.isoformat()} >= {self.end.isoformat()}")
+
+    @classmethod
+    def days(cls, first: date, end: date, zone: ZoneInfo) -> TimeFrame:
+        """Build the frame covering whole local calendar days from ``first`` up to, but not including, ``end``.
+
+        Both bounds are local midnight in ``zone``, taken from ``day_window``. ``TimeFrame.days(d, d + 1 day, zone)``
+        covers the single day ``d``.
+
+        Preconditions:
+            ``end`` is earlier than ``date.max``, because ``day_window`` also computes the following midnight.
+
+        Args:
+            first: The first local date in the frame.
+            end: The first local date after the frame. It must be later than ``first``.
+            zone: The time zone whose local midnights bound the frame. It is also stored as the frame's ``zone``.
+
+        Returns:
+            A ``TimeFrame`` from local midnight at the start of ``first`` to local midnight at the start of ``end``.
+
+        Raises:
+            ValueError: If ``end`` is not later than ``first``, raised by ``__post_init__`` as an empty frame.
+            TypeError: If ``zone`` is ``None``, or if ``first`` or ``end`` is a ``datetime``, raised by ``day_window``.
+            OverflowError: If either date is ``date.max`` or a bound falls outside the ``datetime`` range, raised by
+                ``day_window``.
+
+        """
+        return cls(day_window(first, zone)[0], day_window(end, zone)[0], zone)
+
+    @property
+    def dates(self) -> tuple[date, date] | None:
+        """Return the frame as local dates, if it is made of whole days in ``zone``.
+
+        The frame counts as whole days when both ``start`` and ``end`` are exactly local midnight in ``zone``, as
+        ``day_window`` computes it. This is the inverse of ``TimeFrame.days``.
+
+        Preconditions:
+            None.
+
+        Returns:
+            A tuple ``(first, end)`` where ``first`` is the first local date in the frame and ``end`` is the first
+            local date after it, so ``TimeFrame.days(first, end, zone)`` equals this frame. ``None`` if either bound
+            is not a local midnight.
+
+        Raises:
+            TypeError: If ``zone`` is ``None`` or not a ``tzinfo``, raised by ``business_date``.
+            OverflowError: If a bound converted to ``zone``, or the midnight after its local date, falls outside the
+                ``datetime`` range, raised by ``business_date`` or ``day_window``.
+
+        """
+        first = business_date(self.start, self.zone)
+        end = business_date(self.end, self.zone)
+        if day_window(first, self.zone)[0] != self.start or day_window(end, self.zone)[0] != self.end:
+            return None
+        return first, end
+
+    def halve(self, *, whole_days: bool) -> tuple[TimeFrame, TimeFrame] | None:
+        """Split the frame into two adjacent frames that together cover it exactly.
+
+        With ``whole_days``, the split falls on a local midnight and both halves are whole days; with an odd number of
+        days the first half gets the smaller share. Otherwise the split falls at ``start`` plus half the duration,
+        floored to whole seconds, so the second half is never shorter than the first. Both halves keep ``zone``.
+
+        Preconditions:
+            None.
+
+        Args:
+            whole_days: Whether the halves must be whole local days in ``zone``. Pass ``True`` for sources that only
+                accept dates.
+
+        Returns:
+            A tuple ``(left, right)`` with ``left.start == self.start``, ``left.end == right.start`` and
+            ``right.end == self.end``. ``None`` if the frame is too small to split: fewer than two days with
+            ``whole_days``, or a first half shorter than ``MIN_SPLIT`` (a frame under two minutes) without it.
+
+        Raises:
+            ValueError: If ``whole_days`` is true and the frame does not start and end at local midnight in ``zone``.
+            TypeError: If ``whole_days`` is true and ``zone`` is ``None`` or not a ``tzinfo``, raised by ``dates``.
+            OverflowError: If ``whole_days`` is true and a bound falls outside the ``datetime`` range, raised by
+                ``dates``.
+
+        """
+        if whole_days:
+            dates = self.dates
+            if dates is None:
+                raise ValueError("a whole-day split needs a frame that starts and ends at the local midnight")
+            first, end = dates
+            days = (end - first).days
+            if days < 2:
+                return None
+            middle = first + timedelta(days=days // 2)
+            return TimeFrame.days(first, middle, self.zone), TimeFrame.days(middle, end, self.zone)
+        half = timedelta(seconds=(self.end - self.start) // timedelta(seconds=2))
+        if half < MIN_SPLIT:
+            return None
+        middle = self.start + half
+        return TimeFrame(self.start, middle, self.zone), TimeFrame(middle, self.end, self.zone)

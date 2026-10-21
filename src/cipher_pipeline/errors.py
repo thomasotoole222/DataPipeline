@@ -35,7 +35,6 @@ from typing import Any, ClassVar
 import httpx
 import psycopg
 import psycopg_pool
-from _polars_runtime_32._polars_runtime import PyInProcessQuery
 from opentelemetry import trace
 
 from cipher_pipeline._wrapping import around, reject_generators
@@ -225,17 +224,22 @@ class PermanentError(PipelineError):
 class QualityFailed(PermanentError):
     """Signal that a batch failed its data-quality check because rows were quarantined.
 
-    The message reads ``"<rows_quarantined> of <rows_total> rows quarantined"``. Both counts are stored as
-    ``rows_total`` and ``rows_quarantined`` so handlers can read them without parsing the message.
+    The message reads ``"<rows_quarantined> of <rows_total> rows quarantined"``, followed by ``": "`` and each
+    ``<rule> <count>``, comma-separated, when ``by_rule`` is not empty, e.g. ``"4 of 50 rows quarantined: schema 3,
+    total 1"``. Without ``by_rule`` it is unchanged, e.g. ``"3 of 10 rows quarantined"``. Both counts are stored as
+    ``rows_total`` and ``rows_quarantined``, alongside ``by_rule``, so handlers can read them without parsing the
+    message.
 
     Attributes:
         rows_total (int): Number of rows checked.
         rows_quarantined (int): Number of those rows that were quarantined.
+        by_rule (dict[str, int]): Held records per rule, sorted by rule; empty when none is given. A record that
+            broke two rules counts under both.
 
     """
 
-    def __init__(self, *, rows_total: int, rows_quarantined: int) -> None:
-        """Build the exception message and record the row counts.
+    def __init__(self, *, rows_total: int, rows_quarantined: int, by_rule: Mapping[str, int] | None = None) -> None:
+        """Build the exception message and record the row counts and per-rule counts.
 
         Preconditions:
             ``0 <= rows_quarantined <= rows_total``.
@@ -243,6 +247,7 @@ class QualityFailed(PermanentError):
         Args:
             rows_total: Number of rows checked.
             rows_quarantined: Number of those rows that were quarantined.
+            by_rule: Held records per rule; ``None`` means none given.
 
         Returns:
             None.
@@ -251,9 +256,12 @@ class QualityFailed(PermanentError):
             None.
 
         """
-        super().__init__(f"{rows_quarantined} of {rows_total} rows quarantined")
+        counts = dict(sorted((by_rule or {}).items()))
+        detail = ", ".join(f"{rule} {count}" for rule, count in counts.items())
+        super().__init__(f"{rows_quarantined} of {rows_total} rows quarantined" + (f": {detail}" if detail else ""))
         self.rows_total = rows_total
         self.rows_quarantined = rows_quarantined
+        self.by_rule = counts  # held records per rule; a record that broke two rules counts under both
 
     def __reduce__(self) -> tuple[object, ...]:
         """Return the recipe that ``pickle`` and ``copy`` use to rebuild this exception.
@@ -266,14 +274,19 @@ class QualityFailed(PermanentError):
 
         Returns:
             A ``(callable, (), state)`` tuple:
-            - ``callable`` is ``type(self)`` with ``rows_total`` and ``rows_quarantined`` bound as keyword arguments.
+            - ``callable`` is ``type(self)`` with ``rows_total``, ``rows_quarantined`` and ``by_rule`` bound as
+              keyword arguments.
             - ``state`` is a shallow copy of ``self.__dict__``, which preserves extra attributes such as ``__notes__``.
+
+            Copies and pickles therefore keep args, the counts, ``by_rule`` and any notes.
 
         Raises:
             None.
 
         """
-        rebuild = functools.partial(type(self), rows_total=self.rows_total, rows_quarantined=self.rows_quarantined)
+        rebuild = functools.partial(
+            type(self), rows_total=self.rows_total, rows_quarantined=self.rows_quarantined, by_rule=self.by_rule
+        )
         return rebuild, (), self.__dict__.copy()
 
 
@@ -291,32 +304,32 @@ class LeaseConflict(PipelineError):
     outcome = None
 
 
-def classify(exc: Exception) -> tuple[Outcome, str] | None:
+def classify(err: Exception) -> tuple[Outcome, str] | None:
     """Map an exception to an outcome and an error class name.
 
     A ``PipelineError`` is classified by its own ``outcome`` and ``error_class`` attributes. Any other value is
     classified as ``Outcome.UNEXPECTED`` with the name ``"Unexpected"``.
 
     Preconditions:
-        ``exc`` is an exception instance. This is not checked; any value that is not a ``PipelineError``, including
+        ``err`` is an exception instance. This is not checked; any value that is not a ``PipelineError``, including
         ``None``, is classified as unexpected.
 
     Args:
-        exc: The exception to classify.
+        err: The exception to classify.
 
     Returns:
-        ``(exc.outcome, exc.error_class)`` if ``exc`` is a ``PipelineError`` whose ``outcome`` is not ``None``.
-        ``None`` if ``exc`` is a ``PipelineError`` whose ``outcome`` is ``None``.
-        ``(Outcome.UNEXPECTED, "Unexpected")`` for any other ``exc``.
+        ``(err.outcome, err.error_class)`` if ``err`` is a ``PipelineError`` whose ``outcome`` is not ``None``.
+        ``None`` if ``err`` is a ``PipelineError`` whose ``outcome`` is ``None``.
+        ``(Outcome.UNEXPECTED, "Unexpected")`` for any other ``err``.
 
     Raises:
         None.
 
     """
-    if isinstance(exc, PipelineError):
-        if exc.outcome is None:
+    if isinstance(err, PipelineError):
+        if err.outcome is None:
             return None
-        return exc.outcome, exc.error_class
+        return err.outcome, err.error_class
     return Outcome.UNEXPECTED, "Unexpected"
 
 
@@ -464,7 +477,7 @@ def translates_errors[F: Callable[..., Any]](
     """Return a decorator that converts errors from the decorated callable into pipeline errors.
 
     Each call to the decorated callable runs inside ``translate`` through ``around``. A ``SourceResponseError``
-    is replaced by ``from_response(exc)``. An ``httpx.TimeoutException``, ``httpx.NetworkError`` or
+    is replaced by ``from_response(err)``. An ``httpx.TimeoutException``, ``httpx.NetworkError`` or
     ``httpx.RemoteProtocolError`` is replaced by a ``TransientError`` with the message
     ``"{source}: {exception type name}: {original message}"``. Every other exception, including any other
     ``PipelineError``, propagates unchanged. A replacement exception has the original as its ``__cause__``.
@@ -502,17 +515,17 @@ def translates_errors[F: Callable[..., Any]](
             None, once.
 
         Raises:
-            PipelineError: The result of ``from_response(exc)`` when the block raises ``SourceResponseError``.
+            PipelineError: The result of ``from_response(err)`` when the block raises ``SourceResponseError``.
             TransientError: When the block raises ``httpx.TimeoutException``, ``httpx.NetworkError`` or
                 ``httpx.RemoteProtocolError``.
 
         """
         try:
             yield
-        except SourceResponseError as exc:
-            raise from_response(exc) from exc
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
-            raise TransientError(f"{source}: {type(exc).__name__}: {exc}") from exc
+        except SourceResponseError as err:
+            raise from_response(err) from err
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as err:
+            raise TransientError(f"{source}: {type(err).__name__}: {err}") from err
 
     return around(translate)
 
@@ -605,21 +618,21 @@ def retries[**P, R](
             while True:
                 try:
                     return await fn(*args, **kwargs)
-                except TransientError as exc:
+                except TransientError as err:
                     if attempt >= attempts:
                         raise
                     # Exponential backoff, capped, then jitter.
                     wait = min(base * 2 ** min(attempt, 62), cap) + random.uniform(0, jitter)  # noqa: S311
-                    if isinstance(exc, RateLimited) and exc.retry_after is not None:
-                        retry_after = exc.retry_after.total_seconds()
+                    if isinstance(err, RateLimited) and err.retry_after is not None:
+                        retry_after = err.retry_after.total_seconds()
                         if retry_after > cap:
                             # Too long to hold a worker slot; Orchestrator requeues.
                             raise
                         wait = max(wait, retry_after)
                     trace.get_current_span().add_event(
-                        "retry", {"attempt": attempt + 1, "hub.error_class": exc.error_class, "wait_s": wait}
+                        "retry", {"attempt": attempt + 1, "hub.error_class": err.error_class, "wait_s": wait}
                     )
-                    log.warning("%s failed (%s), retry %d in %.1fs", name, exc.error_class, attempt + 1, wait)
+                    log.warning("%s failed (%s), retry %d in %.1fs", name, err.error_class, attempt + 1, wait)
                 await sleep(wait)
                 attempt += 1
 
@@ -688,7 +701,7 @@ class StartupRefused(RuntimeError):
 
 
 class UnknownJob(PermanentError):
-    """Signal that a task names a job that this build does not define.
+    """Signal that a task names a job that is not in the job registry.
 
     Retrying cannot fix it; only a code or configuration change can.
 
@@ -707,6 +720,162 @@ class JobNotRunnable(PipelineError):
 
     Attributes:
         outcome (Outcome): ``Outcome.UNEXPECTED``, inherited from ``PipelineError``.
+
+    """
+
+    pass
+
+
+class ClientErrorUnhandled(PipelineError):
+    """Signal a source error the client cannot handle: an unknown error code, a non-JSON 2xx body or unreadable body.
+
+    Raised for an error code no rule matches, a 2xx response whose body is not JSON, or a body a spec cannot read. Its
+    outcome is ``UNEXPECTED``: the task is retried once, then an issue is raised.
+
+    Attributes:
+        source (str): Name of the source that returned the response.
+        path (str): Request path that produced the response.
+        status (int): Status code of the response.
+        code (int | None): Source-specific error code, or ``None`` if the response had none.
+        message (str): Description of the error, without the formatted prefix.
+        request_id (str | None): Request identifier reported by the source, or ``None`` if absent.
+
+    """
+
+    def __init__(
+        self,
+        *,
+        source: str,
+        path: str,
+        status: int,
+        code: int | None,
+        message: str,
+        request_id: str | None,
+    ) -> None:
+        """Build the message ``{source}: unhandled {status} code={code} path={path} req={request_id}: {message}``.
+
+        Preconditions:
+            None.
+
+        Args:
+            source: Name of the source that returned the response.
+            path: Request path that produced the response.
+            status: Status code of the response.
+            code: Source-specific error code, or ``None`` if the response had none.
+            message: Description of the error.
+            request_id: Request identifier reported by the source, or ``None`` if absent.
+
+        Returns:
+            None.
+
+        Raises:
+            Nothing.
+
+        """
+        super().__init__(f"{source}: unhandled {status} code={code} path={path} req={request_id}: {message}")
+        self.source = source
+        self.path = path
+        self.status = status
+        self.code = code
+        self.message = message
+        self.request_id = request_id
+
+    def __reduce__(self) -> tuple[object, ...]:
+        """Return the recipe that ``pickle`` and ``copy`` use to rebuild this exception.
+
+        Preconditions:
+            None.
+
+        Returns:
+            The callable and arguments that rebuild the error from its keyword arguments, with a shallow copy of its
+            ``__dict__``.
+
+        Raises:
+            Nothing.
+
+        """
+        rebuild = functools.partial(
+            type(self),
+            source=self.source,
+            path=self.path,
+            status=self.status,
+            code=self.code,
+            message=self.message,
+            request_id=self.request_id,
+        )
+        return rebuild, (), self.__dict__.copy()
+
+
+class RowLimitReached(PermanentError):
+    """Signal that an endpoint reached its row limit and the fetch cannot split the time frame to fit.
+
+    The message reads ``"<endpoint>: reached the <limit>-row limit and the fetch cannot split the time frame to
+    fit"``. The wording covers both cases it is raised in: a reported total over the limit in a frame that cannot be
+    halved further, and a source without a total whose rows reach the limit, which the fetch never splits. Both
+    arguments are stored as ``endpoint`` and ``limit`` so handlers can read them without parsing the message. Pickling
+    and copying rebuild the instance from ``endpoint`` and ``limit`` by keyword and restore its ``__dict__``.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.FAILED``, inherited from ``PermanentError``.
+        endpoint (str): Name of the endpoint spec whose row limit was reached.
+        limit (int): The endpoint's maximum number of rows per time frame.
+
+    """
+
+    def __init__(self, *, endpoint: str, limit: int) -> None:
+        """Build the exception message and record the endpoint and its row limit.
+
+        Preconditions:
+            ``endpoint`` and ``limit`` are passed by keyword.
+
+        Args:
+            endpoint: Name of the endpoint spec whose row limit was reached.
+            limit: The endpoint's maximum number of rows per time frame.
+
+        Returns:
+            None.
+
+        Raises:
+            TypeError: If ``endpoint`` or ``limit`` is missing or passed positionally.
+
+        """
+        super().__init__(f"{endpoint}: reached the {limit}-row limit and the fetch cannot split the time frame to fit")
+        self.endpoint = endpoint
+        self.limit = limit
+
+    def __reduce__(self) -> tuple[object, ...]:
+        """Return the recipe that ``pickle`` and ``copy`` use to rebuild this exception.
+
+        Preconditions:
+            The class is importable at module level under its own name.
+
+        Args:
+            None.
+
+        Returns:
+            A ``(callable, (), state)`` tuple:
+            - ``callable`` is ``type(self)`` with ``endpoint`` and ``limit`` bound as keyword arguments.
+            - ``state`` is a shallow copy of ``self.__dict__``, which preserves extra attributes such as ``__notes__``.
+
+        Raises:
+            None.
+
+        """
+        return functools.partial(type(self), endpoint=self.endpoint, limit=self.limit), (), self.__dict__.copy()
+
+
+class TokenRejected(AuthBlocked):
+    """Signal that a source rejected the credential sent with a request.
+
+    Raised when a source error matches a ``TOKEN_REJECTED`` rule. ``HttpSourceClient`` reports the credential back to
+    its ``TokenSource`` before re-raising. It is not a ``TransientError``, so ``retries`` does not retry it.
+    Construction, message, pickling and the ``Outcome.BLOCKED`` outcome are inherited unchanged from ``AuthBlocked``;
+    ``classify`` reports it as ``(Outcome.BLOCKED, "TokenRejected")``.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.BLOCKED``, inherited from ``AuthBlocked``.
+        source (str): Name of the source that rejected the credential.
+        reason (str): The source's error message.
 
     """
 
@@ -754,11 +923,11 @@ def db_errors() -> Iterator[None]:
     """
     try:
         yield
-    except _DB_CONFLICT as exc:
-        raise DatabaseConflict(f"warehouse: {type(exc).__name__}: {exc}") from exc
-    except _DB_UNAVAILABLE as exc:
-        raise DatabaseUnavailable(f"warehouse: {type(exc).__name__}: {exc}") from exc
-    except psycopg.OperationalError as exc:
-        if type(exc) is not psycopg.OperationalError:
+    except _DB_CONFLICT as err:
+        raise DatabaseConflict(f"warehouse: {type(err).__name__}: {err}") from err
+    except _DB_UNAVAILABLE as err:
+        raise DatabaseUnavailable(f"warehouse: {type(err).__name__}: {err}") from err
+    except psycopg.OperationalError as err:
+        if type(err) is not psycopg.OperationalError:
             raise
-        raise DatabaseUnavailable(f"warehouse: {type(exc).__name__}: {exc}") from exc
+        raise DatabaseUnavailable(f"warehouse: {type(err).__name__}: {err}") from err

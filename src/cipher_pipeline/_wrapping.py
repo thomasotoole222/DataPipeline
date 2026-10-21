@@ -135,8 +135,8 @@ def around[F: Callable[..., Any]](make_context: CallContext) -> Callable[[F], F]
                 with make_context(fn, args, kwargs):
                     try:
                         return await fn(*args, **kwargs)
-                    except BaseException as exc:
-                        caught = exc
+                    except BaseException as err:
+                        caught = err
                         raise
                 # noinspection PyUnreachableCode
                 raise swallowed() from caught
@@ -170,8 +170,8 @@ def around[F: Callable[..., Any]](make_context: CallContext) -> Callable[[F], F]
             with make_context(fn, args, kwargs):
                 try:
                     return fn(*args, **kwargs)
-                except BaseException as exc:
-                    caught = exc
+                except BaseException as err:
+                    caught = err
                     raise
             # noinspection PyUnreachableCode
             raise swallowed() from caught

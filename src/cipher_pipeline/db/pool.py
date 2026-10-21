@@ -4,10 +4,12 @@ Public API:
     Connection: An async psycopg connection that returns tuple rows.
     Pool: An async connection pool of ``Connection`` objects.
     REQUIRED_REVISION: The lowest database schema revision this build accepts.
+    DEAD_CONNECTION_PARAMS: libpq parameters that detect a dead connection.
     open_pool: Open the warehouse connection pool and wait until it is ready.
     check_schema: Check that the database schema revision meets ``REQUIRED_REVISION``.
 """
 
+from collections.abc import Mapping
 from datetime import timedelta
 from typing import Final
 
@@ -21,12 +23,23 @@ from cipher_pipeline.errors import SchemaMismatch, db_errors
 type Connection = AsyncConnection[TupleRow]
 type Pool = AsyncConnectionPool[Connection]
 
+#: Lowest ``alembic_version`` revision of the database schema that this build accepts.
 REQUIRED_REVISION: Final = 0
 
-
+#: Longest wait for the pool to open, and for a connection to be checked out of it.
 _POOL_TIMEOUT: Final = timedelta(seconds=10)
+#: Server-side ``statement_timeout`` set on every pool connection.
 _STATEMENT_TIMEOUT: Final = timedelta(seconds=60)
+#: Server-side ``idle_in_transaction_session_timeout`` set on every pool connection.
 _IDLE_IN_TRANSACTION_TIMEOUT: Final = timedelta(seconds=60)
+#: Idle time on a connection before the first TCP keepalive probe is sent.
+_KEEPALIVES_IDLE: Final = timedelta(seconds=60)
+#: Time between unanswered TCP keepalive probes.
+_KEEPALIVES_INTERVAL: Final = timedelta(seconds=15)
+#: Unanswered TCP keepalive probes after which the connection is treated as dead.
+_KEEPALIVES_COUNT: Final = 4
+#: Longest time sent data may stay unacknowledged before the connection is treated as dead.
+_TCP_USER_TIMEOUT: Final = timedelta(seconds=120)
 
 
 def _ms(value: timedelta) -> int:
@@ -53,12 +66,28 @@ def _ms(value: timedelta) -> int:
     return value // timedelta(milliseconds=1)
 
 
+#: libpq parameters that detect a dead connection in about 2 minutes, used by the pool and by
+#: ``db.control.open_listener``.
+DEAD_CONNECTION_PARAMS: Final[Mapping[str, int]] = {
+    "keepalives": 1,
+    "keepalives_idle": _KEEPALIVES_IDLE // timedelta(seconds=1),
+    "keepalives_interval": _KEEPALIVES_INTERVAL // timedelta(seconds=1),
+    "keepalives_count": _KEEPALIVES_COUNT,
+    "tcp_user_timeout": _ms(_TCP_USER_TIMEOUT),
+}
+
+
 async def open_pool(settings: Settings) -> Pool:
     """Open the warehouse connection pool and wait until it is ready.
 
     Every connection the pool creates uses autocommit, takes ``settings.worker_id`` as its ``application_name``, and
     sets ``statement_timeout`` and ``idle_in_transaction_session_timeout`` through the ``options`` connection
-    parameter. If ``pool.open`` fails or is interrupted, the pool is closed before the exception propagates.
+    parameter.
+    Every connection also takes the libpq parameters in DEAD_CONNECTION_PARAMS (TCP keepalives and tcp_user_timeout),
+    so a connection whose server has gone is found dead in about 2 minutes.
+
+    If ``pool.open`` fails or is interrupted, the pool is closed before the exception propagates.
+
 
     Preconditions:
         Must be awaited inside a running event loop. ``settings.concurrency`` must be an int of at least 1.
@@ -83,14 +112,19 @@ async def open_pool(settings: Settings) -> Pool:
     """
     options = (
         f"-c statement_timeout={_ms(_STATEMENT_TIMEOUT)} "
-        f"-c idle_in_transaction_session_timeout={_ms(_IDLE_IN_TRANSACTION)}"
+        f"-c idle_in_transaction_session_timeout={_ms(_IDLE_IN_TRANSACTION_TIMEOUT)}"
     )
     pool = AsyncConnectionPool(
         settings.warehouse_url.get_secret_value(),
         min_size=1,
         max_size=2 * settings.concurrency,
         timeout=_POOL_TIMEOUT.total_seconds(),
-        kwargs={"autocommit": True, "application_name": settings.worker_id, "options": options},
+        kwargs={
+            "autocommit": True,
+            "application_name": settings.worker_id,
+            "options": options,
+            **DEAD_CONNECTION_PARAMS,
+        },
         check=AsyncConnectionPool.check_connection,
         name="warehouse",
         open=False,

@@ -15,7 +15,6 @@ from psycopg import pq
 from psycopg.types.json import Jsonb
 
 from cipher_pipeline.db.pool import Connection
-from cipher_pipeline.db.raw import raw_table
 from cipher_pipeline.errors import db_errors
 
 
@@ -23,19 +22,22 @@ from cipher_pipeline.errors import db_errors
 class Failure:
     """One validation rule a held row failed.
 
-    Instances are frozen and use slots. ``hold`` stores each failure as a JSON object built with ``asdict``. No field
-    is validated.
+    Instances are frozen and use slots. ``hold`` stores each failure as a JSON object built with ``asdict``, whose
+    keys are ``rule``, ``version``, ``message`` and ``until``, with ``until`` null for an error. No field is
+    validated.
 
     Attributes:
         rule (str): Name of the rule that failed.
         version (int): Version of the rule that failed.
         message (str): Description of the failure.
+        until (str | None): The job a waiting record waits for; None for an error.
 
     """
 
-    rule: str
-    version: int
-    message: str
+    rule: str  # the rule's name, e.g. "order_id_present"
+    version: int  # the rule's version when it ran
+    message: str  # what was wrong with this record
+    until: str | None = None  # the job a waiting record waits for; None for an error
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -43,7 +45,7 @@ class HeldRow:
     """One record held back by validation, as stored in ``quarantine.row``.
 
     Instances are frozen, use slots, and take every field as a required keyword argument in the generated
-    ``__init__``. ``__post_init__`` validates ``raw_table``, ``raw_page_no``, ``raw_index`` and ``failures``. The
+    ``__init__``. ``__post_init__`` validates ``raw_page_no``, ``raw_index`` and ``failures``. The
     generated ``__eq__`` compares all fields and the generated ``__hash__`` hashes all fields, so ``hash`` raises
     ``TypeError`` because ``payload`` is a ``dict``.
 
@@ -52,8 +54,7 @@ class HeldRow:
         job (str): Name of the job that produced the record. Not validated.
         shop_id (UUID): Shop the record belongs to. Not validated.
         partition_key (str): Partition the record would have been loaded into. Not validated.
-        raw_table (str): Raw table the record was read from, in the form ``raw_table`` accepts.
-        raw_page_no (int): Page of ``raw_table`` the record came from, 0 or more.
+        raw_page_no (int): With ``task_id``, the ``raw.page`` row the record came from, 0 or more.
         raw_index (int): Position of the record within that page, 0 or more.
         group_key (str | None): Key grouping related records, or ``None``. Not validated.
         payload (dict[str, Any]): The record itself. The dict passed in is stored as is, not copied.
@@ -61,22 +62,20 @@ class HeldRow:
 
     """
 
-    task_id: int
+    task_id: int  # control.task id of the task that held it
     job: str
     shop_id: UUID
     partition_key: str
-    raw_table: str
-    raw_page_no: int
-    raw_index: int
-    group_key: str | None
-    payload: dict[str, Any]
-    failures: tuple[Failure, ...]
+    raw_page_no: int  # with task_id, the raw.page row the record came from
+    raw_index: int  # position of the record in that page
+    group_key: str | None  # records held together share it, e.g. the order id
+    payload: dict[str, Any]  # the record as landed
+    failures: tuple[Failure, ...]  # every error rule it broke; never empty
 
     def __post_init__(self) -> None:
-        """Validate ``raw_table``, ``raw_page_no``, ``raw_index`` and ``failures``.
+        """Validate ``raw_page_no``, ``raw_index`` and ``failures``.
 
-        Checks run in order: ``raw_table`` through ``raw_table``, then ``raw_page_no`` and ``raw_index`` together,
-        then ``failures``. No field is changed.
+        Checks run in order: ``raw_page_no`` and ``raw_index`` together, then ``failures``. No field is changed.
 
         Preconditions:
             ``raw_page_no`` and ``raw_index`` support ``<`` against ``0``.
@@ -85,13 +84,11 @@ class HeldRow:
             None.
 
         Raises:
-            ValueError: If ``raw_table`` is not a name ``raw_table`` accepts, if ``raw_page_no`` or ``raw_index`` is
-                less than ``0``, or if ``failures`` is empty.
-            TypeError: If ``raw_table`` is not a ``str``, or if ``raw_page_no`` or ``raw_index`` cannot be compared
-                with ``0`` (for example ``None``); both come with an unrelated message.
+            ValueError: If ``raw_page_no`` or ``raw_index`` is less than ``0``, or if ``failures`` is empty.
+            TypeError: If ``raw_page_no`` or ``raw_index`` cannot be compared with ``0`` (for example ``None``); it
+                comes with an unrelated message.
 
         """
-        raw_table(self.raw_table)
         if self.raw_page_no < 0 or self.raw_index < 0:
             raise ValueError(f"raw_page_no and raw_index must be 0 or more, got {self.raw_page_no}, {self.raw_index}")
         if not self.failures:
@@ -99,7 +96,7 @@ class HeldRow:
 
 
 _COPY: Final = (
-    "COPY quarantine.row (task_id, job, shop_id, partition_key, raw_table, raw_page_no, raw_index, group_key, "
+    "COPY quarantine.row (task_id, job, shop_id, partition_key, raw_page_no, raw_index, group_key, "
     "payload, failures) FROM STDIN"
 )
 
@@ -149,7 +146,6 @@ async def hold(conn: Connection, rows: Sequence[HeldRow]) -> int:
                         row.job,
                         row.shop_id,
                         row.partition_key,
-                        row.raw_table,
                         row.raw_page_no,
                         row.raw_index,
                         row.group_key,

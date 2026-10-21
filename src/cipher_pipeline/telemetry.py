@@ -54,7 +54,7 @@ from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExp
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
-from opentelemetry.metrics import Counter, Histogram
+from opentelemetry.metrics import Counter, Histogram, UpDownCounter
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
@@ -88,13 +88,31 @@ class Instruments:
         log_dropped: ``pipeline.log.dropped``, every log record not delivered to the
             collector, with a ``reason`` attribute: ``convert``, ``post_error``, ``http_status``,
             ``rejected``, ``shed``, ``shutdown`` or ``error``.
+        slots_busy: ``pipeline.worker.slots_busy``, task slots in use.
+        queue_wait: ``pipeline.task.queue_wait``, seconds a task waited to be claimed.
+        heartbeat_lag: ``pipeline.lease.heartbeat_lag``, seconds between successful
+            heartbeats.
+        lease_losses: ``pipeline.lease.losses``, every lease given up, with ``kind`` and
+            ``job`` attributes.
+        lease_unwind: ``pipeline.lease.unwind``, seconds a task took to unwind after a
+            lease loss, with ``kind`` and ``job`` attributes.
+        unknown_jobs: ``pipeline.task.unknown_job``, every claimed task whose job is not
+            registered.
+        worker_paused: ``pipeline.worker.paused``, every time the worker paused claiming.
 
     """
 
-    task_duration: Histogram  # pipeline.task.duration
-    rows: Counter  # pipeline.rows
-    source_requests: Counter  # pipeline.source.requests
-    log_dropped: Counter  # pipeline.log.dropped
+    task_duration: Histogram
+    rows: Counter
+    source_requests: Counter
+    log_dropped: Counter
+    slots_busy: UpDownCounter
+    queue_wait: Histogram
+    heartbeat_lag: Histogram
+    lease_losses: Counter
+    lease_unwind: Histogram
+    unknown_jobs: Counter
+    worker_paused: Counter
 
 
 @contextmanager
@@ -231,15 +249,15 @@ def traced[F: Callable[..., Any]](name: str, **attrs: str) -> Callable[[F], F]:
         ) as active:
             try:
                 yield
-            except Exception as exc:
-                named = getattr(exc, "error_class", None)
+            except Exception as err:
+                named = getattr(err, "error_class", None)
                 error_class = named if isinstance(named, str) else "Unexpected"
-                active.record_exception(exc)
+                active.record_exception(err)
                 active.set_status(Status(StatusCode.ERROR, error_class))
                 active.set_attribute("hub.error_class", error_class)
                 raise
-            except BaseException as exc:
-                active.set_status(Status(StatusCode.ERROR, type(exc).__name__))
+            except BaseException as err:
+                active.set_status(Status(StatusCode.ERROR, type(err).__name__))
                 raise
 
     return around(span)
@@ -553,8 +571,8 @@ class OtlpLogShipper:
                     self._ship(client, batch)
                     batch.clear()
                     self._shed()
-                except Exception as exc:
-                    print(f"otlp-log-shipper: {type(exc).__name__}: {exc}", file=sys.stderr)
+                except Exception as err:
+                    print(f"otlp-log-shipper: {type(err).__name__}: {err}", file=sys.stderr)
                     self._dropped.add(len(batch), {"reason": "error"})
                     self._stopping.wait(0.1)
             while time.monotonic() < self._deadline - _POST_TIMEOUT:
@@ -564,8 +582,8 @@ class OtlpLogShipper:
                     if not rest:
                         break
                     self._ship(client, rest)
-                except Exception as exc:
-                    print(f"otlp-log-shipper: {type(exc).__name__}: {exc}", file=sys.stderr)
+                except Exception as err:
+                    print(f"otlp-log-shipper: {type(err).__name__}: {err}", file=sys.stderr)
                     self._dropped.add(len(rest), {"reason": "error"})
             self._shed(keep=0, reason="shutdown")
         finally:
@@ -845,7 +863,7 @@ def _exception_attributes(record: logging.LogRecord) -> dict[str, str]:
         exception.type: Fully qualified class name, without the module for
             built-in exceptions (for example ``ValueError`` but
             ``httpx.ConnectError``).
-        exception.message: ``str(exc)``, or ``<unprintable {type}>`` if that raises.
+        exception.message: ``str(err)``, or ``<unprintable {type}>`` if that raises.
         exception.stacktrace: The formatted traceback, including chained exceptions.
             A trace longer than ``_MAX_STACKTRACE`` characters keeps its last
             ``_MAX_STACKTRACE`` characters (the most recent frames and the exception
@@ -864,20 +882,20 @@ def _exception_attributes(record: logging.LogRecord) -> dict[str, str]:
         A new dict, empty when there is no exception.
 
     Raises:
-        Nothing: ``str(exc)`` is guarded, and ``traceback.format_exception`` reports an
+        Nothing: ``str(err)`` is guarded, and ``traceback.format_exception`` reports an
         unprintable exception instead of raising.
 
     """
-    exc = record.exc_info[1] if record.exc_info else None
-    if exc is None:
+    err = record.exc_info[1] if record.exc_info else None
+    if err is None:
         return {}
-    cls = type(exc)
+    cls = type(err)
     name = cls.__qualname__ if cls.__module__ == "builtins" else f"{cls.__module__}.{cls.__qualname__}"
     try:
-        message = str(exc)
+        message = str(err)
     except Exception:
         message = f"<unprintable {name}>"
-    stack = "".join(traceback.format_exception(exc))
+    stack = "".join(traceback.format_exception(err))
     if len(stack) > _MAX_STACKTRACE:
         stack = f"[truncated {len(stack) - _MAX_STACKTRACE} chars]\n" + stack[-_MAX_STACKTRACE:]
     return {
@@ -1261,6 +1279,13 @@ def configure(*, env: Env, worker_id: str, log_level: str) -> Telemetry:
             rows=meter.create_counter("pipeline.rows", unit="{row}"),
             source_requests=meter.create_counter("pipeline.source.requests", unit="{request}"),
             log_dropped=meter.create_counter("pipeline.log.dropped", unit="{record}"),
+            slots_busy=meter.create_up_down_counter("pipeline.worker.slots_busy", unit="{slot}"),
+            queue_wait=meter.create_histogram("pipeline.task.queue_wait", unit="s"),
+            heartbeat_lag=meter.create_histogram("pipeline.lease.heartbeat_lag", unit="s"),
+            lease_losses=meter.create_counter("pipeline.lease.losses", unit="{loss}"),
+            lease_unwind=meter.create_histogram("pipeline.lease.unwind", unit="s"),
+            unknown_jobs=meter.create_counter("pipeline.task.unknown_job", unit="{task}"),
+            worker_paused=meter.create_counter("pipeline.worker.paused", unit="{pause}"),
         )
         shipper = OtlpLogShipper(endpoint, resource, instruments.log_dropped) if endpoint else None
         queue_handler: logging.Handler | None = None

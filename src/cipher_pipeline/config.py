@@ -83,6 +83,12 @@ class Settings(BaseSettings):
         log_level (Literal["DEBUG", "INFO", "WARNING"]): Log level name. Stored in upper case. Defaults to
             ``"INFO"``.
         polars_threads(int): The resource allocation to polars, checked against container resources at startup
+        tiktok_app_key (SecretStr): The TikTok Shop app key. Required. A sealed Railway variable
+            (``PIPELINE_TIKTOK_APP_KEY``). Masked in ``repr`` and ``str``.
+        tiktok_app_secret (SecretStr): The TikTok Shop app secret that signs every request. Required. A sealed
+            Railway variable (``PIPELINE_TIKTOK_APP_SECRET``). Masked in ``repr`` and ``str``.
+        cruva_api_key (SecretStr): The Cruva API key for the whole account. Required. A sealed Railway variable
+            (``PIPELINE_CRUVA_API_KEY``). Masked in ``repr`` and ``str``.
 
     """
 
@@ -103,6 +109,9 @@ class Settings(BaseSettings):
     concurrency: int = Field(default=1, ge=1, le=4)
     log_level: Literal["DEBUG", "INFO", "WARNING"] = "INFO"
     polars_threads: int = Field(default=2, ge=1)
+    tiktok_app_key: SecretStr  # sealed Railway variable of the pipeline service
+    tiktok_app_secret: SecretStr  # sealed; signs every TikTok Shop request
+    cruva_api_key: SecretStr  # sealed; one key for the whole Cruva account
 
     @field_validator("warehouse_url")
     @classmethod
