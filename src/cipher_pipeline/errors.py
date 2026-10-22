@@ -425,6 +425,35 @@ class SourceResponseError(Exception):
         return rebuild, (), self.__dict__.copy()
 
 
+class NothingLoaded(PermanentError):
+    """Signal that a load was refused because a ``Snapshot`` target had no rows while pruning.
+
+    Raised by ``stages.load.load`` before anything is written, because writing an empty snapshot with pruning on
+    would remove every row of the shop from the target's table. The message reads ``"<table>: a snapshot with no
+    rows would remove every row of the shop"``.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.FAILED``, inherited from ``PermanentError``.
+
+    """
+
+    pass
+
+
+class TableMismatch(RuntimeError):
+    """Signal that a load target does not match its warehouse table, or the table is missing.
+
+    Raised by ``stages.load._columns_checked`` inside the load transaction, before anything is written. The message
+    lists every mismatch, separated by ``"; "``.
+
+    Deliberately not a ``PipelineError``: retrying cannot fix it, so ``classify`` reports it as
+    ``(Outcome.UNEXPECTED, "Unexpected")`` and it is treated as a bug.
+
+    """
+
+    pass
+
+
 def retry_after_from(headers: Mapping[str, str], *, now: datetime) -> timedelta | None:
     """Return the delay requested by a ``Retry-After`` header.
 
