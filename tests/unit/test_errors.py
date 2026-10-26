@@ -1,10 +1,10 @@
-"""Unit tests for the warehouse error types and ``db_errors`` in ``cipher_pipeline.errors``."""
+"""Unit tests for the warehouse error types and ``db_errors`` in ``pipeline.errors``."""
 
 import psycopg
 import psycopg_pool
 import pytest
 
-from cipher_pipeline.errors import (
+from pipeline.errors import (
     DatabaseConflict,
     DatabaseUnavailable,
     Outcome,

@@ -1,4 +1,4 @@
-"""Integration tests for ``cipher_pipeline.db.raw`` and ``cipher_pipeline.db.quarantine`` on ``raw.page``."""
+"""Integration tests for ``pipeline.db.raw`` and ``pipeline.db.quarantine`` on ``raw.page``."""
 
 import os
 from collections.abc import AsyncIterator
@@ -10,12 +10,13 @@ import psycopg
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
-from cipher_pipeline.db.pool import Pool
-from cipher_pipeline.db.quarantine import Failure, HeldRow, hold
-from cipher_pipeline.db.raw import RawPage, discard_pages, last_page, read_pages, save_page
+from pipeline.db.pool import Pool
+from pipeline.db.quarantine import Failure, HeldRow, hold
+from pipeline.db.raw import RawPage, discard_pages, last_page, read_pages, save_page
 
 DSN = os.environ.get("PIPELINE_TEST_DSN", "postgresql://postgres@localhost:5432/pipeline_test")
-ENDPOINT = "tiktok_shop.orders_search"
+CONNECTOR = "tiktok_shop"
+ENDPOINT = "orders_search"
 
 
 @pytest.fixture
@@ -36,6 +37,7 @@ def page(n: int, nxt: str | None = "c", task: int = 1, payload: dict[str, Any] |
     return RawPage(
         task_id=task,
         page_no=n,
+        connector=CONNECTOR,
         endpoint=ENDPOINT,
         cursor_in=None if n == 0 else f"c{n}",
         cursor_next=nxt,
@@ -48,8 +50,9 @@ def held(**kw: Any) -> HeldRow:
     """Build a held row, overriding any field."""
     base: dict[str, Any] = {
         "task_id": 1,
+        "connector": CONNECTOR,
         "job": "orders",
-        "shop_id": uuid4(),
+        "source_id": uuid4(),
         "partition_key": "2026-10-11",
         "raw_page_no": 0,
         "raw_index": 3,
@@ -72,6 +75,7 @@ def test_rawpage_utc_and_checks() -> None:
         RawPage(
             task_id=1,
             page_no=0,
+            connector=CONNECTOR,
             endpoint=ENDPOINT,
             cursor_in=None,
             cursor_next=None,
@@ -82,6 +86,7 @@ def test_rawpage_utc_and_checks() -> None:
         RawPage(
             task_id=1,
             page_no=0,
+            connector=CONNECTOR,
             endpoint=ENDPOINT,
             cursor_in=None,
             cursor_next=None,
@@ -91,7 +96,7 @@ def test_rawpage_utc_and_checks() -> None:
 
 
 async def test_save_and_last(pool: Pool) -> None:
-    """Check last_page returns the highest page saved, endpoint included, or None."""
+    """Check last_page returns the highest page saved, connector and endpoint included, or None."""
     async with pool.connection() as c:
         assert await last_page(c, 1) is None
         await save_page(c, page(0, "c1"))
@@ -99,6 +104,7 @@ async def test_save_and_last(pool: Pool) -> None:
         last = await last_page(c, 1)
         assert last == page(1, "c2")
         assert last is not None
+        assert last.connector == CONNECTOR
         assert last.endpoint == ENDPOINT
         assert last.fetched_at.tzinfo is UTC
 
@@ -122,7 +128,8 @@ async def test_read_pages_order_and_isolation(pool: Pool) -> None:
         other = RawPage(
             task_id=2,
             page_no=0,
-            endpoint="cruva.samples",
+            connector="cruva",
+            endpoint="samples",
             cursor_in=None,
             cursor_next=None,
             fetched_at=datetime(2026, 10, 12, tzinfo=UTC),
@@ -183,27 +190,37 @@ async def test_hold_outside_transaction(pool: Pool) -> None:
 
 
 async def test_hold_writes_rows(pool: Pool) -> None:
-    """Check hold writes each row with its failures and points back to the raw page by task and page."""
-    rows = [held(), held(group_key=None, failures=(Failure("a", 1, "x"), Failure("b", 2, "y")))]
+    """Check hold writes each row open with its failures in order, until included, and its task, page and connector."""
+    rows = [
+        held(),
+        held(group_key=None, failures=(Failure("a", 1, "x"), Failure("b", 2, "y", until="products"))),
+    ]
     async with pool.connection() as c:
         async with c.transaction():
             assert await hold(c, rows) == 2
             assert await hold(c, []) == 0
         cursor = await c.execute(
-            "SELECT status, failures, group_key, resolved_at, task_id, raw_page_no, raw_index "
+            "SELECT status, failures, group_key, resolved_at, task_id, raw_page_no, raw_index, connector "
             "FROM quarantine.row ORDER BY id"
         )
         got = await cursor.fetchall()
         assert got[0] == (
             "open",
-            [{"rule": "order_id_present", "version": 1, "message": "id is null"}],
+            [{"rule": "order_id_present", "version": 1, "message": "id is null", "until": None}],
             "o1",
             None,
             1,
             0,
             3,
+            CONNECTOR,
         )
-        assert got[1][1] == [{"rule": "a", "version": 1, "message": "x"}, {"rule": "b", "version": 2, "message": "y"}]
+        assert got[1][0] == "open"
+        assert got[1][1] == [
+            {"rule": "a", "version": 1, "message": "x", "until": None},
+            {"rule": "b", "version": 2, "message": "y", "until": "products"},
+        ]
+        assert got[1][3] is None
+        assert got[1][4:] == (1, 0, 3, CONNECTOR)
 
 
 async def test_hold_rolls_back_with_load(pool: Pool) -> None:

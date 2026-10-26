@@ -23,7 +23,10 @@ dependencies = [
 ]
 
 [project.scripts]
-cipher-pipeline = "cipher_pipeline.__main__:main"
+cipher-pipeline = "pipeline.__main__:main"
+
+[tool.uv.build-backend]
+module-name = "pipeline"  # the import name; the distribution keeps its project name
 
 [build-system]
 requires = ["uv_build>=0.12.2,<0.13.0"]
@@ -59,17 +62,51 @@ testpaths = ["tests"]
 markers = ["integration: needs a Postgres container"]
 
 [tool.importlinter]
-root_package = "cipher_pipeline"
+root_package = "pipeline"
 
 [[tool.importlinter.contracts]]
 name = "Pipeline layers"
 type = "layers"
 layers = [
-    "cipher_pipeline.worker",
-    "cipher_pipeline.jobs",
-    "cipher_pipeline.stages | cipher_pipeline.writers | cipher_pipeline.rules",
-    "cipher_pipeline.sources",
-    "cipher_pipeline.db | cipher_pipeline.archive",
+    "pipeline.worker",
+    "pipeline.jobs",
+    "pipeline.stages",
+    "pipeline.checks | pipeline.writers",
+    "pipeline.connectors",
+    "pipeline.db | pipeline.archive",
+]
+
+[[tool.importlinter.contracts]]
+name = "Base modules stay at the bottom"
+type = "forbidden"
+source_modules = [
+    "pipeline.config", "pipeline.errors",
+    "pipeline.timeutil", "pipeline.telemetry",
+]
+forbidden_modules = [
+    "pipeline.worker", "pipeline.jobs", "pipeline.stages",
+    "pipeline.writers", "pipeline.checks", "pipeline.connectors",
+    "pipeline.db", "pipeline.archive", "pipeline.registry",
+]
+
+[[tool.importlinter.contracts]]
+name = "Base modules don't import each other"
+type = "independence"
+modules = [
+    "pipeline.config", "pipeline.errors",
+    "pipeline.timeutil", "pipeline.telemetry",
+]
+
+[[tool.importlinter.contracts]]
+name = "_wrapping imports nothing from the package"
+type = "forbidden"
+source_modules = ["pipeline._wrapping"]
+forbidden_modules = [
+    "pipeline.config", "pipeline.errors", "pipeline.timeutil",
+    "pipeline.telemetry", "pipeline.worker", "pipeline.jobs",
+    "pipeline.stages", "pipeline.writers", "pipeline.checks",
+    "pipeline.connectors", "pipeline.db", "pipeline.archive",
+    "pipeline.registry",
 ]
 
 [dependency-groups]

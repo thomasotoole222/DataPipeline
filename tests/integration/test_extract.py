@@ -1,4 +1,4 @@
-"""Integration tests for ``cipher_pipeline.stages.extract`` against a database with control and raw loaded."""
+"""Integration tests for ``pipeline.stages.extract`` against a database with control and raw loaded."""
 
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -12,24 +12,24 @@ from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader, NumberDataPoint
 from psycopg_pool import AsyncConnectionPool
 
-from cipher_pipeline.db import raw
-from cipher_pipeline.db.control import ClaimedTask, claim
-from cipher_pipeline.db.pool import Pool
-from cipher_pipeline.db.raw import RawPage
-from cipher_pipeline.errors import LeaseConflict, TransientError
-from cipher_pipeline.sources.paging import CursorPaginator
-from cipher_pipeline.sources.spec import EndpointSpec, SourceRequest
-from cipher_pipeline.sources.windows import UnixSecondsWindow
-from cipher_pipeline.stages.extract import extract
-from cipher_pipeline.telemetry import Instruments
-from cipher_pipeline.timeutil import TimeFrame
+from pipeline.connectors.paging import CursorPaginator
+from pipeline.connectors.spec import ConnectorRequest, EndpointSpec
+from pipeline.connectors.windows import UnixSecondsWindow
+from pipeline.db import raw
+from pipeline.db.control import ClaimedTask, claim
+from pipeline.db.pool import Pool
+from pipeline.db.raw import RawPage
+from pipeline.errors import LeaseConflict, TransientError
+from pipeline.stages.extract import extract
+from pipeline.telemetry import Instruments
+from pipeline.timeutil import TimeFrame
 
 DSN = os.environ.get("PIPELINE_TEST_DSN", "postgresql://postgres@localhost:5432/pipeline_test")
-SHOP = UUID("00000000-0000-0000-0000-000000000001")
+SOURCE = UUID("00000000-0000-0000-0000-000000000001")
 FRAME = TimeFrame.days(date(2026, 10, 19), date(2026, 10, 20), ZoneInfo("Europe/London"))
 SPEC = EndpointSpec(
     name="tiktok_shop.orders_search",
-    source="tiktok_shop",
+    connector="tiktok_shop",
     method="POST",
     path="/order/202309/orders/search",
     paginator=CursorPaginator(
@@ -52,20 +52,22 @@ type Hook = Callable[[int], Awaitable[None]]
 
 
 class FakeClient:
-    """A source client that returns queued bodies and runs a hook before each send."""
+    """A connector client that returns queued bodies and runs a hook before each send."""
 
-    source = "tiktok_shop"
+    connector = "tiktok_shop"
 
     def __init__(self, bodies: list[dict[str, Any] | Exception], hook: Hook | None = None) -> None:
         """Queue the responses, in order; an exception is raised instead of returned."""
         self.bodies = bodies
         self.hook = hook
-        self.requests: list[SourceRequest] = []
+        self.requests: list[ConnectorRequest] = []
+        self.source_ids: list[UUID] = []
 
-    async def send(self, request: SourceRequest, shop_id: UUID) -> dict[str, Any]:
+    async def send(self, request: ConnectorRequest, source_id: UUID) -> dict[str, Any]:
         """Return the next queued body."""
         n = len(self.requests)
         self.requests.append(request)
+        self.source_ids.append(source_id)
         if self.hook is not None:
             await self.hook(n)
         reply = self.bodies[n]
@@ -101,7 +103,7 @@ def instruments(reader: InMemoryMetricReader) -> Instruments:
     return Instruments(
         task_duration=meter.create_histogram("pipeline.task.duration", unit="s"),
         rows=meter.create_counter("pipeline.rows"),
-        source_requests=meter.create_counter("pipeline.source.requests"),
+        connector_requests=meter.create_counter("pipeline.connector.requests"),
         log_dropped=meter.create_counter("pipeline.log.dropped"),
         slots_busy=meter.create_up_down_counter("pipeline.worker.slots_busy"),
         queue_wait=meter.create_histogram("pipeline.task.queue_wait", unit="s"),
@@ -133,8 +135,9 @@ async def claimed(pool: Pool) -> ClaimedTask:
     """Insert a pending orders task and claim it."""
     async with pool.connection() as c:
         await c.execute(
-            "INSERT INTO control.task (run_id, job, shop_id, partition_key) VALUES (7, 'orders', %s, '2026-10-19')",
-            (SHOP,),
+            "INSERT INTO control.task (run_id, connector, job, source_id, partition_key) "
+            "VALUES (7, 'tiktok_shop', 'orders', %s, '2026-10-19')",
+            (SOURCE,),
         )
         task = await claim(c, "test-worker")
     assert task is not None
@@ -159,7 +162,7 @@ async def run(pool: Pool, task: ClaimedTask, client: FakeClient, instruments: In
 
 
 async def test_lands_every_page_with_its_cursors(pool: Pool, instruments: Instruments) -> None:
-    """Check each page is saved under the task and endpoint with its cursors and the rows fetched are returned."""
+    """Check each page is saved under its task, connector and endpoint with its cursors, and the rows are counted."""
     task = await claimed(pool)
     client = FakeClient([body(["a", "b"], "t1"), body(["c", "d"], "t2"), body(["e"])])
     assert await run(pool, task, client, instruments) == 5
@@ -171,17 +174,18 @@ async def test_lands_every_page_with_its_cursors(pool: Pool, instruments: Instru
     assert landed[2].cursor_next is None
     assert [p.payload for p in landed] == [body(["a", "b"], "t1"), body(["c", "d"], "t2"), body(["e"])]
     assert all(p.task_id == task.id for p in landed)
-    assert all(p.endpoint == "tiktok_shop.orders_search" for p in landed)
+    assert all(p.connector == "tiktok_shop" and p.endpoint == "orders_search" for p in landed)
 
 
-async def test_the_window_and_shop_reach_the_source(pool: Pool, instruments: Instruments) -> None:
-    """Check the request carries the frame through the named window."""
+async def test_the_window_and_source_reach_the_connector(pool: Pool, instruments: Instruments) -> None:
+    """Check the request carries the frame through the named window and is sent for the task's source."""
     task = await claimed(pool)
     client = FakeClient([body(["a"])])
     await run(pool, task, client, instruments)
     assert client.requests[0].body is not None
     assert client.requests[0].body["update_time_ge"] == int(FRAME.start.timestamp())
     assert client.requests[0].body["update_time_lt"] == int(FRAME.end.timestamp())
+    assert client.source_ids == [SOURCE]
 
 
 async def test_an_empty_page_is_landed(pool: Pool, instruments: Instruments) -> None:
@@ -206,7 +210,8 @@ async def test_other_tasks_pages_are_kept(pool: Pool, instruments: Instruments) 
     other = RawPage(
         task_id=999,
         page_no=0,
-        endpoint="cruva.samples",
+        connector="cruva",
+        endpoint="samples",
         cursor_in=None,
         cursor_next=None,
         fetched_at=datetime.now(UTC),
@@ -248,9 +253,9 @@ async def test_a_lease_lost_mid_fetch_stops_the_writes(pool: Pool, instruments: 
 
 
 async def test_a_failure_carries_the_rows_fetched(pool: Pool, instruments: Instruments) -> None:
-    """Check the source's own exception is re-raised with the attempt's count and the landed pages kept."""
+    """Check the connector's own exception is re-raised with the attempt's count and the landed pages kept."""
     task = await claimed(pool)
-    failure = TransientError("source timed out")
+    failure = TransientError("connector timed out")
     client = FakeClient([body(["a", "b"], "t1"), body(["c", "d"], "t2"), failure])
     with pytest.raises(TransientError) as caught:
         await run(pool, task, client, instruments)
@@ -259,8 +264,8 @@ async def test_a_failure_carries_the_rows_fetched(pool: Pool, instruments: Instr
     assert [p.page_no for p in await pages(pool, task.id)] == [0, 1]
 
 
-async def test_no_connection_is_held_across_a_source_call(pool: Pool, instruments: Instruments) -> None:
-    """Check the one-connection pool is free whenever the source is called."""
+async def test_no_connection_is_held_across_a_connector_call(pool: Pool, instruments: Instruments) -> None:
+    """Check the one-connection pool is free whenever the connector is called."""
     task = await claimed(pool)
 
     async def borrow(n: int) -> None:

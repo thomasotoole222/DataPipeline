@@ -1,12 +1,12 @@
-"""Unit tests for the paginators in ``cipher_pipeline.sources.paging``."""
+"""Unit tests for the paginators in ``pipeline.connectors.paging``."""
 
 from typing import Any
 
 import pytest
 
-from cipher_pipeline.errors import ClientErrorUnhandled
-from cipher_pipeline.sources.paging import CursorPaginator, HasMore, PageNumberPaginator, ShortPage, TotalCount
-from cipher_pipeline.sources.spec import EndpointSpec
+from pipeline.connectors.paging import CursorPaginator, HasMore, PageNumberPaginator, ShortPage, TotalCount
+from pipeline.connectors.spec import EndpointSpec
+from pipeline.errors import ClientErrorUnhandled
 
 SAMPLES_PAGING = PageNumberPaginator("page", "page_size", 2, HasMore(("data", "has_more")))
 SAMPLES = EndpointSpec("cruva.samples", "cruva", "POST", "/samples", SAMPLES_PAGING, ("data", "results"))
