@@ -24,8 +24,26 @@ class Paginator(Protocol):
 
     A cursor is a string, or ``None`` for the first page. The cursor ``next_cursor`` returns is the one the caller
     passes to ``apply`` for the following request, and ``None`` from ``next_cursor`` means there is no next page.
+    ``params`` lists every parameter ``apply`` may add on any page, so ``EndpointSpec`` can check them against its
+    method and fixed parameters at construction.
 
     """
+
+    @property
+    def params(self) -> tuple[tuple[Place, str], ...]:
+        """Return every parameter ``apply`` may add, on any page, with where it goes.
+
+        Preconditions:
+            None.
+
+        Returns:
+            One ``(place, name)`` pair per parameter; a body parameter's name is its top-level body key.
+
+        Raises:
+            Nothing.
+
+        """
+        ...
 
     def apply(self, request: ConnectorRequest, cursor: str | None) -> ConnectorRequest:
         """Return the request for the page at a cursor.
@@ -38,10 +56,12 @@ class Paginator(Protocol):
             cursor: The page to request, or ``None`` for the first page.
 
         Returns:
-            A copy of ``request`` with the paging parameters added.
+            ``request`` with the paging parameters added: a new request when any are added, or ``request`` itself
+            when an implementation adds none.
 
         Raises:
-            ValueError: Defined by each implementation.
+            ValueError: Defined by each implementation, for a cursor it cannot read or a request it cannot extend.
+            Exception: Defined by each implementation, such as whatever ``copy.deepcopy`` raises when a body is copied.
 
         """
         ...
@@ -62,6 +82,8 @@ class Paginator(Protocol):
 
         Raises:
             ClientErrorUnhandled: Defined by each implementation, for a body that cannot be read.
+            ValueError: Defined by each implementation, for a ``cursor_in`` it cannot read; not raised when the
+                precondition holds, because ``apply`` already accepted that cursor.
 
         """
         ...
@@ -74,6 +96,22 @@ class NoPaging:
     It holds no state and guarantees nothing beyond its methods: no parameters are added and there is no next page.
 
     """
+
+    @property
+    def params(self) -> tuple[tuple[Place, str], ...]:
+        """Return no parameters: an unpaged request is sent as it is.
+
+        Preconditions:
+            None.
+
+        Returns:
+            An empty tuple.
+
+        Raises:
+            Nothing.
+
+        """
+        return ()
 
     def apply(self, request: ConnectorRequest, cursor: str | None) -> ConnectorRequest:
         """Return the request unchanged, refusing any cursor.
@@ -167,6 +205,22 @@ class CursorPaginator:
         if self.has_more_at is not None:
             check_key_path(self.has_more_at)
 
+    @property
+    def params(self) -> tuple[tuple[Place, str], ...]:
+        """Return the page size and token parameters, both at ``place``.
+
+        Preconditions:
+            None.
+
+        Returns:
+            ``((place, size_param), (place, token_param))``; the token is added only after the first page.
+
+        Raises:
+            Nothing.
+
+        """
+        return ((self.place, self.size_param), (self.place, self.token_param))
+
     def apply(self, request: ConnectorRequest, cursor: str | None) -> ConnectorRequest:
         """Return the request with the page size, and the token when there is one.
 
@@ -195,10 +249,11 @@ class CursorPaginator:
     def next_cursor(self, body: Mapping[str, Any], cursor_in: str | None, *, spec: EndpointSpec) -> str | None:
         """Return the next token from a response, or ``None`` when it was the last page.
 
-        With ``has_more_at`` set, a false flag ends paging whatever the token, and a true flag requires a token.
-        Without it, a missing, ``null`` or empty token ends paging. A token equal to ``cursor_in`` is rejected, but
-        only that one-step repeat is detected: a connector cycling through two or more tokens is not. Records are not
-        read.
+        With ``has_more_at`` set, a false flag ends paging whatever the token, and a true flag requires a token and
+        at least one record: the records are counted strictly, as on a page that is not the last. Without it, a
+        missing, ``null`` or empty token ends paging and records are not read. A token equal to ``cursor_in`` is
+        rejected here; a longer cycle is not seen by this method, and ``fetch_pages`` rejects it from the cursors sent
+        in the same sub-frame.
 
         Preconditions:
             None.
@@ -206,15 +261,17 @@ class CursorPaginator:
         Args:
             body: The decoded response body.
             cursor_in: The token the response was requested with, or ``None`` for the first page.
-            spec: The endpoint, used to build errors.
+            spec: The endpoint, used to count records and to build errors.
 
         Returns:
             The non-empty next token, or ``None``.
 
         Raises:
-            ClientErrorUnhandled: From ``_flag`` when the flag is missing or not a bool; when the token is present
-                and not ``None`` but not a string; when the flag is true and the token is missing, ``null`` or empty;
-                or when the token equals ``cursor_in``.
+            ClientErrorUnhandled: From ``_flag`` when the flag is missing or not a bool; from
+                ``EndpointSpec.record_count`` when the flag is true and the records are missing, ``null`` or not a
+                list; when the flag is true and the page has no records; when the token is present and not ``None``
+                but not a string; when the flag is true and the token is missing, ``null`` or empty; or when the
+                token equals ``cursor_in``.
 
         """
         if self.has_more_at is not None and not _flag(body, self.has_more_at, spec):
@@ -231,6 +288,8 @@ class CursorPaginator:
             return None
         if token == cursor_in:
             raise spec.unhandled(f"connector returned the cursor just sent: {token!r}")
+        if self.has_more_at is not None and spec.record_count(body) == 0:  # more pages promised, none sent: no end
+            raise spec.unhandled("page is empty but has_more is true")
         return token
 
 
@@ -335,7 +394,7 @@ class PageNumberPaginator:
     first_page: int = 1
 
     def __post_init__(self) -> None:
-        """Reject a non-positive page size or a negative first page.
+        """Reject a non-positive page size, a negative first page, or empty or equal parameter names.
 
         Preconditions:
             None.
@@ -355,6 +414,22 @@ class PageNumberPaginator:
         if not self.page_param or not self.size_param or self.page_param == self.size_param:
             raise ValueError(f"parameter names must be non-empty and differ: {self.page_param!r}, {self.size_param!r}")
 
+    @property
+    def params(self) -> tuple[tuple[Place, str], ...]:
+        """Return the page number and page size parameters, both at ``place``.
+
+        Preconditions:
+            None.
+
+        Returns:
+            ``((place, page_param), (place, size_param))``.
+
+        Raises:
+            Nothing.
+
+        """
+        return ((self.place, self.page_param), (self.place, self.size_param))
+
     def apply(self, request: ConnectorRequest, cursor: str | None) -> ConnectorRequest:
         """Return the request with the page number and page size.
 
@@ -370,8 +445,8 @@ class PageNumberPaginator:
 
         Raises:
             ValueError: From ``_page`` when ``cursor`` is not a page number of at least ``first_page``; from
-                ``ConnectorRequest.with_param`` when the request already has that name, or (in the body) the request is
-                a GET.
+                ``ConnectorRequest.with_param`` when the request already has one of the names, or (in the body) the
+                request is a GET.
             Exception: In the body, whatever ``copy.deepcopy`` raises through ``with_param``.
 
         """
@@ -388,7 +463,9 @@ class PageNumberPaginator:
         An empty page that the rule says is not the last is rejected. ``ShortPage`` counts records strictly, because
         the count is its only end signal; ``HasMore`` and ``TotalCount`` decide first and then count with
         ``last_page`` set when there is no next page, so a last page may leave out its records or send them as
-        ``null``.
+        ``null``. ``TotalCount`` counts every page before the last as ``size`` records, so a page it says is not the
+        last must hold at least ``size`` records; a shorter one means the connector caps its page size below
+        ``size`` and is rejected, rather than ending paging before the total is reached.
 
         Preconditions:
             None.
@@ -405,8 +482,9 @@ class PageNumberPaginator:
             ValueError: From ``_page`` when ``cursor_in`` is not a page number of at least ``first_page``.
             ClientErrorUnhandled: From ``EndpointSpec.record_count`` when the records are missing, ``null`` or not
                 a list, except a missing or ``null`` list on a last page under ``HasMore`` or ``TotalCount``; from
-                ``_flag`` or ``_total`` when the end rule's value is missing or invalid; or when the page is empty but
-                the end rule says more pages follow.
+                ``_flag`` or ``EndpointSpec.count_at`` when the end rule's value is missing or invalid; when the page
+                is empty but the end rule says more pages follow; or, under ``TotalCount``, when a page the total says
+                is not the last holds fewer than ``size`` records.
 
         """
         page = self._page(cursor_in)
@@ -418,12 +496,17 @@ class PageNumberPaginator:
                 more = _flag(body, at, spec)
                 count = spec.record_count(body, last_page=not more)
             case TotalCount(at):
-                more = (page - self.first_page + 1) * self.size < _total(body, at, spec)
+                more = (page - self.first_page + 1) * self.size < spec.count_at(body, at)
                 count = spec.record_count(body, last_page=not more)
         if not more:
             return None
         if count == 0:  # the connector says more pages follow but sent nothing: paging would never end
             raise spec.unhandled(f"page {page} is empty but the end rule {self.end} says more pages follow")
+        if isinstance(self.end, TotalCount) and count < self.size:  # the total assumes full pages: records were lost
+            raise spec.unhandled(
+                f"page {page} returned fewer records than the requested page size ({count} < {self.size}) but the "
+                f"end rule {self.end} says more pages follow: the page size must not exceed the API's maximum"
+            )
         return str(page + 1)
 
     def _page(self, cursor: str | None) -> int:
@@ -474,32 +557,4 @@ def _flag(body: Mapping[str, Any], path: KeyPath, spec: EndpointSpec) -> bool:
         raise spec.unhandled(f"no has_more flag at {'.'.join(path)}") from None
     if not isinstance(value, bool):
         raise spec.unhandled(f"has_more at {'.'.join(path)} is a {type(value).__name__}, not a bool")
-    return value
-
-
-def _total(body: Mapping[str, Any], path: KeyPath, spec: EndpointSpec) -> int:
-    """Return the total record count at a key path.
-
-    Preconditions:
-        None.
-
-    Args:
-        body: The decoded response body.
-        path: Where the count is.
-        spec: The endpoint, used to build errors.
-
-    Returns:
-        The non-negative integer count.
-
-    Raises:
-        ClientErrorUnhandled: When nothing is at ``path`` or the value is not a non-negative ``int`` (booleans, floats,
-            strings and ``None`` are rejected).
-
-    """
-    try:
-        value = value_at(body, path)
-    except KeyError:
-        raise spec.unhandled(f"no total count at {'.'.join(path)}") from None
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise spec.unhandled(f"total count at {'.'.join(path)} is not a count: {value!r}")
     return value

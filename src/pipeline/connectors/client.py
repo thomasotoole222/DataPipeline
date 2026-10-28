@@ -12,18 +12,21 @@ Public API:
 """
 
 import asyncio
+import logging
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from functools import partial
-from typing import Any, Protocol, assert_never
+from typing import Any, Final, Protocol, assert_never
 from uuid import UUID
 
 import httpx
 
 from pipeline.connectors.spec import ConnectorRequest
+from pipeline.db.pool import storable_text
 from pipeline.errors import (
     AuthBlocked,
     ClientErrorUnhandled,
@@ -39,6 +42,9 @@ from pipeline.errors import (
 )
 from pipeline.telemetry import Instruments
 from pipeline.timeutil import utc_now
+
+#: Logger for this module.
+_log: Final = logging.getLogger(__name__)
 
 
 class CredentialProvider[C](Protocol):
@@ -180,6 +186,9 @@ class ErrorRule:
         Preconditions:
             None.
 
+        Args:
+            None.
+
         Returns:
             None.
 
@@ -301,17 +310,20 @@ class HttpConnectorClient[C](ABC):
     A subclass sets the class attributes ``connector`` and ``rules`` and implements ``build`` and ``fault``. Each
     attempt gets a credential from ``tokens`` and sends the request built by ``build``. Every attempt that reaches the
     exchange is recorded in ``instruments.connector_requests``; an attempt whose ``tokens.get`` raises, or whose
-    ``build`` or ``fault`` raises something other than a ``PipelineError`` or ``httpx.HTTPError``, is not. Error
-    responses are converted with ``map_error`` over ``rules``; a
-    ``TokenRejected`` credential is reported to ``tokens``; ``TransientError`` is retried with the defaults of
-    ``retries``.
+    ``build``, ``fault`` or ``http.send`` raises something other than a ``PipelineError`` or ``httpx.HTTPError``, or
+    whose response body is nested too deeply to parse or clean (``RecursionError``), is not. Error responses are
+    converted with ``map_error`` over ``rules``; a ``TokenRejected`` credential is reported to ``tokens``;
+    ``TransientError`` is retried with the defaults of ``retries``. Every character of a parsed response body that
+    Postgres text cannot store (NUL and lone surrogates) is replaced with U+FFFD, logged and counted in
+    ``instruments.text_replaced``.
 
     Attributes:
         connector (str): Class attribute set by the subclass. Name of the connector, used in errors and telemetry.
         rules (tuple[ErrorRule, ...]): Class attribute set by the subclass. Rules ``map_error`` tries in order.
         http (httpx.AsyncClient): The client requests are sent with.
         tokens (CredentialProvider[C]): Where credentials come from and rejected ones go.
-        instruments (Instruments): Telemetry instruments; ``connector_requests`` counts attempts.
+        instruments (Instruments): Telemetry instruments; ``connector_requests`` counts attempts and
+            ``text_replaced`` the response bodies whose unstorable characters were replaced.
 
     """
 
@@ -358,7 +370,8 @@ class HttpConnectorClient[C](ABC):
         Runs ``_attempt`` under ``retries`` with its defaults: up to 5 retries after the first attempt while it raises
         ``TransientError``, waiting with exponential backoff (1 s base, 60 s cap, up to 0.5 s jitter) through
         ``sleep``. Every attempt that reaches the exchange is recorded; an attempt whose ``tokens.get`` raises, or
-        whose ``build`` or ``fault`` raises something other than a ``PipelineError`` or ``httpx.HTTPError``, is not.
+        whose ``build``, ``fault`` or ``http.send`` raises something other than a ``PipelineError`` or
+        ``httpx.HTTPError``, or whose response body raises ``RecursionError`` in ``_call``, is not.
 
         Preconditions:
             None.
@@ -372,16 +385,20 @@ class HttpConnectorClient[C](ABC):
 
         Raises:
             TransientError: The last attempt's error once retries are used up. It covers ``RateLimited``, rule
-                outcomes of ``TRANSIENT``, and ``httpx.TimeoutException``, ``httpx.NetworkError`` and
-                ``httpx.RemoteProtocolError``, which are translated.
+                outcomes of ``TRANSIENT``, and ``httpx.TimeoutException``, ``httpx.NetworkError``,
+                ``httpx.RemoteProtocolError`` and ``httpx.DecodingError``, which are translated.
             RateLimited: At once, without retrying, when its ``retry_after`` exceeds 60 seconds.
             TokenRejected: After the credential is reported to ``tokens``. Not retried.
             AuthBlocked: From a ``BLOCKED`` rule. Not retried.
             PermanentError: From a ``PERMANENT`` rule. Not retried.
-            ClientErrorUnhandled: When no rule matches an error, or a 2xx body is not a JSON object. Not retried.
+            ClientErrorUnhandled: When no rule matches an error, a 2xx body holds the literal ``NaN``, ``Infinity``
+                or ``-Infinity`` or a number too large for a float, such as ``1e400``, or a 2xx body is not a JSON
+                object. Not retried.
             httpx.HTTPError: Any other ``httpx`` error, untranslated. Not retried.
-            Any exception from ``tokens.get``, ``tokens.reject``, ``build``, ``fault`` or ``sleep`` propagates; a
-                ``TransientError`` among them is retried.
+            RecursionError: From ``_call``, when a response body, of any status, is nested deeper than
+                ``_storable_text`` or ``json.loads`` can recurse. Not translated, recorded or retried.
+            Any exception from ``tokens.get``, ``tokens.reject``, ``build``, ``fault``, ``http.send`` or ``sleep``
+                propagates; a ``TransientError`` among them is retried.
 
         """
         return await self._send(request, source_id)
@@ -452,12 +469,15 @@ class HttpConnectorClient[C](ABC):
 
         Raises:
             PipelineError: The translated error from ``_exchange``: a ``map_error`` result, a ``TransientError`` for
-                a network failure, or a ``ClientErrorUnhandled`` for a 2xx body that is not a JSON object.
+                a network failure, or a ``ClientErrorUnhandled`` for a 2xx body that is not standard JSON or not a
+                JSON object.
             httpx.HTTPError: Any ``httpx`` error that ``translates_errors`` does not translate.
-            Any exception from ``tokens.get``, ``tokens.reject``, ``build`` or ``fault``, unchanged. An exception from
-                ``tokens.reject`` replaces the ``TokenRejected``. A ``TransientError`` from it is retried by ``send``
-                like any other; the next attempt fetches a fresh credential. The attempt is already recorded as
-                ``token_rejected``, and the ``TokenRejected`` stays as the new error's ``__context__``.
+            RecursionError: From ``_call`` for a too deeply nested response body; the attempt is not recorded.
+            Any exception from ``tokens.get``, ``tokens.reject``, ``build``, ``fault`` or ``http.send``, unchanged.
+                An exception from ``tokens.reject`` replaces the ``TokenRejected``. A ``TransientError`` from it is
+                retried by ``send`` like any other; the next attempt fetches a fresh credential. The attempt is
+                already recorded as ``token_rejected``, and the ``TokenRejected`` stays as the new error's
+                ``__context__``.
 
         """
         # Fresh credential and fresh build (TikTok timestamp + sign) on every attempt.
@@ -477,8 +497,19 @@ class HttpConnectorClient[C](ABC):
 
         A 2xx response succeeds when its body is a JSON object and ``fault`` returns ``None``. Any other response is
         raised as a ``ConnectorResponseError`` whose code, message and request id come from ``fault``, or, when the body
-        is not a JSON object or ``fault`` returns ``None``, from no code, the first 500 characters of the response
-        text, and no request id. Called through ``_exchange``, which translates what it raises.
+        is not a JSON object or ``fault`` returns ``None``, from no code, the first 500 characters of the response text,
+        and no request id. A 2xx body holding the literal ``NaN``, ``Infinity`` or ``-Infinity``, or a number literal
+        that overflows a float (``1e400``), is refused (see ``_json_object``); any other body is parsed with those
+        accepted, so an error response is classified by its status and ``fault`` as usual. Every NUL and lone surrogate
+        in a JSON-object body is replaced by ``_storable_text`` before ``fault`` reads it; when any was, a warning
+        naming the connector and the request path is logged and ``instruments.text_replaced`` gets 1 with a
+        ``connector`` attribute. Called through ``_exchange``, which translates what it raises.
+
+        Known limitation: a JSON-object body nested about 1,000 levels deep or more raises ``RecursionError`` from
+        ``_storable_text``, which recurses once per level against the default recursion limit of 1,000 (on Python
+        3.14, 997 levels of arrays pass when called near the top of the stack; fewer from deeper in it). That is far
+        below the about 52,000 levels ``_json_object`` can parse, so it is the depth that applies to every body that
+        parses as a JSON object. The ``RecursionError`` escapes ``send`` untranslated, unrecorded and not retried.
 
         Preconditions:
             None.
@@ -488,18 +519,40 @@ class HttpConnectorClient[C](ABC):
             credential: The credential to build the request with.
 
         Returns:
-            The response status code and the body parsed as a JSON object.
+            The response status code and the body parsed as a JSON object, with NUL characters and lone surrogates
+            replaced.
 
         Raises:
-            ClientErrorUnhandled: If a 2xx response body is not a JSON object; ``code`` and ``request_id`` are
-                ``None``.
+            ClientErrorUnhandled: If a 2xx response body is not standard JSON or is not a JSON object; ``code`` and
+                ``request_id`` are ``None``.
             ConnectorResponseError: If ``fault`` reports an error or the response is not 2xx. Its ``headers`` are the
                 response headers.
-            Any exception from ``build``, ``fault`` or ``http.send``, unchanged.
+            RecursionError: From ``_json_object`` or ``_storable_text`` when the body is nested too deeply, whatever the
+                status; see their docstrings.
+            Any exception from ``build``, ``fault``, ``http.send`` or ``Counter.add``, unchanged.
 
         """
         response = await self.http.send(self.build(request, credential))
-        body = _json_object(response)
+        try:
+            body = _json_object(response, strict=response.is_success)
+        except _NonStandardJsonError as err:
+            raise ClientErrorUnhandled(
+                connector=self.connector,
+                path=request.path,
+                status=response.status_code,
+                code=None,
+                message=f"response is not standard JSON: it holds {err}",
+                request_id=None,
+            ) from None
+        if body is not None:
+            body, replaced = _storable_text(body)
+            if replaced:
+                _log.warning(
+                    "connector %s: characters Postgres cannot store replaced in the response to %s",
+                    self.connector,
+                    request.path,
+                )
+                self.instruments.text_replaced.add(1, {"connector": self.connector})
         if response.is_success:
             if body is None:
                 raise ClientErrorUnhandled(
@@ -535,7 +588,8 @@ class HttpConnectorClient[C](ABC):
 
         Args:
             status: HTTP status of the attempt, or ``0`` when there was no response.
-            result: ``"success"``, ``"network_error"``, ``"unhandled"`` or an ``ErrorOutcome`` value.
+            result: ``"success"``, ``"network_error"``, ``"protocol_error"``, ``"unhandled"`` or an
+                ``ErrorOutcome`` value.
 
         Returns:
             None.
@@ -583,16 +637,25 @@ def _result(err: Exception) -> str:
         err: The error the attempt raised.
 
     Returns:
-        ``"network_error"`` if ``err`` or its ``__cause__`` is an ``httpx.HTTPError``; otherwise the
-        ``ErrorOutcome`` member for its type; otherwise ``"unhandled"``, as for ``ClientErrorUnhandled``.
+        When ``err``, or else its ``__cause__``, is an ``httpx.HTTPError``, a label taken from httpx's hierarchy:
+        ``"network_error"`` for an ``httpx.NetworkError`` (``ConnectError``, ``ReadError``, ``WriteError``,
+        ``CloseError``) or an ``httpx.TimeoutException`` (``ConnectTimeout``, ``ReadTimeout``, ``WriteTimeout``,
+        ``PoolTimeout``); ``"protocol_error"`` for every other ``httpx.HTTPError``, such as ``httpx.DecodingError``,
+        ``httpx.UnsupportedProtocol``, ``httpx.LocalProtocolError``, ``httpx.RemoteProtocolError``,
+        ``httpx.ProxyError``, ``httpx.TooManyRedirects`` or ``httpx.HTTPStatusError``, whether translated to a
+        ``TransientError`` or not. ``httpx.InvalidURL`` is not an ``httpx.HTTPError`` and never gets here. Otherwise
+        the ``ErrorOutcome`` member for its type; otherwise ``"unhandled"``, as for ``ClientErrorUnhandled``.
 
     Raises:
         None.
 
     """
-    # The metric's result for a failed attempt: the inverse of map_error, plus the two non-rule results.
-    if isinstance(err, httpx.HTTPError) or isinstance(err.__cause__, httpx.HTTPError):
+    # The metric's result for a failed attempt: the inverse of map_error, plus the three non-rule results.
+    http_err = err if isinstance(err, httpx.HTTPError) else err.__cause__
+    if isinstance(http_err, httpx.NetworkError | httpx.TimeoutException):
         return "network_error"
+    if isinstance(http_err, httpx.HTTPError):
+        return "protocol_error"
     match err:
         case RateLimited():
             return ErrorOutcome.RATE_LIMITED
@@ -608,25 +671,143 @@ def _result(err: Exception) -> str:
             return "unhandled"
 
 
-def _json_object(response: httpx.Response) -> dict[str, Any] | None:
+class _NonStandardJsonError(Exception):
+    """Signal that a response body holds a number with no finite ``float`` value, which ``jsonb`` cannot store.
+
+    Raised for the constants ``NaN``, ``Infinity`` and ``-Infinity``, which standard JSON does not allow, and for a
+    number literal that overflows a ``float``, such as ``1e400``. Not a ``ValueError``, so ``_json_object`` does not
+    mistake it for a body that is not JSON at all. ``str()`` gives the constant or literal found.
+
+    """
+
+
+def _reject_constant(name: str) -> Any:
+    """Refuse a non-standard JSON constant; used as ``parse_constant`` when decoding a response.
+
+    Preconditions:
+        None.
+
+    Args:
+        name: The constant the decoder met: ``"NaN"``, ``"Infinity"`` or ``"-Infinity"``.
+
+    Returns:
+        Never returns.
+
+    Raises:
+        _NonStandardJsonError: Always, carrying ``name``.
+
+    """
+    raise _NonStandardJsonError(name)
+
+
+def _finite_float(literal: str) -> float:
+    """Parse a JSON number literal as a ``float``, refusing one that overflows; used as ``parse_float``.
+
+    Preconditions:
+        ``literal`` is a JSON number literal with a fraction or an exponent, as the decoder passes to ``parse_float``.
+
+    Args:
+        literal: The number literal the decoder met.
+
+    Returns:
+        The literal's finite ``float`` value.
+
+    Raises:
+        _NonStandardJsonError: If the value is not finite, such as ``1e400`` or ``-1e999``, carrying ``literal``.
+
+    """
+    value = float(literal)
+    if not math.isfinite(value):
+        raise _NonStandardJsonError(literal)
+    return value
+
+
+def _json_object(response: httpx.Response, *, strict: bool) -> dict[str, Any] | None:
     """Return the response body parsed as JSON if it is a JSON object, else ``None``.
+
+    Known limitation: a body nested more deeply than the JSON decoder allows (the limit depends on the C stack; about
+    52,000 levels on Python 3.14 with the default main-thread stack) raises ``RecursionError`` instead of giving
+    ``None``, and ``send`` neither translates, records nor retries it. A JSON object that parses is then cleaned by
+    ``_storable_text`` in ``_call``, which raises ``RecursionError`` from about 1,000 levels, so for an object body
+    that lower depth is the one that applies.
+
+    ``strict`` refuses the literal constants, through ``parse_constant``, and a number literal too large for a
+    ``float``, such as ``1e400`` or ``-1e999``, through ``parse_float``, so a strictly parsed body holds no value that
+    ``json.dumps`` would write as ``NaN`` or ``Infinity``.
 
     Preconditions:
         The response body has been read, as ``http.send`` does when not streaming.
 
     Args:
         response: The response to parse.
+        strict: Keyword-only. Refuse the literals ``NaN``, ``Infinity`` and ``-Infinity`` and overflowing number
+            literals when true; when false, parse them as ``json.loads`` does, to ``float`` values, overflowing
+            literals becoming ``inf`` or ``-inf``.
 
     Returns:
-        The parsed body if it is a JSON object; ``None`` if it is not valid JSON or is another JSON value.
+        The parsed body if it is a JSON object, holding only finite floats when ``strict`` is true; ``None`` if it is
+        not valid JSON or is another JSON value.
 
     Raises:
-        Nothing for a body that is not valid JSON: ``ValueError`` from ``response.json()`` is caught.
+        _NonStandardJsonError: From ``_reject_constant`` when ``strict`` is true and the body holds ``NaN``,
+            ``Infinity`` or ``-Infinity``, or from ``_finite_float`` when ``strict`` is true and it holds a number
+            literal that overflows a ``float``. Nothing for a body that is not valid JSON: ``ValueError`` from
+            ``response.json()`` is caught.
+        RecursionError: From ``response.json()`` when the body nests arrays or objects too deeply for the decoder
+            (about 52,000 levels on Python 3.14 with the default stack); it is not a ``ValueError``, so it is not
+            caught.
 
     """
     try:
-        body = response.json()
+        body = response.json(parse_constant=_reject_constant, parse_float=_finite_float) if strict else response.json()
     except ValueError:
         return None
     # Trust boundary: the network can send any JSON value.
     return body if isinstance(body, dict) else None
+
+
+def _storable_text(value: Any) -> tuple[Any, bool]:
+    """Return a decoded JSON value with its strings, keys included, made storable by ``storable_text``.
+
+    Only text Postgres ``text`` and ``jsonb`` can store is kept: every NUL (U+0000) and every surrogate (U+D800 to
+    U+DFFF, which ``json.loads`` gives for an unpaired surrogate escape in the JSON text) is replaced with U+FFFD.
+    Objects and arrays are rebuilt only when something inside them changed; other values are returned as they are.
+    Two keys of one object that differ only by such characters and U+FFFD become the same key, and the later one's
+    value is kept.
+
+    Known limitation: the function recurses once per level of nesting, so a body nested about as deep as the
+    interpreter's recursion limit (1,000 by default) raises ``RecursionError``: on Python 3.14, 997 levels of arrays
+    pass when called near the top of the stack, fewer from deeper in it, while ``json.loads`` parses about 52,000.
+    This is the lower of the two depths, so it is the one that applies to a JSON-object body in ``_call``. ``send``
+    neither translates, records nor retries the error. No connector sends bodies anywhere near that deep.
+
+    Preconditions:
+        ``value`` is what ``json.loads`` returns: ``dict`` with ``str`` keys, ``list``, ``str``, number, bool or
+        ``None``.
+
+    Args:
+        value: The value to clean.
+
+    Returns:
+        The cleaned value and whether any character was replaced.
+
+    Raises:
+        RecursionError: If ``value`` nests arrays or objects more deeply than the recursion limit allows.
+
+    """
+    match value:
+        case str():
+            cleaned = storable_text(value)
+            return cleaned, cleaned is not value
+        case dict():
+            items = [(_storable_text(k), _storable_text(v)) for k, v in value.items()]
+            if not any(k_changed or v_changed for (_, k_changed), (_, v_changed) in items):
+                return value, False
+            return {k: v for (k, _), (v, _) in items}, True
+        case list():
+            elements = [_storable_text(v) for v in value]
+            if not any(changed for _, changed in elements):
+                return value, False
+            return [v for v, _ in elements], True
+        case _:
+            return value, False

@@ -1,1 +1,1 @@
-"""Connector API access: endpoint specs, request windows, paging, fetching and the per-connector clients."""
+"""Connector API access: endpoint specs, windows, paging, fetching and the HTTP client base for connectors."""

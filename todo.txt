@@ -1,0 +1,39 @@
+Known issues and open items, 2026-10-28
+=======================================
+
+Known issues
+------------
+Found by the last review round and left open on purpose. Fix one if integration testing or production shows it
+matters.
+
+1. config._load: an env-file path whose "~" cannot be expanded (e.g. "~nosuchuser/.env", or "~/.env" with no HOME
+   and no password-database entry) raises RuntimeError from Path.expanduser instead of the usual
+   "env file <path> cannot be checked" refusal.
+   Fix: move expanduser inside the stat try and refuse on RuntimeError.
+
+2. config.Settings.__init_subclass__: refuses a subclass that changes env_prefix, case_sensitive,
+   env_file_encoding or secrets_dir, but accepts other pydantic-settings keys that _load ignores
+   (env_ignore_empty, env_parse_none_str, env_nested_delimiter, env_prefix_target). Example: with
+   env_ignore_empty=True an empty PIPELINE_LOG_LEVEL still reaches validation and fails.
+   Fix: allow-list the model_config keys _load honours and refuse every other one, naming the key.
+
+3. worker.lease.Lease._heartbeats: the heartbeat_lag metric is described as the time between successful
+   heartbeats, but it is measured from the last committed renewal (the claim, or a committed fenced block after a
+   pause). Frequent fenced writes make it read near zero, so it cannot show slow heartbeats.
+   Fix: measure from the last heartbeat (skip the first), or redefine the metric in telemetry.Instruments.
+
+4. checks.record.Record.__pydantic_init_subclass__: the (name, fields) list of field validators is rebuilt on
+   every pass of the "for name in key" loop although it does not depend on the name. Readability only.
+   Fix: build it once before the loop.
+
+Open build items
+----------------
+5. Dockerfile and README.md are empty. The Dockerfile is specified on build-spec tab 1; stage 1 stays Modified until
+   it exists.
+
+6. The Alembic revision <revision>_pipeline_raw_quarantine.py and tests/integration/conftest.py (build-spec tab 3)
+   are not written yet; stage 3 stays Modified until they exist. Both belong with the integration-testing setup.
+
+7. Stage 10: the Orchestrator's lease-expiry function must take the task row lock (as control.claim does with
+   FOR UPDATE SKIP LOCKED), so a fenced Load's row lock prevents a takeover. The control-schema DDL enters the build
+   spec with stage 10.

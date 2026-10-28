@@ -1,5 +1,6 @@
 """Integration tests for ``pipeline.worker.lease`` against a database with control loaded."""
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from datetime import timedelta
@@ -17,9 +18,14 @@ from pipeline.errors import LeaseConflict, Outcome
 from pipeline.telemetry import Instruments
 from pipeline.worker.lease import Lease
 
-DSN = os.environ.get("PIPELINE_TEST_DSN", "postgresql://postgres@localhost:5432/pipeline_test")
+DSN = os.environ.get("TEST_PIPELINE_DSN", "postgresql://postgres@localhost:5432/pipeline_test")
 SOURCE = UUID("00000000-0000-0000-0000-000000000001")
 WORKER = "test-worker"
+
+
+def started() -> float:
+    """Return the running loop's time, as the worker notes it just before a claim."""
+    return asyncio.get_running_loop().time()
 
 
 @pytest.fixture
@@ -57,6 +63,8 @@ def instruments(reader: InMemoryMetricReader) -> Instruments:
         lease_unwind=meter.create_histogram("pipeline.lease.unwind", unit="s"),
         unknown_jobs=meter.create_counter("pipeline.task.unknown_job"),
         worker_paused=meter.create_counter("pipeline.worker.paused"),
+        check_failures=meter.create_counter("pipeline.check.failures"),
+        text_replaced=meter.create_counter("pipeline.connector.text_replaced"),
     )
 
 
@@ -113,7 +121,7 @@ async def test_complete_with_a_stale_token_records_a_commit_loss(
 ) -> None:
     """Check that complete on a stolen lease raises, records a commit loss and leaves completed unset."""
     task = await claimed(pool)
-    held = Lease(pool, task, worker_id=WORKER, instruments=instruments)
+    held = Lease(pool, task, worker_id=WORKER, instruments=instruments, claim_started=started())
     await steal(pool, task)
     async with pool.connection() as c:
         with pytest.raises(LeaseConflict):
@@ -129,7 +137,7 @@ async def test_complete_records_the_task_duration(
 ) -> None:
     """Check that complete records the reported duration, with the job and outcome as attributes."""
     task = await claimed(pool)
-    held = Lease(pool, task, worker_id=WORKER, instruments=instruments)
+    held = Lease(pool, task, worker_id=WORKER, instruments=instruments, claim_started=started())
     async with pool.connection() as c:
         await held.complete(c, success(duration=timedelta(seconds=2.5)))
     (point,) = points(reader, "pipeline.task.duration")

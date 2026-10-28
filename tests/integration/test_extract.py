@@ -2,6 +2,7 @@
 
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
@@ -15,16 +16,16 @@ from psycopg_pool import AsyncConnectionPool
 from pipeline.connectors.paging import CursorPaginator
 from pipeline.connectors.spec import ConnectorRequest, EndpointSpec
 from pipeline.connectors.windows import UnixSecondsWindow
-from pipeline.db import raw
+from pipeline.db import control, raw
 from pipeline.db.control import ClaimedTask, claim
-from pipeline.db.pool import Pool
+from pipeline.db.pool import Connection, Pool
 from pipeline.db.raw import RawPage
 from pipeline.errors import LeaseConflict, TransientError
 from pipeline.stages.extract import extract
 from pipeline.telemetry import Instruments
 from pipeline.timeutil import TimeFrame
 
-DSN = os.environ.get("PIPELINE_TEST_DSN", "postgresql://postgres@localhost:5432/pipeline_test")
+DSN = os.environ.get("TEST_PIPELINE_DSN", "postgresql://postgres@localhost:5432/pipeline_test")
 SOURCE = UUID("00000000-0000-0000-0000-000000000001")
 FRAME = TimeFrame.days(date(2026, 10, 19), date(2026, 10, 20), ZoneInfo("Europe/London"))
 SPEC = EndpointSpec(
@@ -112,6 +113,8 @@ def instruments(reader: InMemoryMetricReader) -> Instruments:
         lease_unwind=meter.create_histogram("pipeline.lease.unwind", unit="s"),
         unknown_jobs=meter.create_counter("pipeline.task.unknown_job"),
         worker_paused=meter.create_counter("pipeline.worker.paused"),
+        check_failures=meter.create_counter("pipeline.check.failures"),
+        text_replaced=meter.create_counter("pipeline.connector.text_replaced"),
     )
 
 
@@ -156,9 +159,24 @@ async def pages(pool: Pool, task_id: int) -> list[RawPage]:
         return [p async for p in raw.read_pages(c, task_id)]
 
 
+class FakeFence:
+    """A ``Fence`` that opens a transaction and runs ``control.fence`` in it, as the worker's ``Lease.fenced`` does."""
+
+    def __init__(self, task: ClaimedTask) -> None:
+        """Fence on ``task``."""
+        self.task = task
+
+    @asynccontextmanager
+    async def fenced(self, conn: Connection) -> AsyncIterator[None]:
+        """Open a transaction on ``conn``, fence it on the task's lease, and run the block."""
+        async with conn.transaction():
+            await control.fence(conn, self.task)
+            yield
+
+
 async def run(pool: Pool, task: ClaimedTask, client: FakeClient, instruments: Instruments) -> int:
     """Run extract for the orders spec over ``FRAME``."""
-    return await extract(pool, task, client, SPEC, "update", FRAME, instruments)
+    return await extract(pool, task, FakeFence(task), client, SPEC, "update", FRAME, instruments)
 
 
 async def test_lands_every_page_with_its_cursors(pool: Pool, instruments: Instruments) -> None:

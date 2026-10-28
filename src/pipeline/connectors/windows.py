@@ -20,7 +20,8 @@ class Window(Protocol):
     """Describe how an endpoint receives a time frame, and whether that frame must be whole local days.
 
     ``whole_days`` tells the caller how to split a frame (``TimeFrame.halve(whole_days=...)``), so that every frame
-    passed to ``apply`` is one the window can express.
+    passed to ``apply`` is one the window can express. A window whose ``whole_days`` is ``True`` must reject, with
+    ``ValueError`` from ``apply``, a frame that is not whole local days, rather than send a widened or truncated range.
 
     """
 
@@ -44,7 +45,7 @@ class Window(Protocol):
         """Return a copy of a request with a time frame added as filter parameters.
 
         Preconditions:
-            When ``whole_days`` is ``True``, ``frame`` is whole local days in its zone.
+            None; a frame the window cannot express is rejected.
 
         Args:
             request: The request without window parameters.
@@ -54,7 +55,11 @@ class Window(Protocol):
             A copy of ``request`` with the window parameters added.
 
         Raises:
-            ValueError: Defined by each implementation.
+            ValueError: When ``frame`` cannot be expressed by the window, which for a ``whole_days`` window includes
+                any frame that does not start and end at local midnight in its zone, or ``request`` cannot take its
+                parameters; each implementation states the cases.
+            TypeError: As an implementation states, for a frame whose zone is not a ``tzinfo``.
+            OverflowError: As an implementation states, for a bound near the ``datetime`` range.
 
         """
         ...
@@ -64,12 +69,14 @@ class Window(Protocol):
 class UnixSecondsWindow:
     """Send a frame as a start and an end parameter, each in whole Unix seconds.
 
-    Both bounds are floored to the second by ``to_epoch``. The end is the frame's exclusive end, so the endpoint
-    must read the end parameter as exclusive. Construction guarantees that both parameter names are non-empty and
-    different.
+    Both bounds are floored to the second by ``to_epoch``, so a frame with fractional bounds is sent as the
+    whole-second range ``[floor(start), floor(end))``; adjacent frames share a bound and so still meet exactly. The end
+    is the frame's exclusive end, so the endpoint must read the end parameter as exclusive. Construction guarantees
+    that both parameter names are non-empty and different.
 
     Attributes:
-        whole_days (ClassVar[bool]): Always ``False``; any frame of at least one whole second can be sent.
+        whole_days (ClassVar[bool]): Always ``False``; any frame whose bounds floor to different seconds can be sent,
+            which includes every frame of at least one second.
         start_param (str): The name of the start parameter.
         end_param (str): The name of the end parameter.
         place (Place): Whether both parameters go in the query or at the top level of the body. Defaults to
@@ -119,8 +126,9 @@ class UnixSecondsWindow:
         Raises:
             ValueError: When both bounds floor to the same second, so the range of whole seconds would be empty; or
                 from ``ConnectorRequest.with_param`` when a name is already set on ``request``, or ``place`` is
-                ``Place.BODY`` and ``request`` is a GET.
-            Exception: For ``Place.BODY``, whatever ``copy.deepcopy`` raises through ``with_param``.
+                ``Place.BODY`` and ``request`` is a GET. The names themselves always pass ``check_key_path``, as
+                ``__post_init__`` guarantees. ``with_param``'s ``copy.deepcopy`` failure cannot occur: the values are
+                ``int`` and the rest of the body was already deep-copied when ``request`` was built.
 
         """
         start, end = to_epoch(frame.start), to_epoch(frame.end)
@@ -255,10 +263,11 @@ class FlatDateWindow:
         Raises:
             ValueError: From ``_date_bounds`` when ``frame`` is not whole local days; or from
                 ``ConnectorRequest.with_param`` when a name is already set on ``request``, or ``place`` is
-                ``Place.BODY`` and ``request`` is a GET.
+                ``Place.BODY`` and ``request`` is a GET. The names always pass ``check_key_path``, as ``__post_init__``
+                guarantees, and the ``copy.deepcopy`` failure ``with_param`` allows cannot occur: the values are
+                strings and the rest of the body was already deep-copied when ``request`` was built.
             TypeError: From ``TimeFrame.dates``, through ``_date_bounds``, when the frame's zone is not a ``tzinfo``.
             OverflowError: From ``TimeFrame.dates``, through ``_date_bounds``, for a bound near the ``datetime`` range.
-            Exception: For ``Place.BODY``, whatever ``copy.deepcopy`` raises through ``with_param``.
 
         """
         first, end = _date_bounds(frame, end_inclusive=self.end_inclusive)

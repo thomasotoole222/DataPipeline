@@ -1,6 +1,8 @@
 """Describe where a record model loads: its table, writer and columns, built from its field marks and type mapping.
 
 Public API:
+    TABLE_PATTERN: The pattern a ``schema.table`` name matches, used with ``fullmatch``.
+    COLUMN_PATTERN: The pattern a bare column name matches, used with ``fullmatch``.
     To: Field mark that loads a single value into the named column.
     Rows: Field mark that loads a ``list`` of child parts as rows of the child's own table.
     Upsert: Writer that inserts rows or updates them on a conflict over ``key``.
@@ -14,6 +16,7 @@ Public API:
     target_of: Return a model's top-level target.
     build_target: Build and check a model's target from its table, writer, source column and field marks.
     mismatches: List the ways a table in the catalog does not fit a target.
+    alias_value: Return a ``type`` alias's value, with a subscripted generic alias's arguments substituted.
 
 Private units:
     _columns: Collect the columns of a model's marked fields and computed fields, nested parts included.
@@ -34,7 +37,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from types import NoneType, UnionType
-from typing import Annotated, Any, Final, Literal, TypeAliasType, Union, get_args, get_origin
+from typing import Annotated, Any, Final, Literal, TypeAliasType, TypeVar, Union, get_args, get_origin
 from uuid import UUID
 
 import polars as pl
@@ -44,11 +47,12 @@ from pydantic.fields import FieldInfo
 from pipeline.db.catalog import TableInfo
 
 #: A ``schema.table`` name: two lower-case identifiers of ASCII letters, digits and ``_``, not starting with a digit,
-#: joined by one dot. Used with ``fullmatch``.
-_TABLE: Final = re.compile(r"[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*")
-#: A bare column name: one lower-case identifier of ASCII letters, digits and ``_``, not starting with a digit. Used
-#: with ``fullmatch``.
-_COLUMN: Final = re.compile(r"[a-z_][a-z0-9_]*")
+#: joined by one dot. Used with ``fullmatch``. Each identifier is 1 to 63 characters, the most Postgres keeps
+#: (NAMEDATALEN - 1), so a name is never truncated by Postgres.
+TABLE_PATTERN: Final = re.compile(r"[a-z_][a-z0-9_]{0,62}\.[a-z_][a-z0-9_]{0,62}")
+#: A bare column name: one lower-case identifier of ASCII letters, digits and ``_``, not starting with a digit, 1 to
+#: 63 characters, the most Postgres keeps (NAMEDATALEN - 1). Used with ``fullmatch``.
+COLUMN_PATTERN: Final = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 #: The Postgres type name of a ``timestamptz`` column, as ``format_type`` prints it.
 _TIMESTAMPTZ: Final = "timestamp with time zone"
@@ -62,6 +66,8 @@ _SCALARS: Final[dict[object, tuple[pl.DataType, str]]] = {
     bool: (pl.Boolean(), "boolean"),
     UUID: (pl.String(), "uuid"),
 }
+#: The largest ``max_digits`` a loaded ``Decimal`` may have: the largest precision ``pl.Decimal`` holds.
+_MAX_DIGITS: Final = 38
 #: The Postgres types an ``Update`` with ``missing="zero"`` can set to zero: ``bigint`` or ``numeric(p,s)``. Used with
 #: ``fullmatch``.
 _NUMERIC: Final = re.compile(r"bigint|numeric\(\d+,\d+\)")
@@ -71,8 +77,8 @@ _NUMERIC: Final = re.compile(r"bigint|numeric\(\d+,\d+\)")
 class To:
     """Field mark that loads a single value into the named column.
 
-    ``__post_init__`` is not defined, so ``column`` is not validated here; ``_column`` checks it against ``_COLUMN``
-    when the model's target is built.
+    ``__post_init__`` is not defined, so ``column`` is not validated here; ``_column`` checks it against
+    ``COLUMN_PATTERN`` when the model's target is built.
 
     Attributes:
         column: The target column name.
@@ -126,6 +132,9 @@ class ReplaceChildren:
 class ReplacePartition:
     """Writer that replaces the rows whose ``column`` lies in the task's time frame.
 
+    Only the task's source's rows are replaced when the table has a source column; otherwise every row in the frame.
+    It has no key, so a target with this writer cannot have ``Rows`` children.
+
     ``__post_init__`` is not defined, so ``column`` is not validated here; ``_check_writer`` checks it is a target
     column of type ``timestamptz`` or ``date`` that does not allow None when the target is built.
 
@@ -163,8 +172,8 @@ class Update:
     Attributes:
         key: Target column names: non-empty, distinct, not nullable, and including the source column when the table has
             one.
-        missing: ``"keep"`` leaves the source's rows the connector did not return; ``"zero"`` sets their columns outside
-            ``key`` to zero.
+        missing: ``"keep"`` leaves the source's rows the connector did not return (every table row when the table has
+            no source column); ``"zero"`` sets their columns outside ``key`` to zero.
 
     """
 
@@ -183,7 +192,7 @@ class Column:
     ``__post_init__`` is not defined, so nothing is validated here; ``build_target`` makes every instance.
 
     Attributes:
-        name: The target column name, matching ``_COLUMN``.
+        name: The target column name, matching ``COLUMN_PATTERN``.
         polars: The column's type in the frame.
         postgres: The column's type exactly as ``format_type`` prints it.
         nullable: True when the field allows None, or lies inside a part that does.
@@ -210,7 +219,7 @@ class Target:
     checks the names, the writer against the columns, and that column names are distinct.
 
     Attributes:
-        table: The table as ``schema.table``, matching ``_TABLE``.
+        table: The table as ``schema.table``, matching ``TABLE_PATTERN``.
         writer: How the frame is written to ``table``.
         source_column: The column the task's source id is written to, or None; always None for ``ReplaceChildren``.
         columns: Every column the frame has, in frame order: the source column first, then inherited, then own.
@@ -261,8 +270,9 @@ def build_target(model: type[BaseModel], table: str, writer: Writer, source_colu
     The columns are the source column (``uuid``, not nullable, path ``()``) when given, then the columns ``_columns``
     collects. Each ``Rows`` field gives a child whose target is rebuilt with the writer key's columns (inherited)
     before its own and ``inherited`` set to the key names. A child cannot have children of its own: its writer is
-    ``ReplaceChildren``, which has no key, so its own build refused any ``Rows``. The model's table and its children's
-    tables must all differ.
+    ``ReplaceChildren``, which has no key, so its own build refused any ``Rows``. An ``Update`` parent cannot have
+    children: the row it updates may not exist, so its child rows would have no parent. The model's table and its
+    children's tables must all differ.
 
     Preconditions:
         None.
@@ -277,18 +287,21 @@ def build_target(model: type[BaseModel], table: str, writer: Writer, source_colu
         The target, with ``inherited=()`` and one child per ``Rows`` field in field order.
 
     Raises:
-        ValueError: ``table`` or ``source_column`` is not a lower-case name of the right form; from ``_columns``, for a
-            malformed ``To`` column; from ``_check_writer``, for a writer that does not fit the columns.
+        ValueError: ``table`` or ``source_column`` is not a lower-case name of the right form (an identifier over 63
+            characters included); from ``_columns``, for a malformed ``To`` column or a ``Decimal`` precision or scale
+            out of range; from ``_check_writer``, for a writer that does not fit the columns.
         TypeError: ``source_column`` is given with ``ReplaceChildren``; ``model`` is not complete; ``Rows`` is used with
-            a writer that has no key; two targets load into one table; from ``_columns``, for a misused mark, a type
-            with no column type or a part that contains itself; from ``_check_names``, for a repeated column name in
-            the model or in a child.
+            a writer that has no key or with ``Update``; two targets load into one table; from ``_columns``, for a
+            misused mark (``Rows`` on a ``list`` without exactly one argument included), a type with no column type,
+            a part that contains itself, an unmarked union with a part among its members or a generic type alias
+            whose arguments cannot be substituted; from ``_check_names``, for a repeated column name in the model or
+            in a child; from ``_check_writer``, for a ``ReplaceChildren`` model with no column of its own.
 
     """
     name = model.__name__
-    if not _TABLE.fullmatch(table):
+    if not TABLE_PATTERN.fullmatch(table):
         raise ValueError(f"{name}: table must be schema.table in lower case, got {table!r}")
-    if source_column is not None and not _COLUMN.fullmatch(source_column):
+    if source_column is not None and not COLUMN_PATTERN.fullmatch(source_column):
         raise ValueError(f"{name}: source_column must be a lower-case name, got {source_column!r}")
     if source_column is not None and isinstance(writer, ReplaceChildren):
         raise TypeError(f"{name}: a ReplaceChildren table has no source_column; the source comes with the parent's key")
@@ -301,7 +314,9 @@ def build_target(model: type[BaseModel], table: str, writer: Writer, source_colu
     _check_writer(name, writer, columns, source_column)
     key = _key(writer)
     if rows and key is None:
-        raise TypeError(f"{name}: Rows needs a writer with a key (Upsert, Snapshot or Update)")
+        raise TypeError(f"{name}: Rows needs a writer with a key (Upsert or Snapshot)")
+    if rows and isinstance(writer, Update):
+        raise TypeError(f"{name}: Rows is not for an Update table; its rows may not exist to own the children")
     by_name = {column.name: column for column in columns}
     inherited = tuple(by_name[column] for column in key or ())  # Rows implies a key, checked above
     tables = [table, *(child.table for _, child in rows)]
@@ -326,9 +341,10 @@ def _columns(
     """Collect the columns of a model's marked fields and computed fields, nested parts included.
 
     Fields come first, in field order, then computed fields. A ``To`` field gives one column. An unmarked field whose
-    type is a part gives the part's columns in its place; a computed field that returns a part does not. A ``Rows``
-    field appends ``(field name, child target)`` to ``rows`` and gives no column. Other unmarked fields, unmarked
-    lists included, are skipped.
+    type is a part gives the part's columns in its place; a computed field that returns a part does not. An unmarked
+    field whose type is a union with a part among its members (``A | B``, ``A | B | None``, ``A | int``) is refused,
+    since no one part gives its columns; ``A | None`` is a single optional part. A ``Rows`` field appends ``(field
+    name, child target)`` to ``rows`` and gives no column. Other unmarked fields, unmarked lists included, are skipped.
 
     Preconditions:
         None.
@@ -346,8 +362,9 @@ def _columns(
     Raises:
         TypeError: ``To`` on a list; ``Rows`` on a nested part's field, a non-list or a computed field; a mark on a
             part field; a part field whose part has its own table; a part field whose part contains itself (its
-            part is in ``inside``); from ``_mark``, ``_child`` and ``_column``.
-        ValueError: From ``_column``, for a malformed ``To`` column.
+            part is in ``inside``); an unmarked field whose type is a union with a part among its members; from
+            ``_unwrap``, ``_mark``, ``_child`` and ``_column``.
+        ValueError: From ``_column``, for a malformed ``To`` column or a ``Decimal`` precision or scale out of range.
 
     """
     columns: list[Column] = []
@@ -375,6 +392,15 @@ def _columns(
                     f"{where}: {annotation.__name__} contains itself, so it cannot be flattened into columns"
                 )
             columns.extend(_columns(annotation, here, optional or nullable, None, (*inside, annotation)))
+        elif (
+            mark is None
+            and get_origin(annotation) in (Union, UnionType)
+            and any(
+                isinstance(member, type) and issubclass(member, BaseModel)
+                for member in (_unwrap(arg, ())[0] for arg in get_args(annotation))
+            )
+        ):
+            raise TypeError(f"{where}: a union of parts cannot be flattened into columns")
         elif isinstance(mark, Rows):
             raise TypeError(f"{where}: Rows is only for a list of parts")
         elif isinstance(mark, To):
@@ -393,33 +419,42 @@ def _columns(
 def _unwrap(annotation: Any, metadata: Sequence[object]) -> tuple[Any, tuple[object, ...], bool]:
     """Strip type aliases, ``Annotated`` and ``Optional`` from an annotation.
 
-    Layers are stripped from the outside in until none is left. Each ``Annotated`` adds its extras to the metadata; a
-    ``FieldInfo`` extra adds its ``metadata`` items rather than itself. ``X | None`` becomes ``X`` and sets nullable.
-    A union of two or more types besides None is returned whole, still holding None, with nullable set.
+    Layers are stripped from the outside in until none is left. A ``type`` alias, bare or subscripted
+    (``Maybe[Address]`` for ``type Maybe[T] = T | None``), is replaced by ``alias_value``. Each ``Annotated`` adds its
+    extras to the metadata; a ``FieldInfo`` extra adds its ``metadata`` items rather than itself. ``X | None`` becomes
+    ``X`` and sets nullable. A union of two or more types besides None is returned whole, still holding None, with
+    nullable set; a union without None (``int | str``) is returned whole with nullable as found so far.
+
+    The metadata comes back innermost layer first: each stripped layer's items, in their own order, are placed
+    before the ones already found, so ``metadata`` comes last. Pydantic applies an outer layer's constraints after an
+    inner one's, so the last ``max_digits``/``decimal_places`` is the one it enforces: for a field such as
+    ``Annotated[Money | None, Field(max_digits=12, decimal_places=2), To("price")]`` with
+    ``type Money = Annotated[Decimal, Field(max_digits=10, decimal_places=2)]`` both the validator and
+    ``_column_type`` use 12 digits.
 
     Preconditions:
         None.
 
     Args:
         annotation: The annotation to strip.
-        metadata: Metadata already found, placed first in the result.
+        metadata: Metadata already found (the outermost layer's), placed last in the result.
 
     Returns:
-        The stripped annotation, ``metadata`` followed by the metadata found, and whether None is allowed.
+        The stripped annotation, the metadata found followed by ``metadata``, and whether None is allowed.
 
     Raises:
-        Nothing.
+        TypeError: From ``alias_value``, for a subscripted generic alias whose arguments cannot be substituted.
 
     """
     found = list(metadata)
     nullable = False
     while True:
-        if isinstance(annotation, TypeAliasType):
-            annotation = annotation.__value__
+        if isinstance(annotation, TypeAliasType) or isinstance(get_origin(annotation), TypeAliasType):
+            annotation = alias_value(annotation)  # type X = ..., bare or subscripted
         elif get_origin(annotation) is Annotated:
             annotation, *extra = get_args(annotation)
-            for item in extra:
-                found.extend(item.metadata if isinstance(item, FieldInfo) else [item])
+            layer = [part for item in extra for part in (item.metadata if isinstance(item, FieldInfo) else [item])]
+            found[:0] = layer  # inner layers first: pydantic applies the outer layer's constraints last
         elif get_origin(annotation) in (Union, UnionType) and NoneType in get_args(annotation):
             rest = [arg for arg in get_args(annotation) if arg is not NoneType]
             if len(rest) > 1:
@@ -427,6 +462,42 @@ def _unwrap(annotation: Any, metadata: Sequence[object]) -> tuple[Any, tuple[obj
             annotation, nullable = rest[0], True
         else:
             return annotation, tuple(found), nullable
+
+
+def alias_value(form: Any) -> Any:
+    """Return a ``type`` alias's value, with a subscripted generic alias's arguments substituted.
+
+    A bare alias (``type Code = str``) gives its ``__value__``. A subscripted generic alias (``Pair[int]`` for
+    ``type Pair[T] = tuple[T, T]``) gives its alias's value with each type parameter replaced by its argument:
+    ``tuple[int, int]``. The arguments are substituted only when the value is one of the alias's type variables
+    (``type Id[T] = T``) or when the value's own parameters are the alias's type parameters in the same order; any
+    other value (e.g. ``type Swap[A, B] = tuple[B, A]``, whose value lists its parameters in another order) is
+    refused, since subscripting it would bind the arguments to the wrong parameters. Aliases inside the value are not
+    resolved.
+
+    Preconditions:
+        ``form`` is a ``TypeAliasType`` or a subscripted one (its ``get_origin`` is a ``TypeAliasType``).
+
+    Args:
+        form: The alias, bare or subscripted.
+
+    Returns:
+        The alias's value, its arguments substituted.
+
+    Raises:
+        TypeError: ``form`` is a subscripted alias whose value is neither one of its type variables nor generic in
+            its type parameters in order, or whose arguments do not fit its parameters.
+
+    """
+    if isinstance(form, TypeAliasType):
+        return form.__value__
+    alias: TypeAliasType = get_origin(form)
+    params, value, args = alias.__type_params__, alias.__value__, get_args(form)
+    if isinstance(value, TypeVar) and value in params and len(args) == len(params):
+        return args[params.index(value)]
+    if params and getattr(value, "__parameters__", ()) == params:
+        return value[args]  # raises TypeError when the arguments do not fit
+    raise TypeError(f"{form}: the arguments of a generic type alias are substituted only in its parameters' order")
 
 
 def _mark(where: str, metadata: Sequence[object]) -> To | Rows | None:
@@ -455,9 +526,13 @@ def _mark(where: str, metadata: Sequence[object]) -> To | Rows | None:
 def _child(where: str, annotation: Any, nullable: bool) -> Target:
     """Return the target of a ``Rows`` field's child part.
 
+    The list's item type ``X`` is passed through ``_unwrap`` first, as every other annotation is, so an item given as
+    a ``type`` alias (``list[ChildAlias]`` for ``type ChildAlias = Child``) or wrapped in ``Annotated`` is read as the
+    part it names; an item that allows None (``list[Child | None]``) is refused.
+
     Preconditions:
-        ``annotation`` is ``list[X]`` with one argument (``_columns`` calls this only when ``get_origin`` is
-        ``list``).
+        ``get_origin(annotation)`` is ``list`` (``_columns`` calls this only then); it may have any number of
+        arguments, since pydantic accepts ``list[X, Y]`` as a field type.
 
     Args:
         where: ``Model.field``, used in the error message.
@@ -468,11 +543,16 @@ def _child(where: str, annotation: Any, nullable: bool) -> Target:
         ``X.__target__``, whose writer is ``ReplaceChildren``.
 
     Raises:
-        TypeError: The field allows None, ``X`` declares no table, or ``X``'s writer is not ``ReplaceChildren``.
+        TypeError: The field or its item allows None, ``annotation`` does not have exactly one argument
+            (``list[X, Y]``), ``X`` declares no table, or ``X``'s writer is not ``ReplaceChildren``; also from
+            ``_unwrap``, for an item that is a subscripted generic alias whose arguments cannot be substituted.
 
     """
-    (item,) = get_args(annotation)
-    target: Target | None = getattr(item, "__target__", None)
+    args = get_args(annotation)
+    target: Target | None = None
+    if len(args) == 1:  # list[X] only
+        item, _, item_nullable = _unwrap(args[0], ())  # an alias or Annotated around the part
+        target = None if item_nullable else getattr(item, "__target__", None)
     if nullable or target is None or not isinstance(target.writer, ReplaceChildren):
         raise TypeError(f"{where}: Rows needs list[SomePart], where SomePart declares a table with ReplaceChildren()")
     return target
@@ -498,11 +578,12 @@ def _column(
         The column named ``mark.column``.
 
     Raises:
-        ValueError: ``mark.column`` does not match ``_COLUMN``.
+        ValueError: ``mark.column`` does not match ``COLUMN_PATTERN``; from ``_column_type``, for a ``Decimal``
+            precision or scale out of range.
         TypeError: From ``_column_type``, for a type with no column type.
 
     """
-    if not _COLUMN.fullmatch(mark.column):
+    if not COLUMN_PATTERN.fullmatch(mark.column):
         raise ValueError(f"{where}: To column must be a lower-case name, got {mark.column!r}")
     polars, postgres = _column_type(where, annotation, metadata)
     return Column(mark.column, polars, postgres, nullable, path)
@@ -512,8 +593,8 @@ def _column_type(where: str, annotation: Any, metadata: Sequence[object]) -> tup
     """Map an annotation to its frame type and Postgres type.
 
     ``Decimal`` maps to ``pl.Decimal(p, s)`` and ``numeric(p,s)``, with ``p`` and ``s`` the last non-None
-    ``max_digits`` and ``decimal_places`` found on the metadata items. Any other annotation is looked up in
-    ``_SCALARS``.
+    ``max_digits`` and ``decimal_places`` found on the metadata items; ``p`` must lie from 1 to 38 (the precisions
+    polars holds) and ``s`` from 0 to ``p``. Any other annotation is looked up in ``_SCALARS``.
 
     Preconditions:
         None.
@@ -529,6 +610,7 @@ def _column_type(where: str, annotation: Any, metadata: Sequence[object]) -> tup
     Raises:
         TypeError: A ``Decimal`` lacks ``max_digits`` or ``decimal_places``, or the annotation is not in ``_SCALARS``
             (an unhashable annotation included).
+        ValueError: A ``Decimal``'s ``max_digits`` or ``decimal_places`` lies outside the ranges above.
 
     """
     if annotation is Decimal:
@@ -541,6 +623,11 @@ def _column_type(where: str, annotation: Any, metadata: Sequence[object]) -> tup
         if len(found) < 2:
             raise TypeError(f"{where}: a loaded Decimal needs max_digits and decimal_places")
         digits, places = found["max_digits"], found["decimal_places"]
+        if not 1 <= digits <= _MAX_DIGITS or not 0 <= places <= digits:
+            raise ValueError(
+                f"{where}: a loaded Decimal needs max_digits from 1 to {_MAX_DIGITS} and decimal_places from 0 to "
+                f"max_digits, got {digits} and {places}"
+            )
         return pl.Decimal(digits, places), f"numeric({digits},{places})"
     try:
         return _SCALARS[annotation]
@@ -578,7 +665,9 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
     when there is one. ``ReplacePartition`` needs its column to be a target column of type ``timestamptz`` or
     ``date`` that does not allow None. ``Snapshot`` refuses a column named ``removed_at``. ``Update`` needs a column
     outside its key, and with ``missing="zero"`` every such column must be ``bigint`` or ``numeric(p,s)``.
-    ``ReplaceChildren`` and ``Upsert`` have no check beyond the key's.
+    ``ReplaceChildren`` needs at least one column: ``columns`` are the child's own, as ``build_target`` adds the
+    inherited key columns only when it rebuilds the child target, and without one every list item would load as the
+    same key-only row. ``Upsert`` has no check beyond the key's.
 
     Preconditions:
         Column names in ``columns`` are distinct (``build_target`` calls ``_check_names`` first).
@@ -593,7 +682,8 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
         None.
 
     Raises:
-        ValueError: Any of the checks above fails.
+        TypeError: The writer is ``ReplaceChildren`` and ``columns`` is empty.
+        ValueError: Any other check above fails.
 
     """
     by_name = {column.name: column for column in columns}
@@ -609,6 +699,8 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
         if source_column is not None and source_column not in key:
             raise ValueError(f"{name}: the writer's key must include the source column {source_column!r}")
     match writer:
+        case ReplaceChildren() if not columns:
+            raise TypeError(f"{name}: a ReplaceChildren table needs a column of its own besides the parent's key")
         case ReplacePartition(column=column):
             if column not in by_name or by_name[column].postgres not in (_TIMESTAMPTZ, "date"):
                 raise ValueError(f"{name}: ReplacePartition needs a target column of type {_TIMESTAMPTZ} or date")
@@ -654,9 +746,12 @@ def mismatches(target: Target, info: TableInfo | None) -> list[str]:
 
     Each target column gets at most one message, the first that applies: it does not exist, its type differs from
     ``Column.postgres`` (compared as exact strings), it is ``NOT NULL`` while the model allows None, or it is
-    not writable (a generated or ``GENERATED ALWAYS`` identity column). Then each table column that is ``NOT NULL``
-    with no default and not a target column gets a message, except ``removed_at`` for a ``Snapshot``. A writer key
-    needs a unique key on exactly its columns, and a ``Snapshot`` needs a nullable ``timestamptz`` ``removed_at``.
+    not writable (a generated or ``GENERATED ALWAYS`` identity column), except an ``Update``'s key columns, which
+    are only matched, never written. Then, unless the writer is ``Update`` (which never inserts), each table column
+    that is ``NOT NULL`` with no default and not a target column gets a message, except ``removed_at`` for a
+    ``Snapshot``. A writer key needs a unique key on exactly its columns, and a ``Snapshot`` needs a nullable
+    ``timestamptz`` ``removed_at`` that is writable, since the writer sets it. Only ``target.table`` is compared;
+    ``target.children`` are not visited, so each child target is checked by its own call.
 
     Preconditions:
         ``info`` is ``table_info``'s result for ``target.table``.
@@ -678,6 +773,8 @@ def mismatches(target: Target, info: TableInfo | None) -> list[str]:
         return [f"{table} does not exist or has 0 columns"]
     found: list[str] = []
     names = {column.name for column in target.columns}
+    update = isinstance(target.writer, Update)
+    matched = (_key(target.writer) or ()) if update else ()  # an Update never writes its key
     for column in target.columns:
         actual = info.columns.get(column.name)
         if actual is None:
@@ -686,13 +783,14 @@ def mismatches(target: Target, info: TableInfo | None) -> list[str]:
             found.append(f"{table}.{column.name} is {actual.type}, the model needs {column.postgres}")
         elif column.nullable and not actual.nullable:
             found.append(f"{table}.{column.name} is NOT NULL, but the model allows None")
-        elif not actual.writable:
+        elif not actual.writable and column.name not in matched:
             found.append(f"{table}.{column.name} is generated, so the model cannot fill it")
     snapshot = isinstance(target.writer, Snapshot)
-    for actual in info.columns.values():
-        unfilled = not actual.nullable and not actual.has_default and actual.name not in names
-        if unfilled and not (snapshot and actual.name == "removed_at"):
-            found.append(f"{table}.{actual.name} is NOT NULL with no default, but the model does not fill it")
+    if not update:  # an Update never inserts
+        for actual in info.columns.values():
+            unfilled = not actual.nullable and not actual.has_default and actual.name not in names
+            if unfilled and not (snapshot and actual.name == "removed_at"):
+                found.append(f"{table}.{actual.name} is NOT NULL with no default, but the model does not fill it")
     key = _key(target.writer)
     if key is not None and frozenset(key) not in info.unique_keys:
         found.append(f"{table} has no unique key on ({', '.join(key)})")
@@ -700,4 +798,6 @@ def mismatches(target: Target, info: TableInfo | None) -> list[str]:
         removed = info.columns.get("removed_at")
         if removed is None or removed.type != _TIMESTAMPTZ or not removed.nullable:
             found.append(f"{table}.removed_at must be a nullable {_TIMESTAMPTZ} column")
+        elif not removed.writable:
+            found.append(f"{table}.removed_at is generated, so the Snapshot writer cannot set it")
     return found

@@ -15,7 +15,8 @@ Public API:
     TimeFrame: A non-empty, half-open span of UTC instants with the time zone that maps it to local dates.
 
 Requirements:
-    Python 3.11 or later, for ``datetime.UTC``.
+    Python 3.14 or later: ``datetime.UTC`` needs 3.11, and the unquoted ``TimeFrame`` return annotations inside its own
+    class body rely on the deferred evaluation of annotations added in 3.14.
     Time zone data available to ``zoneinfo``, from the host system or the ``tzdata`` package (required on Windows).
     Without it, importing this module raises ``zoneinfo.ZoneInfoNotFoundError`` when ``LONDON`` is created.
 
@@ -94,9 +95,10 @@ def day_window(d: date, zone: ZoneInfo) -> tuple[datetime, datetime]:
     """Return the UTC instants that bound a calendar day in a time zone.
 
     The window is half-open and covers instants ``t`` with ``start <= t < end``. Both bounds are local midnight
-    (``time.min``) in ``zone`` with ``fold=0``, converted to ``UTC``. When local midnight falls in a gap, it resolves
-    to the instant of the transition. ``end`` is computed the same way as ``start`` for the following date, so windows
-    for consecutive dates are contiguous and do not overlap. A window is 24 hours long except across an offset change,
+    (``time.min``) in ``zone`` with ``fold=0``, converted to ``UTC``. When local midnight falls in a gap, it is read
+    with the offset in force before the gap, which is the transition instant when the gap starts at midnight. ``end``
+    is computed the same way as ``start`` for the following date, so windows for consecutive dates are contiguous and
+    do not overlap. A window is 24 hours long except across an offset change,
     where its length differs by the size of the change.
 
     Preconditions:
@@ -162,8 +164,8 @@ def from_epoch(seconds: int) -> datetime:
     """Convert a Unix timestamp in seconds to an aware UTC ``datetime``.
 
     Preconditions:
-        ``seconds`` is a count of seconds, not milliseconds, since 1970-01-01T00:00:00 UTC.
-        ``seconds`` maps to a date between years 1 and 9999 and fits the platform's ``time_t``.
+        ``seconds`` is a count of seconds, not milliseconds, since 1970-01-01T00:00:00 UTC. A millisecond value is not
+        detected unless it falls outside the supported range.
 
     Args:
         seconds: The Unix timestamp to convert, in seconds.
@@ -173,8 +175,9 @@ def from_epoch(seconds: int) -> datetime:
         ``0`` returns 1970-01-01 00:00:00+00:00.
 
     Raises:
-        ValueError: If ``seconds`` is NaN or outside the supported range, for example ``10**12``, ``10**20`` or
-            infinity. ``OverflowError`` and ``OSError`` from the platform are re-raised as ``ValueError``.
+        ValueError: If ``seconds`` is NaN or outside the supported range (years 1 to 9999 and the platform's
+            ``time_t``), for example ``10**12``, ``10**20`` or infinity. ``OverflowError`` and ``OSError`` from the
+            platform are re-raised as ``ValueError``.
         TypeError: If ``seconds`` is not a number.
 
     """
@@ -219,7 +222,8 @@ class TimeFrame:
     """A non-empty, half-open span of UTC instants, with the time zone whose local days it is read in.
 
     The frame covers instants ``t`` with ``start <= t < end``. Instances are immutable; both bounds are normalised to
-    ``UTC`` on construction, so frames built from the same instants in different offsets compare equal.
+    ``UTC`` on construction, so frames built from the same instants in different offsets, with equal ``zone`` values,
+    compare equal.
 
     Attributes:
         start: The first instant in the frame, aware, with ``tzinfo`` set to ``UTC``.
@@ -276,7 +280,10 @@ class TimeFrame:
             A ``TimeFrame`` from local midnight at the start of ``first`` to local midnight at the start of ``end``.
 
         Raises:
-            ValueError: If ``end`` is not later than ``first``, raised by ``__post_init__`` as an empty frame.
+            ValueError: If the local midnights of ``first`` and ``end`` are the same instant or in the wrong order,
+                raised by ``__post_init__`` as an empty frame. This happens when ``end`` is not later than ``first``,
+                and also when ``zone`` skips every date from ``first`` up to ``end``, for example
+                ``TimeFrame.days(date(2011, 12, 30), date(2011, 12, 31), ZoneInfo("Pacific/Apia"))``.
             TypeError: If ``zone`` is ``None``, or if ``first`` or ``end`` is a ``datetime``, raised by ``day_window``.
             OverflowError: If either date is ``date.max`` or a bound falls outside the ``datetime`` range, raised by
                 ``day_window``.
@@ -289,7 +296,10 @@ class TimeFrame:
         """Return the frame as local dates, if it is made of whole days in ``zone``.
 
         The frame counts as whole days when both ``start`` and ``end`` are exactly local midnight in ``zone``, as
-        ``day_window`` computes it. This is the inverse of ``TimeFrame.days``.
+        ``day_window`` computes it. This inverts ``TimeFrame.days`` up to skipped dates: when ``zone`` skips a whole
+        date, the midnights on either side of it are the same instant and the later date is returned, so
+        ``TimeFrame.days(date(2011, 12, 29), date(2011, 12, 30), ZoneInfo("Pacific/Apia")).dates`` is
+        ``(date(2011, 12, 29), date(2011, 12, 31))``, which covers the same instants.
 
         Preconditions:
             None.
@@ -328,7 +338,10 @@ class TimeFrame:
         Returns:
             A tuple ``(left, right)`` with ``left.start == self.start``, ``left.end == right.start`` and
             ``right.end == self.end``. ``None`` if the frame is too small to split: fewer than two days with
-            ``whole_days``, or a first half shorter than ``MIN_SPLIT`` (a frame under two minutes) without it.
+            ``whole_days``, or a first half shorter than ``MIN_SPLIT`` (a frame under two minutes) without it. Also
+            ``None`` with ``whole_days`` when the middle date, ``first + days // 2`` counted in calendar dates, is one
+            that ``zone`` skips, for example ``TimeFrame.days(date(2011, 12, 29), date(2011, 12, 31),
+            ZoneInfo("Pacific/Apia")).halve(whole_days=True)``. This holds even when both halves would be non-empty.
 
         Raises:
             ValueError: If ``whole_days`` is true and the frame does not start and end at local midnight in ``zone``.
@@ -346,6 +359,9 @@ class TimeFrame:
             if days < 2:
                 return None
             middle = first + timedelta(days=days // 2)
+            middle_start, middle_end = day_window(middle, self.zone)
+            if middle_start == middle_end:  # zone skips the middle date, so a half could be empty
+                return None
             return TimeFrame.days(first, middle, self.zone), TimeFrame.days(middle, end, self.zone)
         half = timedelta(seconds=(self.end - self.start) // timedelta(seconds=2))
         if half < MIN_SPLIT:

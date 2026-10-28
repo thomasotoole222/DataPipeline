@@ -77,18 +77,18 @@ class HeldRow:
     def __post_init__(self) -> None:
         """Validate ``raw_page_no``, ``raw_index`` and ``failures``.
 
-        Checks run in order: ``raw_page_no`` and ``raw_index`` together, then ``failures``. No field is changed.
+        Checks run in order: ``raw_page_no`` and ``raw_index`` together, then ``failures``. No field is changed. No
+        upper bound is checked, although the ``quarantine.row`` columns are ``integer``; the table's own ``CHECK``
+        constraints repeat the ``0 or more`` rule.
 
         Preconditions:
-            ``raw_page_no`` and ``raw_index`` support ``<`` against ``0``.
+            None.
 
         Returns:
             None.
 
         Raises:
             ValueError: If ``raw_page_no`` or ``raw_index`` is less than ``0``, or if ``failures`` is empty.
-            TypeError: If ``raw_page_no`` or ``raw_index`` cannot be compared with ``0`` (for example ``None``); it
-                comes with an unrelated message.
 
         """
         if self.raw_page_no < 0 or self.raw_index < 0:
@@ -105,19 +105,19 @@ _COPY: Final = (
 
 
 async def hold(conn: Connection, rows: Sequence[HeldRow]) -> int:
-    """Copy held rows into the hold table inside the caller's open transaction.
+    """Copy held rows into ``quarantine.row`` inside the caller's open transaction.
 
     Checks the connection's transaction status first, so the check applies even when ``rows`` is empty. For a
     non-empty ``rows``, opens a cursor and a ``COPY`` using ``_COPY`` and writes one record per row, with
     ``payload`` and ``failures`` wrapped as ``Jsonb`` (each failure converted with ``asdict``). Does not commit;
-    the rows become visible only when the caller's transaction commits. Database errors raised during the copy pass
-    through ``db_errors``.
+    the rows become visible only when the caller's transaction commits. The cursor and copy run inside
+    ``db_errors``, so connection and conflict errors are translated and every other error propagates unchanged.
+    ``HeldRow.__post_init__`` guarantees each row has at least one failure and non-negative positions, matching the
+    table's ``CHECK`` constraints.
 
     Preconditions:
-        ``conn`` is an async psycopg connection whose transaction status is ``pq.TransactionStatus.INTRANS``.
-        Every element of ``rows`` has the attributes ``_COPY`` expects, in the same order. Every ``payload`` and
-        every field of every item in ``failures`` is serialisable by ``Jsonb``, and every item in ``failures`` is a
-        dataclass instance. No other coroutine is using ``conn`` for the duration of the call.
+        ``conn`` is inside a transaction (``pq.TransactionStatus.INTRANS``). Every ``payload`` is serialisable by
+        ``Jsonb``. No other coroutine is using ``conn`` for the duration of the call.
 
     Args:
         conn: The connection to copy through, already inside a transaction.
@@ -128,12 +128,13 @@ async def hold(conn: Connection, rows: Sequence[HeldRow]) -> int:
         without opening a cursor when ``rows`` is empty.
 
     Raises:
-        RuntimeError: If ``conn.info.transaction_status`` is anything other than ``pq.TransactionStatus.INTRANS``,
-            including when ``rows`` is empty.
-        TypeError: If ``rows`` does not support ``len``, if an item in ``failures`` is not a dataclass instance, or
-            if a value cannot be serialised to JSON. Whether ``db_errors`` translates these is unknown.
-        Exception: Whatever ``db_errors`` raises for a database error during the cursor or copy, conditional on
-            ``db_errors``.
+        RuntimeError: If ``conn.info.transaction_status`` is anything other than ``pq.TransactionStatus.INTRANS``
+            (idle, in error, or busy), including when ``rows`` is empty.
+        TypeError: If a ``payload`` value cannot be serialised to JSON; ``db_errors`` passes it through unchanged.
+        DatabaseConflict: From ``db_errors``, on a serialization failure or deadlock during the cursor or copy.
+        DatabaseUnavailable: From ``db_errors``, on a lost or refused connection during the cursor or copy.
+        psycopg.Error: Any other database error during the cursor or copy, unchanged, for example a value outside
+            the ``integer`` range of ``raw_page_no`` or ``raw_index``.
 
     """
     if conn.info.transaction_status != pq.TransactionStatus.INTRANS:

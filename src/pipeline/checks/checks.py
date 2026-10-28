@@ -20,11 +20,10 @@ from typing import Final
 from uuid import UUID
 
 from pipeline.checks.record import Record
-from pipeline.checks.targets import _COLUMN, _TABLE
+from pipeline.checks.targets import COLUMN_PATTERN, TABLE_PATTERN
 from pipeline.timeutil import TimeFrame
 
-#: The rule name a failed parse is held under; no check may use it.
-#: The rule name a failed parse is held under; no check may use it.
+#: The rule name a failed parse is held under; no check may use it (``_check_declaration`` rejects it).
 SCHEMA_RULE: Final = "schema"
 
 
@@ -125,14 +124,16 @@ class Lookup[R: Record]:
         ``name`` is not empty and is not ``SCHEMA_RULE``.
         ``version`` is 1 or more.
         ``until`` is not ``None`` exactly when ``severity`` is ``Severity.WAIT``, and is then not ``""``.
-        ``table`` matches ``_TABLE``: a lower-case ``schema.table``.
-        ``column`` matches ``_COLUMN``: a lower-case bare column name.
+        ``table`` matches ``TABLE_PATTERN``: a lower-case ``schema.table``.
+        ``column`` matches ``COLUMN_PATTERN``: a lower-case bare column name.
 
     Attributes:
         name: The check's name, unique within a ``Validation``.
-        values: Returns the values of a record to look up. Nothing on this page calls it.
+        values: Returns the values of a record to look up, an iterable of strings other than a bare ``str``. Nothing
+            on this page calls it; Validate refuses a bare ``str`` with ``TypeError``.
         table: The ``schema.table`` to look the values up in.
-        column: The column of ``table`` that holds the values.
+        column: The column of ``table`` that holds the values; each value is cast to the column's type and compared
+            there (a value that is not a valid literal of the type is not found).
         version: The version of the check, 1 or more. Defaults to 1.
         severity: What a failure means. Defaults to ``Severity.WAIT``.
         overridable: Stored only; not used on this page. Defaults to ``False``.
@@ -144,7 +145,7 @@ class Lookup[R: Record]:
     values: Callable[[R], Iterable[str]]  # the values the record refers to
     _: KW_ONLY
     table: str  # "schema.table"
-    column: str  # the column the values must appear in, compared as text
+    column: str  # the column the values must appear in, compared in its own type
     version: int = 1  # bumped when the check's meaning changes; stored with each failure
     severity: Severity = Severity.WAIT  # a missing reference usually arrives with a later job
     overridable: bool = False  # whether a person may release a record held by it
@@ -163,13 +164,14 @@ class Lookup[R: Record]:
 
         Raises:
             ValueError: From ``_check_declaration``, if ``name``, ``version``, ``severity`` or ``until`` breaks an
-                invariant; or if ``table`` does not match ``_TABLE`` or ``column`` does not match ``_COLUMN``.
+                invariant; or if ``table`` does not match ``TABLE_PATTERN`` or ``column`` does not match
+                ``COLUMN_PATTERN``.
 
         """
         _check_declaration(self.name, self.version, self.severity, self.until)
-        if not _TABLE.fullmatch(self.table):
+        if not TABLE_PATTERN.fullmatch(self.table):
             raise ValueError(f"lookup {self.name!r}: table must be schema.table in lower case, got {self.table!r}")
-        if not _COLUMN.fullmatch(self.column):
+        if not COLUMN_PATTERN.fullmatch(self.column):
             raise ValueError(f"lookup {self.name!r}: column must be a lower-case name, got {self.column!r}")
 
 

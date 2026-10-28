@@ -397,6 +397,9 @@ def _split_up_front(
             fetch has no window.
         ClientErrorUnhandled: From ``EndpointSpec.total`` when ``total_at`` is set but the body has no count there.
         ValueError: From ``_Position.split``, only when its precondition is broken.
+        TypeError: From ``_Position.split`` when ``window.whole_days`` is ``True`` and the zone is not a ``tzinfo``.
+        OverflowError: From ``_Position.split`` when ``window.whole_days`` is ``True`` and a bound is near the
+            ``datetime`` range.
 
     """
     # on a sub-frame's first page only: None when it fits, else the halved position
@@ -462,6 +465,10 @@ async def fetch_pages[C](
     Each sub-frame is paged to its end before the next starts. When a sub-frame's first page reports a total above
     ``spec.max_rows``, that response is dropped and the sub-frame is halved, repeatedly, until the total fits or the
     sub-frame cannot be split. Nothing is checked until the first iteration, because this is an async generator.
+    The paging cursors sent are kept per sub-frame, so a paginator returning one already sent in the current
+    sub-frame (a cycle such as A, B, A) fails instead of paging forever. They are reset at each sub-frame's first
+    page, because a paginator's cursors (page numbers, offsets) legitimately repeat across sub-frames; a cycle that
+    spans sub-frames is not one, and a resumed fetch knows only the cursors sent since it resumed.
 
     Preconditions:
         ``resume_from``, when given, is a ``cursor_in`` or ``cursor_next`` from a fetch with the same ``spec``,
@@ -486,17 +493,28 @@ async def fetch_pages[C](
             ``EndpointSpec.request`` for wrong path parameters; from ``_Position.decode`` for a bad ``resume_from``;
             from ``Window.apply`` or ``Paginator.apply`` for a request they cannot build; or from ``Page`` when
             ``clock`` returns a naive datetime.
+        OverflowError: From ``_Position.decode`` for a cursor edge, from ``Window.apply`` for a bound near the
+            ``datetime`` range, or from ``_split_up_front`` for a whole-day split, when a ``datetime`` leaves its range.
+        TypeError: From ``Window.apply`` or ``_split_up_front`` when a whole-day window or split meets a zone that is
+            not a ``tzinfo``.
         RowLimitReached: From ``_split_up_front`` or ``_following`` when the endpoint's row limit is reached.
         ClientErrorUnhandled: From ``EndpointSpec.total``, ``EndpointSpec.record_count`` or
-            ``Paginator.next_cursor`` for a body they cannot read.
-        Exception: Whatever ``client.send`` or ``clock`` raises.
+            ``Paginator.next_cursor`` for a body they cannot read; or from ``EndpointSpec.unhandled`` when the
+            paginator returns a cursor already sent in the current sub-frame.
+        Exception: Whatever ``client.send`` or ``clock`` raises, or whatever ``copy.deepcopy`` raises when
+            ``Window.apply`` or ``Paginator.apply`` copies a request body.
 
     """
     win = _window(spec, window, frame)
     base = spec.request(path_params)
     at = _Position.start(frame) if resume_from is None else _Position.decode(resume_from, frame)
     cursor_in = resume_from
+    sent: set[str] = set()  # paging cursors sent in the current sub-frame
     while True:
+        if at.paging is None:  # a sub-frame's first page: its cursors start afresh
+            sent.clear()
+        else:
+            sent.add(at.paging)
         sub = at.sub_frame(frame)
         request = base if win is None or sub is None else win.apply(base, sub)
         body = await client.send(spec.paginator.apply(request, at.paging), source_id)
@@ -506,6 +524,8 @@ async def fetch_pages[C](
             at = halved  # this page is dropped: nothing of the sub-frame is yielded before the split
             continue
         paging = spec.paginator.next_cursor(body, at.paging, spec=spec)
+        if paging is not None and paging in sent:  # a cycle would page forever
+            raise spec.unhandled(f"the API returned a cursor already used in this frame: {paging!r}")
         count = spec.record_count(body, last_page=paging is None)
         following = _following(spec, at, count, paging)
         cursor_next = None if following is None else following.encode(frame)

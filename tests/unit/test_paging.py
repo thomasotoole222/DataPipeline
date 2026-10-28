@@ -50,3 +50,23 @@ def test_page_number_rejects_empty_or_shared_names(page: str, size: str) -> None
     """Refuse to build a ``PageNumberPaginator`` with an empty or shared parameter name."""
     with pytest.raises(ValueError, match="non-empty and differ"):
         PageNumberPaginator(page, size, 100, ShortPage())
+
+
+@pytest.mark.parametrize("data", [{}, {"total_count": -1}, {"total_count": True}, {"total_count": "5"}])
+def test_total_count_is_read_as_the_spec_reads_a_total(data: dict[str, Any]) -> None:
+    """Reject a bad total count with the same error ``EndpointSpec.total`` gives for it."""
+    spec = EndpointSpec(
+        "cruva.ads_creatives",
+        "cruva",
+        "POST",
+        "/ads",
+        ADS_PAGING,
+        ("data", "creatives"),
+        total_at=("data", "total_count"),
+    )
+    body = {"data": {"creatives": [], **data}}
+    with pytest.raises(ClientErrorUnhandled) as from_spec:
+        spec.total(body)
+    with pytest.raises(ClientErrorUnhandled) as from_paging:
+        ADS_PAGING.next_cursor(body, None, spec=spec)
+    assert str(from_paging.value) == str(from_spec.value)

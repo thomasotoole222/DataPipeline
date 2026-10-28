@@ -14,7 +14,7 @@ from pipeline.db.pool import Pool
 from pipeline.db.quarantine import Failure, HeldRow, hold
 from pipeline.db.raw import RawPage, discard_pages, last_page, read_pages, save_page
 
-DSN = os.environ.get("PIPELINE_TEST_DSN", "postgresql://postgres@localhost:5432/pipeline_test")
+DSN = os.environ.get("TEST_PIPELINE_DSN", "postgresql://postgres@localhost:5432/pipeline_test")
 CONNECTOR = "tiktok_shop"
 ENDPOINT = "orders_search"
 

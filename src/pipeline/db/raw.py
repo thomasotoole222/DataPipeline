@@ -4,8 +4,9 @@ Public API:
     RawPage: One page of results fetched for a task, as stored in ``raw.page``.
     save_page: Insert a ``RawPage`` row, or overwrite the existing row with the same ``task_id`` and ``page_no``.
     last_page: Return the highest-numbered page stored for a task, or ``None``.
-    read_pages: Stream the pages of one task as ``RawPage`` objects, ordered by ``page_no``.
-    discard_pages: Delete every row of a task from ``raw.page`` and return the reported row count.
+    read_pages: Fetch every page of one task in one query, then yield them as ``RawPage`` objects by ``page_no``.
+    discard_pages: Delete every row of a task from ``raw.page`` and return the cursor's row count.
+
 """
 
 from collections.abc import AsyncIterator
@@ -26,19 +27,22 @@ class RawPage:
     """One page of results fetched for a task, as stored in ``raw.page``.
 
     Instances are frozen, use slots, and take every field as a required keyword argument in the generated
-    ``__init__``. ``__post_init__`` validates ``page_no`` and ``payload`` and replaces ``fetched_at`` with the result
-    of ``ensure_utc``. The generated ``__eq__`` compares all fields and the generated ``__hash__`` hashes all fields.
-    A dataclass subclass must also be frozen.
+    ``__init__``. ``__post_init__`` checks that ``page_no`` is 0 or more and that ``payload`` is a ``dict``, and
+    replaces ``fetched_at`` with ``ensure_utc(fetched_at)``, so every instance holds an aware UTC ``fetched_at``.
+    ``last_page`` and ``read_pages`` build instances from ``raw.page`` rows, so those rows pass the same checks.
+    The generated ``__eq__`` compares all fields. The generated ``__hash__`` hashes all fields, so it always raises
+    ``TypeError`` because ``payload`` is a ``dict``: instances cannot go in a set or be dict keys.
 
     Attributes:
-        task_id (int): Identifier of the task the page belongs to. Not validated.
-        page_no (int): Position of the page within the task, 0 or more.
+        task_id (int): Identifier of the ``control.task`` the page belongs to. Not validated.
+        page_no (int): Position of the page within the task: 0 for the first page, then 1, 2 and so on. At least 0.
         connector (str): The connector that fetched the page, e.g. ``"tiktok_shop"``. Not validated.
         endpoint (str): The endpoint within the connector, e.g. ``"orders_search"``. Not validated.
         cursor_in (str | None): Cursor sent to fetch this page, or ``None``. Not validated.
         cursor_next (str | None): Cursor returned for the next page, or ``None``. Not validated.
-        fetched_at (datetime): Time the page was fetched, as returned by ``ensure_utc``.
-        payload (dict[str, Any]): Decoded page body. The dict passed in is stored as is, not copied.
+        fetched_at (datetime): Time the response arrived, aware and in UTC.
+        payload (dict[str, Any]): The whole decoded response body, envelope included. Must be a ``dict``; its
+            contents are not checked, and the dict passed in is stored as is, not copied.
 
     """
 
@@ -58,7 +62,8 @@ class RawPage:
         ``ensure_utc(fetched_at)``.
 
         Preconditions:
-            ``page_no`` supports ``<`` against ``0``. ``fetched_at`` is a value ``ensure_utc`` accepts.
+            The fields hold their annotated types (mypy checks callers; rows from ``raw.page`` match by its column
+            types and ``NOT NULL`` constraints).
 
         Args:
             None.
@@ -67,10 +72,10 @@ class RawPage:
             None.
 
         Raises:
-            ValueError: If ``page_no`` is less than ``0``.
-            TypeError: If ``payload`` is not a ``dict``. Also let through, with an unrelated message, when ``page_no``
-                cannot be compared with ``0`` (for example a ``str`` or ``None``).
-            Exception: Whatever ``ensure_utc`` raises is let through.
+            ValueError: If ``page_no`` is less than ``0``, or, from ``ensure_utc``, if ``fetched_at`` is naive.
+            TypeError: If ``payload`` is not a ``dict``, or, from ``ensure_utc``, if ``fetched_at`` is not a
+                ``datetime``.
+            OverflowError: From ``ensure_utc``, if converting ``fetched_at`` to UTC leaves the ``datetime`` range.
 
         """
         if self.page_no < 0:
@@ -97,12 +102,19 @@ async def save_page(conn: Connection, page: RawPage) -> None:
 
     Executes ``_SAVE`` on ``conn`` inside ``db_errors()``. An existing row with the same ``task_id`` and ``page_no``
     has its ``connector``, ``endpoint``, ``cursor_in``, ``cursor_next``, ``fetched_at`` and ``payload`` overwritten.
-    ``payload`` is wrapped in ``Jsonb``. The function does not commit.
+    ``payload`` is wrapped in ``Jsonb``, which serialises it with ``json.dumps``. ``RawPage`` guarantees ``page_no``
+    meets the table's ``CHECK (page_no >= 0)`` and ``fetched_at`` is aware. The function does not commit.
+
+    ``jsonb`` rejects a string holding NUL (U+0000) or a lone surrogate, and a ``NaN``/``Infinity`` number. A page
+    fetched through ``HttpConnectorClient`` holds none of them: the client replaces NUL and lone surrogates with
+    U+FFFD and refuses a 2xx body holding a non-standard constant, so only a payload built some other way can fail
+    here with a psycopg ``DataError``.
 
     Preconditions:
         ``conn`` is an open asynchronous connection that is not running another statement. ``raw.page`` exists as
-        ``pipeline_raw_quarantine.sql`` creates it. ``page.payload`` is JSON-serialisable. The caller commits
-        afterwards unless ``conn`` is in autocommit mode.
+        ``pipeline_raw_quarantine.sql`` creates it. ``page.payload`` is JSON-serialisable by ``json.dumps`` and
+        holds no value ``jsonb`` rejects (see TODO 1). The caller commits afterwards unless ``conn`` is in
+        autocommit mode.
 
     Args:
         conn: Connection the statement runs on.
@@ -113,8 +125,10 @@ async def save_page(conn: Connection, page: RawPage) -> None:
         None.
 
     Raises:
-        Whatever ``db_errors`` raises or lets through when ``conn.execute`` fails, for example on a missing table or
-        a payload that cannot be serialised; conditional on ``db_errors``.
+        DatabaseConflict: From ``db_errors``, on a serialisation failure or deadlock.
+        DatabaseUnavailable: From ``db_errors``, when the connection is lost or the database cannot be reached.
+        Exception: Any other error from ``conn.execute`` propagates unchanged, for example a missing table, a
+            ``TypeError`` from serialising the payload, or a psycopg ``DataError`` from ``jsonb`` input.
 
     """
     params = (
@@ -140,27 +154,28 @@ _LAST: Final = (
 
 
 async def last_page(conn: Connection, task_id: int) -> RawPage | None:
-    """Return the highest-numbered page row stored for a task.
+    """Return the highest-numbered page stored for a task.
 
     Opens a cursor on ``conn`` whose row factory is ``class_row(RawPage)``, executes ``_LAST`` with ``task_id``
-    bound, and fetches one row. Execution and fetching run inside ``db_errors()``.
+    bound, and fetches one row. Opening, executing and fetching run inside ``db_errors()``, which never swallows an
+    exception.
 
     Preconditions:
-        ``conn`` is an open asynchronous connection that no other coroutine is using concurrently. ``_LAST`` selects
-        exactly the fields that ``RawPage`` accepts as keyword arguments.
+        ``conn`` is an open asynchronous connection that no other coroutine is using concurrently. ``raw.page``
+        exists. ``_LAST`` selects exactly the fields ``RawPage`` takes as keyword arguments.
 
     Args:
         conn: Connection to run the query on.
         task_id: Task whose last page is fetched.
 
     Returns:
-        The ``RawPage`` built from the row with the highest ``page_no`` for ``task_id``. ``None`` if ``raw.page`` has
-        no row for ``task_id``, and also ``None`` if ``db_errors`` suppresses an exception.
+        The ``RawPage`` built from the row with the highest ``page_no`` for ``task_id``, or ``None`` if ``raw.page``
+        has no row for ``task_id``.
 
     Raises:
-        Exceptions raised while opening the cursor, executing or fetching, as translated or re-raised by
-        ``db_errors``. This function swallows nothing itself. Whether ``db_errors`` swallows anything depends on its
-        implementation.
+        DatabaseConflict: From ``db_errors``, on a serialisation failure or deadlock.
+        DatabaseUnavailable: From ``db_errors``, when the connection is lost or the database cannot be reached.
+        Exception: Any other error from the cursor, or from ``RawPage`` building the row, propagates unchanged.
 
     """
     with db_errors():
@@ -178,28 +193,29 @@ _READ: Final = (
 
 
 async def read_pages(conn: Connection, task_id: int) -> AsyncIterator[RawPage]:
-    """Read the pages of one task from ``raw.page``.
+    """Yield the pages of one task from ``raw.page`` in ``page_no`` order.
 
-    Nothing runs until iteration starts. On the first step, all matching rows are fetched with a single cursor on
-    ``conn`` inside ``db_errors()``, converted to ``RawPage`` by ``class_row``, and the cursor is closed; the pages are
-    then yielded from memory.
+    Nothing runs until iteration starts. On the first step, every matching row is fetched with one cursor on
+    ``conn`` inside ``db_errors()``, built into a ``RawPage`` by ``class_row``, and the cursor is closed; the pages
+    are then yielded from memory, so the whole task is held in memory at once.
 
     Preconditions:
-        ``conn`` is open and not used concurrently until the first page has been yielded.
-        ``RawPage`` accepts the columns selected by ``_READ`` as keyword arguments.
+        ``conn`` is open and not used concurrently until the first page has been yielded. ``raw.page`` exists.
+        ``_READ`` selects exactly the fields ``RawPage`` takes as keyword arguments.
 
     Args:
         conn: Connection the cursor is opened on.
         task_id: Task whose rows are selected.
 
     Yields:
-        One ``RawPage`` per row whose ``task_id`` matches, in ascending ``page_no`` order. Yields nothing if no row
-        matches, so an unknown task is not distinguished from a task with no pages.
+        One ``RawPage`` per row whose ``task_id`` matches, in ascending ``page_no`` order. Nothing if no row matches,
+        so an unknown task is not distinguished from a task with no pages.
 
     Raises:
-        Whatever ``db_errors`` translates database errors into, from executing the query or fetching rows. Errors
-        from ``RawPage`` that ``db_errors`` does not handle propagate unchanged. All exceptions surface on the first
-        iteration step, never at the call itself.
+        DatabaseConflict: From ``db_errors``, on a serialisation failure or deadlock.
+        DatabaseUnavailable: From ``db_errors``, when the connection is lost or the database cannot be reached.
+        Exception: Any other error from the cursor, or from ``RawPage`` building a row, propagates unchanged. Every
+            exception surfaces on the first iteration step, never at the call itself.
 
     """
     with db_errors():
@@ -218,25 +234,25 @@ _DISCARD: Final = "DELETE FROM raw.page WHERE task_id = %s"
 async def discard_pages(conn: Connection, task_id: int) -> int:
     """Delete every row in ``raw.page`` whose ``task_id`` column equals ``task_id``.
 
-    Executes ``_DISCARD`` on ``conn`` inside ``db_errors()`` and returns the cursor's ``rowcount``. The function does
-    not commit and does not close the cursor.
+    Executes ``_DISCARD`` on ``conn`` inside ``db_errors()`` and returns the cursor's ``rowcount``. ``db_errors``
+    never swallows an exception, so ``cursor`` is always bound when it is read. The function does not commit and does
+    not close the cursor.
 
     Preconditions:
-        ``conn`` is open and accepts an awaitable ``execute``. ``raw.page`` exists. If ``conn`` is not in autocommit
-        mode, the caller commits or rolls back afterwards for the deletion to take effect or be discarded.
+        ``conn`` is an open asynchronous connection that is not running another statement. ``raw.page`` exists. If
+        ``conn`` is not in autocommit mode, the caller commits or rolls back afterwards.
 
     Args:
         conn: Connection the ``DELETE`` runs on.
         task_id: Value matched against the ``task_id`` column.
 
     Returns:
-        The cursor's ``rowcount`` after the ``DELETE``: the number of rows deleted, ``0`` when no row matched, or
-        whatever value the cursor reports when the count is unavailable.
+        The number of rows the ``DELETE`` removed, ``0`` when no row matched.
 
     Raises:
-        Exception: Whatever ``db_errors`` raises in place of, or lets through from, a failure in ``conn.execute``.
-        UnboundLocalError: When ``db_errors`` suppresses an exception from ``conn.execute``, because ``cursor`` is
-            then never assigned.
+        DatabaseConflict: From ``db_errors``, on a serialisation failure or deadlock.
+        DatabaseUnavailable: From ``db_errors``, when the connection is lost or the database cannot be reached.
+        Exception: Any other error from ``conn.execute`` propagates unchanged.
 
     """
     with db_errors():

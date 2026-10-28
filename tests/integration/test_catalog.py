@@ -9,7 +9,7 @@ from psycopg_pool import AsyncConnectionPool
 from pipeline.db.catalog import TableColumn, table_info
 from pipeline.db.pool import Pool
 
-DSN = os.environ.get("PIPELINE_TEST_DSN", "postgresql://postgres@localhost:5432/pipeline_test")
+DSN = os.environ.get("TEST_PIPELINE_DSN", "postgresql://postgres@localhost:5432/pipeline_test")
 
 
 @pytest.fixture

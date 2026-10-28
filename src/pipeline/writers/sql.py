@@ -161,8 +161,9 @@ async def snapshot(
 
     Preconditions:
         As for ``upsert``. The table has a ``removed_at`` column and ``columns`` does not include it.
-        ``source_id`` is not ``None`` when ``source_column`` is set (``load._write`` passes the task's source exactly
-        when the target has a source column, and a task's source is never None).
+        ``source_column``, when set, is in ``key`` (``checks.targets`` refuses a writer key without it), so the prune
+        compares keys within one source. ``source_id`` is not ``None`` when ``source_column`` is set (``load._write``
+        passes the task's source exactly when the target has a source column, and a task's source is never None).
 
     Args:
         conn: Connection the statements run on; the caller owns the transaction.
@@ -217,9 +218,11 @@ async def update(
         ``table`` is ``"schema.name"``. ``key`` is non-empty and ``columns`` has at least one name not in ``key``
         (``checks.targets`` refuses an Update model with no column outside its key when the class is defined).
         ``staged`` has every name in ``columns`` and ``key`` and no two rows with the same key (else which staged
-        row wins is undefined). When zeroing, every non-key column accepts ``0``. ``source_id`` is not ``None`` when
-        ``source_column`` is set (``load._write`` passes the task's source exactly when the target has a source column,
-        and a task's source is never None).
+        row wins is undefined). When zeroing, every non-key column accepts ``0`` (``checks.targets`` refuses a
+        ``missing="zero"`` column outside the key that is not ``bigint`` or ``numeric(p,s)``). ``source_column``, when
+        set, is in ``key`` (``checks.targets`` refuses a writer key without it), so it is never written or zeroed.
+        ``source_id`` is not ``None`` when ``source_column`` is set (``load._write`` passes the task's source exactly
+        when the target has a source column, and a task's source is never None).
 
     Args:
         conn: Connection the statements run on; the caller owns the transaction.
