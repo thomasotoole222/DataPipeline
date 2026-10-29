@@ -1,19 +1,30 @@
 CREATE SCHEMA raw;
-COMMENT ON SCHEMA raw IS 'Source pages exactly as fetched, in one table. Hot for 5 days, then archived to Parquet.';
+COMMENT ON SCHEMA raw IS
+    'Source pages as fetched: each page''s envelope in raw.page, its hashed part once in raw.payload. Purged by control.purge_raw.';
+
+CREATE TABLE raw.payload (
+    hash        bytea       PRIMARY KEY,              -- sha256 of body's canonical JSON (raw.save_page)
+    body        jsonb       NOT NULL                  -- the hashed part: the connector's hashed keys and their values
+);
+COMMENT ON TABLE raw.payload IS
+    'Hashed parts of source responses, each stored once. Grain: one row per distinct hashed part. Writer: pipeline Extract; control.purge_raw. Layer: raw.';
 
 CREATE TABLE raw.page (
-    task_id     bigint      NOT NULL,                 -- control.task id; no foreign key, so raw does not depend on control
-    page_no     integer     NOT NULL CHECK (page_no >= 0),
-    connector   text        NOT NULL,                 -- the connector that fetched it, e.g. 'tiktok_shop'
-    endpoint    text        NOT NULL,                 -- the endpoint within the connector, e.g. 'orders_search'
-    cursor_in   text,                                 -- cursor sent; NULL on the first page
-    cursor_next text,                                 -- cursor for the next page; NULL on the last page
-    fetched_at  timestamptz NOT NULL,
-    payload     jsonb       NOT NULL,                 -- the whole response, envelope included
+    task_id      bigint      NOT NULL,                -- control.task id; no foreign key, so raw does not depend on control
+    page_no      integer     NOT NULL CHECK (page_no >= 0),
+    connector    text        NOT NULL,                -- the connector that fetched it, e.g. 'tiktok_shop'
+    endpoint     text        NOT NULL,                -- the endpoint within the connector, e.g. 'orders_search'
+    cursor_in    text,                                -- cursor sent; NULL on the first page
+    cursor_next  text,                                -- cursor for the next page; NULL on the last page
+    fetched_at   timestamptz NOT NULL,
+    envelope     jsonb       NOT NULL,                -- the response without its hashed keys, e.g. code and request_id
+    payload_hash bytea       NOT NULL REFERENCES raw.payload (hash),  -- the response's hashed part
     PRIMARY KEY (task_id, page_no)                    -- a task fetches one endpoint, so the task's pages are its key
 );
+CREATE INDEX page_payload ON raw.page (payload_hash);  -- control.purge_raw finds the payloads no page references
+CREATE INDEX page_fetched ON raw.page (fetched_at);    -- control.purge_raw finds the pages past the retention
 COMMENT ON TABLE raw.page IS
-    'Source responses from every endpoint. Grain: one page per task. Writer: pipeline Extract. Layer: raw.';
+    'Source responses from every endpoint, without their hashed part. Grain: one page per task. Writer: pipeline Extract; control.purge_raw. Layer: raw.';
 
 CREATE SCHEMA quarantine;
 COMMENT ON SCHEMA quarantine IS 'Records held back by validation until they are replayed, released or discarded.';

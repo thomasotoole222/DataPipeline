@@ -7,8 +7,11 @@ import pytest
 from pipeline.errors import (
     DatabaseConflict,
     DatabaseUnavailable,
+    KeyViolation,
     Outcome,
+    Overflow,
     PipelineError,
+    TooDeep,
     classify,
     db_errors,
 )
@@ -33,7 +36,6 @@ CONFLICT: list[type[Exception]] = [
 PASS_THROUGH: list[type[Exception]] = [
     psycopg.errors.QueryCanceled,
     psycopg.errors.UndefinedTable,
-    psycopg.errors.UniqueViolation,
     psycopg.InterfaceError,
     psycopg.errors.OutOfMemory,
     psycopg.errors.SqlserverRejectedEstablishmentOfSqlconnection,
@@ -77,3 +79,20 @@ def test_db_errors_passes_other_errors_through(cls: type[Exception]) -> None:
     with pytest.raises(cls) as info, db_errors():
         raise original
     assert info.value is original
+
+
+def test_db_errors_raises_key_violation_without_the_key_values() -> None:
+    """Turn a unique violation into a permanent ``KeyViolation`` whose message leaves out Postgres's detail."""
+    original = psycopg.errors.UniqueViolation("duplicate key value violates unique constraint\nDETAIL: Key (id)=(o1)")
+    with pytest.raises(KeyViolation) as info, db_errors():
+        raise original
+    assert info.value.__cause__ is original
+    assert str(info.value).startswith("warehouse: unique key ")
+    assert "o1" not in str(info.value)
+    assert classify(info.value) == (Outcome.FAILED, "KeyViolation")
+
+
+@pytest.mark.parametrize("cls", [KeyViolation, Overflow, TooDeep], ids=lambda c: c.__name__)
+def test_deterministic_errors_are_permanent(cls: type[PipelineError]) -> None:
+    """Classify each error the same input always reproduces as failed, so it is not retried."""
+    assert classify(cls("x")) == (Outcome.FAILED, cls.__name__)

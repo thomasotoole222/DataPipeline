@@ -137,9 +137,9 @@ class TaskReport:
     Fields are validated in ``__post_init__``, and the first failed check raises. An ``error_message`` longer than
     ``_MESSAGE_LIMIT`` characters is stored as its first ``_MESSAGE_LIMIT`` characters, with no truncation marker. Row
     counts are not checked against each other, because one fetched record can produce several rows. Every character
-    of ``error_class`` and ``error_message`` that Postgres text cannot store (NUL and lone surrogates; see
-    ``storable_text``) is stored as U+FFFD, because psycopg cannot send it and ``report_outcome`` would then fail to
-    record the outcome. ``control.report_outcome`` takes the row counts as ``bigint``, so each must be at most
+    of ``error_class``, ``error_type`` and ``error_message`` that Postgres text cannot store (NUL and lone surrogates;
+    see ``storable_text``) is stored as U+FFFD, because psycopg cannot send it and ``report_outcome`` would then fail
+    to record the outcome. ``control.report_outcome`` takes the row counts as ``bigint``, so each must be at most
     ``_MAX_ROWS`` (``2**63 - 1``). ``retry_after`` must be at most ``MAX_RETRY_AFTER`` (six hours), the longest
     retry delay the pipeline stores; ``retry_after_from`` clamps a ``Retry-After`` header to it.
 
@@ -150,6 +150,9 @@ class TaskReport:
         outcome: The result of the run.
         error_class: Error class of an unsuccessful run. ``None`` exactly when ``outcome`` is ``Outcome.SUCCEEDED``,
             and never ``""``. Characters ``storable_text`` replaces become U+FFFD.
+        error_type: Type name of the exception that ended an unsuccessful run, such as ``"RecursionError"`` when
+            ``error_class`` is ``"Unexpected"``. ``None`` exactly when ``outcome`` is ``Outcome.SUCCEEDED``, and never
+            ``""``. Characters ``storable_text`` replaces become U+FFFD.
         error_message: Error text, or ``None``. Must be ``None`` when ``outcome`` is ``Outcome.SUCCEEDED``.
             Characters ``storable_text`` replaces become U+FFFD, then the text is truncated to ``_MESSAGE_LIMIT``
             characters.
@@ -168,6 +171,8 @@ class TaskReport:
         ValueError: If ``error_class`` is ``None`` while ``outcome`` is not ``Outcome.SUCCEEDED``, or is not ``None``
             while it is.
         ValueError: If ``error_class`` is ``""``.
+        ValueError: If ``error_type`` is ``None`` while ``outcome`` is not ``Outcome.SUCCEEDED``, or is not ``None``
+            while it is, or is ``""``.
         ValueError: If ``outcome`` is ``Outcome.SUCCEEDED`` and ``error_message`` or ``retry_after`` is not ``None``.
         ValueError: If ``rows_fetched``, ``rows_written`` or ``rows_rejected`` is negative or above ``_MAX_ROWS``.
         ValueError: If ``duration`` is negative.
@@ -177,6 +182,7 @@ class TaskReport:
 
     outcome: Outcome
     error_class: str | None  # None exactly when outcome is SUCCEEDED; never ""
+    error_type: str | None  # the exception's type name; None exactly when outcome is SUCCEEDED; never ""
     error_message: str | None  # None when SUCCEEDED; cut to _MESSAGE_LIMIT characters
     retry_after: timedelta | None  # the delay a connector asked for, if any; 0 to MAX_RETRY_AFTER; None when SUCCEEDED
     rows_fetched: int  # each count >= 0; not checked against each other
@@ -185,10 +191,10 @@ class TaskReport:
     duration: timedelta  # >= 0
 
     def __post_init__(self) -> None:
-        """Validate the fields, make ``error_class`` and ``error_message`` storable, and truncate ``error_message``.
+        """Validate the fields, make the error texts storable, and truncate ``error_message``.
 
-        Both texts go through ``storable_text`` (NUL and lone surrogates become U+FFFD), and ``error_message`` is
-        then cut to ``_MESSAGE_LIMIT`` characters.
+        ``error_class``, ``error_type`` and ``error_message`` go through ``storable_text`` (NUL and lone surrogates
+        become U+FFFD), and ``error_message`` is then cut to ``_MESSAGE_LIMIT`` characters.
 
         Preconditions:
             Called once, by the generated ``__init__``.
@@ -208,6 +214,10 @@ class TaskReport:
             raise ValueError(f"error_class must be None exactly when the outcome is succeeded, got {self.outcome}")
         if self.error_class == "":
             raise ValueError("error_class must not be empty")
+        if succeeded != (self.error_type is None):
+            raise ValueError(f"error_type must be None exactly when the outcome is succeeded, got {self.outcome}")
+        if self.error_type == "":
+            raise ValueError("error_type must not be empty")
         if succeeded and self.error_message is not None:
             raise ValueError("error_message must be None when the outcome is succeeded")
         if succeeded and self.retry_after is not None:
@@ -224,6 +234,8 @@ class TaskReport:
             raise ValueError(f"retry_after must be at most {MAX_RETRY_AFTER}, got {self.retry_after}")
         if self.error_class is not None:
             object.__setattr__(self, "error_class", storable_text(self.error_class))
+        if self.error_type is not None:
+            object.__setattr__(self, "error_type", storable_text(self.error_type))
         if self.error_message is not None:
             object.__setattr__(self, "error_message", storable_text(self.error_message)[:_MESSAGE_LIMIT])
 
@@ -482,14 +494,14 @@ class Fence(Protocol):
         ...
 
 
-#: SQL that calls ``control.report_outcome`` with ten positional ``%s`` parameters.
-_REPORT: Final = "SELECT control.report_outcome(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+#: SQL that calls ``control.report_outcome`` with eleven positional ``%s`` parameters.
+_REPORT: Final = "SELECT control.report_outcome(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
 
 
 async def report_outcome(conn: Connection, task: ClaimedTask, report: TaskReport) -> str:
     """Report a claimed task's outcome through ``control.report_outcome`` and return the result as text.
 
-    Builds ten positional parameters from ``task`` and ``report``, executes ``_REPORT`` on ``conn`` inside
+    Builds eleven positional parameters from ``task`` and ``report``, executes ``_REPORT`` on ``conn`` inside
     ``_fenced(task)``, fetches one row and returns its first column converted with ``str``. A ``NULL`` first column is
     not rejected. ``report.duration`` is sent as whole milliseconds, rounded towards negative infinity. The function
     does not commit. ``TaskReport`` keeps ``retry_after`` within ``MAX_RETRY_AFTER``, and ``control.report_outcome``
@@ -503,10 +515,10 @@ async def report_outcome(conn: Connection, task: ClaimedTask, report: TaskReport
     Args:
         conn: The connection the query is executed on.
         task: The claimed task. ``task.id`` and ``task.lease_token`` are the first two parameters.
-        report: The outcome to record. ``outcome.value``, ``error_class``, ``error_message``, ``retry_after``,
-            ``rows_fetched``, ``rows_written``, ``rows_rejected`` and ``duration`` (in whole milliseconds) are the
-            remaining parameters, in that order. ``retry_after`` is sent as a ``timedelta``, which psycopg adapts to
-            the ``interval`` parameter of ``control.report_outcome``.
+        report: The outcome to record. ``outcome.value``, ``error_class``, ``error_type``, ``error_message``,
+            ``retry_after``, ``rows_fetched``, ``rows_written``, ``rows_rejected`` and ``duration`` (in whole
+            milliseconds) are the remaining parameters, in that order. ``retry_after`` is sent as a ``timedelta``,
+            which psycopg adapts to the ``interval`` parameter of ``control.report_outcome``.
 
     Returns:
         ``str(row[0])``, where ``row`` is the first row returned by ``control.report_outcome``. The string ``"None"``
@@ -530,6 +542,7 @@ async def report_outcome(conn: Connection, task: ClaimedTask, report: TaskReport
         task.lease_token,
         report.outcome.value,
         report.error_class,
+        report.error_type,
         report.error_message,
         report.retry_after,
         report.rows_fetched,

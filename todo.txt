@@ -84,3 +84,9 @@ change. Fix one if integration testing or production shows it matters.
     reports, against the rule that error messages name keys or fields and never show values.
     Fix: drop the value from the message ("Cruva shop id must be non-empty printable ASCII with no whitespace"), in
     the build spec's stage 11 tab and in the code.
+
+15. Stage 11 (Cipher application package), TIKTOK_SHOP_RULES: TikTok Shop error 36009004 was seen in integration
+    step 3 when a shop's credential is revoked; it is classed PermanentError because its message lacks the
+    access_token keyword. Stage 11 says an account-wide endpoint also returns 36009004 when sent a shop_cipher, so
+    mapping it to TokenRejected for every endpoint would block those.
+    Fix: decide a per-endpoint mapping later.

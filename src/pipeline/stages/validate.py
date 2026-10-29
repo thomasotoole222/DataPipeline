@@ -1,8 +1,10 @@
 """Validate the records a task landed in ``raw.page``: parse, deduplicate, run checks, and split accepted from held.
 
 Public API:
-    Validated: The outcome of ``validate``: accepted records, held rows and counts.
+    Validated: The outcome of ``validate``: accepted records, where they landed, held rows and counts.
     validate: Parse, deduplicate and check a task's landed records.
+    held_accepted: Build the held row for an accepted record that a later stage holds back.
+    judge: Fail the batch when its held rows break the batch policy.
 
 """
 
@@ -15,7 +17,7 @@ from typing import Any, Final
 
 from pydantic import BaseModel, ValidationError
 
-from pipeline.checks.checks import SCHEMA_RULE, CheckContext, Lookup, Rule, Severity, Validation
+from pipeline.checks.checks import SCHEMA_RULE, BatchPolicy, CheckContext, Lookup, Rule, Severity, Validation
 from pipeline.checks.record import Keyed, Record, key_of
 from pipeline.connectors.spec import EndpointSpec
 from pipeline.db import raw
@@ -36,24 +38,32 @@ _EXAMPLES: Final = 5
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Validated[R: Record]:
-    """The outcome of ``validate``: accepted records, held rows and counts.
+    """The outcome of ``validate``: accepted records, where they landed, held rows and counts.
 
     Frozen, slotted and keyword-only. No field is checked; there is no ``__post_init__``.
 
     Attributes:
         accepted: Records kept by ``_dedupe`` that failed no non-``WARN`` check, in landed order, each with the key
             it was de-duplicated on, which Transform writes as its key columns.
+        landed: Where each accepted record landed and its raw value, in ``accepted`` order, so ``held_accepted`` can
+            hold it back after Validate.
         held: Rows held back, one per record that failed to parse, parsed with a key that could not be read, shares
             its key with a record that failed to parse, or failed a non-``WARN`` check.
         records: Number of records landed, before deduplication.
         deduplicated: Number of records dropped by ``_dedupe``.
+        judged_total: The total ``judge`` was given: records landed, less those ``_dedupe`` dropped and the held
+            copies of a failed key after the first.
+        judged: The held rows ``judge`` was given; Load gives them to ``judge`` again with its own held records.
 
     """
 
     accepted: tuple[Keyed[R], ...]  # records that load with their keys, warned ones included, in fetch order
+    landed: tuple[_Landed, ...]  # where each accepted record came from, in accepted order
     held: tuple[HeldRow, ...]  # records held back, for Load to write with quarantine.hold
     records: int  # records on the task's pages, duplicates included
     deduplicated: int  # earlier copies dropped because a later page had the same key
+    judged_total: int  # the total judge was given: records landed, less dropped copies and repeats of failed keys
+    judged: tuple[HeldRow, ...]  # the held rows judge was given; Load judges them again with its own
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,14 +118,14 @@ async def validate[R: Record](
     key among those records, ``_fetch_lookups`` makes one ``known_values`` call per ``Lookup`` over the kept
     records, and each kept record is checked. Failures with severity ``WARN`` are only reported, with the record's
     key; any other failure (error or wait) holds the record, and a record with no such failure is accepted. Then
-    ``_report`` and ``_judge`` run, and the result is returned.
+    ``_report`` and ``judge`` run, and the result is returned.
 
     A record that fails both an error check and a wait check is held with both failures and counts as an error,
     because ``_waiting`` needs every failure to have an ``until`` job. Every ``SCHEMA_RULE`` failure (a parse
     failure, an unreadable key, or a parsed copy of a key that failed to parse) counts as an ``ERROR`` failure in
     ``_report``.
 
-    ``_judge`` is given the rows ``_parse_records`` counts (one per failed key and one per record whose key could not
+    ``judge`` is given the rows ``_parse_records`` counts (one per failed key and one per record whose key could not
     be read) and every held kept record, and a total of the records landed less those ``_dedupe`` dropped and the held
     rows it does not count. So a key fetched three times counts as one record and one held row whether it fails to
     parse or fails an error check.
@@ -132,13 +142,14 @@ async def validate[R: Record](
         instruments: Telemetry passed to ``_parse_records`` and ``_report``.
 
     Returns:
-        A ``Validated`` with the accepted records and their keys; every held row, parse failures and parsed records
-        with an unreadable key first in landed order, then the parsed copies of failed keys in landed order, then
-        check failures in kept order; ``records``, the number of records landed before deduplication; and
-        ``deduplicated``, the number of records dropped by ``_dedupe``.
+        A ``Validated`` with the accepted records and their keys, and where each landed; every held row, parse
+        failures and parsed records with an unreadable key first in landed order, then the parsed copies of
+        failed keys in landed order, then check failures in kept order; ``records``, the number of records
+        landed before deduplication; ``deduplicated``, the number of records dropped by ``_dedupe``; and
+        ``judged_total`` and ``judged``, the total and the held rows ``judge`` was given.
 
     Raises:
-        QualityFailed: From ``_judge``, when the held rows that are not waiting, each failed key counted once, break
+        QualityFailed: From ``judge``, when the held rows that are not waiting, each failed key counted once, break
             the batch policy.
         ClientErrorUnhandled: From ``_records``, when a page other than the last has nothing or ``null`` at the
             records path, or any page has a non-list there.
@@ -162,6 +173,7 @@ async def validate[R: Record](
     kept, dropped = _dedupe(clean)
     known = await _fetch_lookups(pool, validation.checks, [p.record for p in kept])
     accepted: list[Keyed[R]] = []
+    origins: list[_Landed] = []  # where each accepted record landed
     warned: list[tuple[Failure, tuple[object, ...]]] = []
     warned_rows = 0
     for entry in kept:
@@ -175,11 +187,21 @@ async def validate[R: Record](
             counted.append(held[-1])
         else:
             accepted.append(Keyed(entry.record, entry.key))
+            origins.append(entry.landed)
             warned_rows += bool(warnings)
     _report(task, instruments, held, warned, warned_rows, failed, dropped, new_fields)
     repeats = len(held) - len(counted)  # the other copies of failed keys, counted once like deduplicated ones
-    _judge(validation, len(landed) - len(dropped) - repeats, counted)
-    return Validated(accepted=tuple(accepted), held=tuple(held), records=len(landed), deduplicated=len(dropped))
+    judged_total = len(landed) - len(dropped) - repeats
+    judge(validation.policy, judged_total, counted)
+    return Validated(
+        accepted=tuple(accepted),
+        landed=tuple(origins),
+        held=tuple(held),
+        records=len(landed),
+        deduplicated=len(dropped),
+        judged_total=judged_total,
+        judged=tuple(counted),
+    )
 
 
 def _records(pages: Iterable[RawPage], spec: EndpointSpec) -> list[_Landed]:
@@ -540,6 +562,31 @@ def _held(task: ClaimedTask, item: _Landed, group_key: str | None, failures: tup
     )
 
 
+def held_accepted(task: ClaimedTask, validated: Validated[Any], position: int, failure: Failure) -> HeldRow:
+    """Build the held row for an accepted record that a later stage holds back, such as Transform or Load.
+
+    The row is built as ``validate`` builds one for a failed check: by ``_held``, from the record's landed page,
+    position and payload, with ``_group_key`` of its key and ``failure`` as its one failure.
+
+    Preconditions:
+        ``validated`` is ``validate``'s result for ``task``.
+
+    Args:
+        task: The task that landed the record; gives the id, connector, job, source and partition.
+        validated: The validate result holding the record.
+        position: The record's position in ``validated.accepted``.
+        failure: Why the record is held.
+
+    Returns:
+        The ``HeldRow``.
+
+    Raises:
+        IndexError: When ``position`` is not a position in ``validated.accepted``.
+
+    """
+    return _held(task, validated.landed[position], _group_key(validated.accepted[position].key), (failure,))
+
+
 def _group_key(key: Iterable[object]) -> str:
     """Return the group key for a record's key values: a compact JSON array of the values as strings.
 
@@ -609,8 +656,8 @@ def _waiting(row: HeldRow) -> bool:
     return all(failure.until is not None for failure in row.failures)
 
 
-def _judge(validation: Validation[Any], total: int, held: Sequence[HeldRow]) -> None:
-    """Fail the batch when the held rows that are not waiting break the validation's batch policy.
+def judge(policy: BatchPolicy, total: int, held: Sequence[HeldRow]) -> None:
+    """Fail the batch when the held rows that are not waiting break the batch policy.
 
     Rows for which ``_waiting`` is true are not counted. When ``policy.fails(total, errors)`` is true it raises
     ``QualityFailed(rows_total=total, rows_quarantined=<non-waiting held rows>, by_rule=<failures per rule over those
@@ -619,13 +666,14 @@ def _judge(validation: Validation[Any], total: int, held: Sequence[HeldRow]) -> 
     Preconditions:
         ``0 <= len(held) <= total``, as ``BatchPolicy.fails`` expects; ``validate`` guarantees this because every row
         it passes is the first copy of a failed key, a parse failure with an unreadable key, or a kept record, and
-        ``total`` counts each of them once.
+        ``total`` counts each of them once. ``stages.load`` adds only accepted records, each a kept record that
+        ``total`` counts and ``validate`` did not hold.
 
     Args:
-        validation: Gives the batch policy.
+        policy: The batch policy.
         total: Records after deduplication, each failed key counted once, parse failures included.
         held: The task's held rows to judge: one per failed key, every one whose key is unreadable, and every held
-            kept record.
+            kept record; ``stages.load`` passes ``Validated.judged`` followed by the records it holds.
 
     Returns:
         None.
@@ -635,7 +683,7 @@ def _judge(validation: Validation[Any], total: int, held: Sequence[HeldRow]) -> 
 
     """
     errors = [row for row in held if not _waiting(row)]
-    if validation.policy.fails(total, len(errors)):
+    if policy.fails(total, len(errors)):
         by_rule = Counter(failure.rule for row in errors for failure in row.failures)
         raise QualityFailed(rows_total=total, rows_quarantined=len(errors), by_rule=by_rule)
 

@@ -234,6 +234,7 @@ def _failure_report(task: ClaimedTask, err: BaseException) -> TaskReport:
 
     An ``Exception`` is classified by ``classify``; any other ``BaseException`` is ``Outcome.UNEXPECTED`` with its
     class name as the error class. The failure is logged at ``WARNING``, and the report is built from it:
+    - ``error_type`` is the exception's type name, so an ``"Unexpected"`` error class still names its exception;
     - ``error_message`` is ``str(err)``, or the exception's type name when that is empty;
     - ``retry_after`` comes from ``err.retry_after`` when that is a ``timedelta``;
     - ``rows_fetched`` and ``rows_written`` come from ``_count``;
@@ -265,6 +266,7 @@ def _failure_report(task: ClaimedTask, err: BaseException) -> TaskReport:
     return TaskReport(
         outcome=outcome,
         error_class=error_class,
+        error_type=type(err).__name__,
         error_message=str(err) or type(err).__name__,
         retry_after=retry_after if isinstance(retry_after, timedelta) else None,
         rows_fetched=_count(err, "rows_fetched"),

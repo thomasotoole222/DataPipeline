@@ -105,10 +105,14 @@ class ConnectorClient[C](Protocol):
 
     Attributes:
         connector (str): Name of the connector the client talks to.
+        hashed_keys (frozenset[str]): The top-level keys of a response body that hold its data, such as TikTok Shop's
+            ``data``. Extract stores their part of each page once per distinct content; the other keys (request ids
+            and the like) are the page's envelope.
 
     """
 
     connector: str
+    hashed_keys: frozenset[str]  # the body keys stored once per distinct content in raw.payload
 
     async def send(self, request: ConnectorRequest, source_id: UUID) -> dict[str, Any]:
         """Send a request for a source and return the response body.
@@ -307,7 +311,8 @@ class Fault:
 class HttpConnectorClient[C](ABC):
     """Send connector requests over HTTP, classify errors by rule, record every attempt and retry transient failures.
 
-    A subclass sets the class attributes ``connector`` and ``rules`` and implements ``build`` and ``fault``. Each
+    A subclass sets the class attributes ``connector`` and ``rules``, sets ``hashed_keys`` when its bodies hold their
+    data under named keys, and implements ``build`` and ``fault``. Each
     attempt gets a credential from ``tokens`` and sends the request built by ``build``. Every attempt that reaches the
     exchange is recorded in ``instruments.connector_requests``; an attempt whose ``tokens.get`` raises, or whose
     ``build``, ``fault`` or ``http.send`` raises something other than a ``PipelineError`` or ``httpx.HTTPError``, or
@@ -320,6 +325,8 @@ class HttpConnectorClient[C](ABC):
     Attributes:
         connector (str): Class attribute set by the subclass. Name of the connector, used in errors and telemetry.
         rules (tuple[ErrorRule, ...]): Class attribute set by the subclass. Rules ``map_error`` tries in order.
+        hashed_keys (frozenset[str]): Class attribute a subclass may set. The body keys Extract stores once per
+            distinct content; empty by default, which keeps every body whole in its envelope.
         http (httpx.AsyncClient): The client requests are sent with.
         tokens (CredentialProvider[C]): Where credentials come from and rejected ones go.
         instruments (Instruments): Telemetry instruments; ``connector_requests`` counts attempts and
@@ -329,6 +336,7 @@ class HttpConnectorClient[C](ABC):
 
     connector: str
     rules: tuple[ErrorRule, ...]
+    hashed_keys: frozenset[str] = frozenset()  # none: every body stays whole in its envelope
 
     def __init__(
         self,

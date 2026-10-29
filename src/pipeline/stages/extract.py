@@ -15,6 +15,7 @@ from pipeline.db import raw
 from pipeline.db.control import ClaimedTask, Fence
 from pipeline.db.pool import Pool
 from pipeline.db.raw import RawPage
+from pipeline.errors import TooDeep
 from pipeline.telemetry import Instruments
 from pipeline.timeutil import TimeFrame
 
@@ -47,7 +48,9 @@ async def extract[C](
     ``instruments.rows`` with attributes ``job`` set to ``task.job`` and ``stage`` set to ``"fetched"``. When an
     ``Exception`` escapes, the attribute named by ``_ROWS_FETCHED`` is set on it to the records landed so far, and it
     is re-raised. ``fetch_pages`` checks ``window``, ``frame`` and ``path_params`` only when the first page is
-    requested, so a call they do not suit raises after the discard has committed.
+    requested, so a call they do not suit raises after the discard has committed. A ``RecursionError`` from the fetch
+    or a page save, a response body nested deeper than the client can parse or clean, is raised as ``TooDeep``
+    instead. Each page is stored with ``client.hashed_keys``.
 
     Preconditions:
         ``raw.page`` exists as ``raw.save_page`` requires. ``fence`` fences on ``task``'s lease. ``spec`` is an
@@ -58,7 +61,7 @@ async def extract[C](
         pool: Pool each transaction takes a connection from.
         task: The claimed task; its ``id``, ``source_id`` and ``job`` are used.
         fence: Fences each transaction on the task's lease (the worker's ``Lease``).
-        client: The client that sends each request.
+        client: The client that sends each request; its ``hashed_keys`` say which part of each page is hashed.
         spec: The endpoint to fetch.
         window: The name of one of ``spec.windows``, or ``None`` when ``frame`` is ``None``.
         frame: The span of time to fetch, or ``None`` for an endpoint fetched without a window.
@@ -70,6 +73,7 @@ async def extract[C](
 
     Raises:
         LeaseConflict: From ``fence.fenced`` when the lease is no longer held, before the discard or a page lands.
+        TooDeep: When the fetch or a page save raises ``RecursionError``; the ``RecursionError`` is not chained.
         Exception: Whatever ``raw.discard_pages``, ``fetch_pages``, ``_land``, the pool, ``fence.fenced`` or the
             counter raises, unchanged. Every ``Exception`` escapes with ``rows_fetched`` set to the records landed
             before it. A ``BaseException`` that is not an ``Exception``, such as ``asyncio.CancelledError``, escapes
@@ -80,17 +84,22 @@ async def extract[C](
     try:
         async with pool.connection() as conn, fence.fenced(conn):
             await raw.discard_pages(conn, task.id)  # every attempt starts over
-        async for page in fetch_pages(client, spec, window, frame, task.source_id, path_params=path_params):
-            await _land(pool, task, fence, spec, page)
-            rows += page.record_count
-            instruments.rows.add(page.record_count, {"job": task.job, "stage": "fetched"})
+        try:
+            async for page in fetch_pages(client, spec, window, frame, task.source_id, path_params=path_params):
+                await _land(pool, task, fence, spec, page, client.hashed_keys)
+                rows += page.record_count
+                instruments.rows.add(page.record_count, {"job": task.job, "stage": "fetched"})
+        except RecursionError:  # its traceback is a thousand frames of one call, so it is not chained
+            raise TooDeep(f"{spec.name}: a response body is nested too deeply to parse or store") from None
     except Exception as err:
         setattr(err, _ROWS_FETCHED, rows)
         raise
     return rows
 
 
-async def _land(pool: Pool, task: ClaimedTask, fence: Fence, spec: EndpointSpec, page: Page) -> None:
+async def _land(
+    pool: Pool, task: ClaimedTask, fence: Fence, spec: EndpointSpec, page: Page, hashed_keys: frozenset[str]
+) -> None:
     """Save ``page`` as a ``RawPage`` row of ``task`` in ``raw.page``, in one transaction fenced on the task's lease.
 
     ``record_count`` is not stored. ``RawPage`` re-checks ``page_no`` and ``fetched_at``, which ``Page`` already
@@ -105,6 +114,7 @@ async def _land(pool: Pool, task: ClaimedTask, fence: Fence, spec: EndpointSpec,
         fence: Fences the transaction on the task's lease.
         spec: The spec that fetched the page; its ``connector`` and ``endpoint`` are stored with the page.
         page: The fetched page to save.
+        hashed_keys: The body keys stored once per distinct content in ``raw.payload``, passed to ``raw.save_page``.
 
     Returns:
         None.
@@ -126,4 +136,4 @@ async def _land(pool: Pool, task: ClaimedTask, fence: Fence, spec: EndpointSpec,
         payload=page.payload,
     )
     async with pool.connection() as conn, fence.fenced(conn):  # a connection only for the write, never across a call
-        await raw.save_page(conn, row)
+        await raw.save_page(conn, row, hashed_keys)

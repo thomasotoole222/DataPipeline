@@ -2,7 +2,7 @@
 
 Public API:
     upsert: Insert staged rows and update existing rows by key where their other columns differ.
-    replace_children: Delete the rows of every parent listed in a parents table, then insert the staged rows.
+    replace_children: Delete the rows of listed parents missing from the stage, then upsert the staged rows by key.
     replace_partition: Delete the rows in one source's half-open range of a column, then insert the staged rows.
     snapshot: Upsert staged rows, clear their ``removed_at``, and optionally mark rows missing from the stage removed.
     update: Update existing rows by key from the stage, and optionally zero rows missing from the stage.
@@ -45,6 +45,7 @@ async def upsert(conn: Connection, table: str, staged: str, columns: Sequence[st
         ValueError: When ``table`` does not contain exactly one ``.``.
         DatabaseConflict: From ``db_errors``, on a serialization failure or deadlock.
         DatabaseUnavailable: From ``db_errors``, on a lost or refused connection.
+        KeyViolation: From ``db_errors``, when a written row violates a unique key of the table.
         psycopg.Error: Any other database error, unchanged.
 
     """
@@ -52,43 +53,63 @@ async def upsert(conn: Connection, table: str, staged: str, columns: Sequence[st
 
 
 async def replace_children(
-    conn: Connection, table: str, staged: str, columns: Sequence[str], key: Sequence[str], parents: str
+    conn: Connection,
+    table: str,
+    staged: str,
+    columns: Sequence[str],
+    inherited: Sequence[str],
+    key: Sequence[str],
+    parents: str,
 ) -> int:
-    """Delete every table row whose parent key is listed in ``parents``, then insert every staged row.
+    """Make each listed parent's rows in the table equal its staged rows, touching only rows that change.
 
-    The two statements run on the same connection; they are atomic only if the caller's transaction makes them so.
-    The parent key is read from ``parents`` qualified, so a key column missing from ``parents`` raises
+    First every table row whose parent key (``inherited``) is listed in ``parents`` and whose row key (``key``) has
+    no staged row is deleted; then every staged row is upserted on ``key`` as ``upsert`` does, so an existing row is
+    updated only when a non-key column differs. Re-running unchanged data therefore deletes, inserts and updates
+    nothing. The two statements run on the same connection; they are atomic only if the caller's transaction makes
+    them so. The parent key is read from ``parents`` qualified, so a key column missing from ``parents`` raises
     ``psycopg.errors.UndefinedColumn`` rather than matching the table's own column.
 
     Preconditions:
-        ``table`` is ``"schema.name"``. ``key`` is non-empty and names the parent-key columns of ``table``, and
-        ``parents`` has a column of each of those names (Load passes the parent's staged table, and
-        ``build_target`` makes the child's key the parent's writer key, which the parent's columns include).
-        ``staged`` has every name in ``columns``, and each staged row belongs to a parent in ``parents`` (rows of
-        any other parent are added beside the existing ones).
+        ``table`` is ``"schema.name"``. ``inherited`` is non-empty and names the parent-key columns of ``table``, and
+        ``parents`` has a column of each of those names (Load passes the parent's staged table, and ``build_target``
+        makes the child's inherited columns the parent's writer key, which the parent's columns include). ``key`` is
+        ``inherited`` followed by the child's own key columns and is exactly the columns of a unique index or
+        constraint on the table (``row_key``; ``load`` checks the table with ``mismatches``). ``staged`` has every name
+        in ``columns``, no two rows with the same ``key`` (else Postgres raises ``CardinalityViolation``), and each
+        staged row belongs to a parent in ``parents`` (rows of any other parent are upserted beside the existing ones).
 
     Args:
         conn: Connection the statements run on; the caller owns the transaction.
         table: Target table as ``"schema.name"``.
         staged: Unqualified name of the staged table.
         columns: Columns copied from the stage to the table.
-        key: Parent-key columns, matched by name in ``table`` and ``parents``.
+        inherited: Parent-key columns, matched by name in ``table`` and ``parents``.
+        key: Row-key columns: the conflict columns, also used to find the rows missing from the stage.
         parents: Unqualified name of the table listing the parents to replace.
 
     Returns:
-        The number of rows deleted plus the number of rows inserted.
+        The number of rows deleted, plus the number of rows inserted or updated.
 
     Raises:
         ValueError: When ``table`` does not contain exactly one ``.``.
         DatabaseConflict: From ``db_errors``, on a serialization failure or deadlock.
         DatabaseUnavailable: From ``db_errors``, on a lost or refused connection.
+        KeyViolation: From ``db_errors``, when an upserted row violates another unique key of the table.
         psycopg.Error: Any other database error, unchanged.
 
     """
-    delete = sql.SQL("DELETE FROM {table} WHERE ROW({key}) IN (SELECT {p_key} FROM {parents} AS p)").format(
-        table=_table(table), key=_names(key), p_key=_names(key, "p"), parents=sql.Identifier(parents)
-    )  # p_key is qualified, so a key column missing from parents is an error, never the outer table's column
-    return await _changed(conn, delete) + await _changed(conn, _insert(table, staged, columns))
+    delete = sql.SQL(
+        "DELETE FROM {table} AS t WHERE ROW({t_key}) IN (SELECT {p_key} FROM {parents} AS p) AND {missing}"
+    ).format(
+        table=_table(table),
+        t_key=_names(inherited, "t"),
+        p_key=_names(inherited, "p"),  # qualified, so a key column missing from parents is an error
+        parents=sql.Identifier(parents),
+        missing=_missing(staged, key),
+    )
+    deleted = await _changed(conn, delete)
+    return deleted + await _changed(conn, _upsert(table, staged, columns, key, clear_removed=False))
 
 
 async def replace_partition(
@@ -132,6 +153,7 @@ async def replace_partition(
         ValueError: When ``table`` does not contain exactly one ``.``.
         DatabaseConflict: From ``db_errors``, on a serialization failure or deadlock.
         DatabaseUnavailable: From ``db_errors``, on a lost or refused connection.
+        KeyViolation: From ``db_errors``, when a written row violates a unique key of the table.
         psycopg.Error: Any other database error, unchanged.
 
     """
@@ -182,6 +204,7 @@ async def snapshot(
         ValueError: When ``table`` does not contain exactly one ``.``.
         DatabaseConflict: From ``db_errors``, on a serialization failure or deadlock.
         DatabaseUnavailable: From ``db_errors``, on a lost or refused connection.
+        KeyViolation: From ``db_errors``, when a written row violates a unique key of the table.
         psycopg.Error: Any other database error, unchanged.
 
     """
@@ -242,6 +265,7 @@ async def update(
         ValueError: When ``table`` does not contain exactly one ``.``.
         DatabaseConflict: From ``db_errors``, on a serialization failure or deadlock.
         DatabaseUnavailable: From ``db_errors``, on a lost or refused connection.
+        KeyViolation: From ``db_errors``, when a written row violates a unique key of the table.
         psycopg.Error: Any other database error, unchanged.
 
     """
@@ -456,6 +480,7 @@ async def _changed(conn: Connection, query: sql.Composed, params: tuple[object, 
     Raises:
         DatabaseConflict: From ``db_errors``, on a serialization failure or deadlock.
         DatabaseUnavailable: From ``db_errors``, on a lost or refused connection.
+        KeyViolation: From ``db_errors``, when a written row violates a unique key of the table.
         psycopg.Error: Any other database error, unchanged.
 
     """

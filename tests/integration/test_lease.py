@@ -88,6 +88,7 @@ def success(duration: timedelta = timedelta(seconds=1)) -> TaskReport:
     return TaskReport(
         outcome=Outcome.SUCCEEDED,
         error_class=None,
+        error_type=None,
         error_message=None,
         retry_after=None,
         rows_fetched=0,
@@ -143,3 +144,45 @@ async def test_complete_records_the_task_duration(
     (point,) = points(reader, "pipeline.task.duration")
     assert (point.sum, point.count) == (2.5, 1)
     assert dict(point.attributes) == {"job": "orders", "outcome": "succeeded"}
+
+
+async def test_expire_leases_logs_each_lease_it_releases(pool: Pool) -> None:
+    """Check expire_leases releases an expired lease and logs it as an expired lease loss under its owner."""
+    task = await claimed(pool)
+    async with pool.connection() as c:
+        await c.execute(
+            "UPDATE control.task SET lease_expires_at = now() - interval '1 second' WHERE id = %s", (task.id,)
+        )
+        cursor = await c.execute("SELECT control.expire_leases()")
+        assert await cursor.fetchone() == (1,)
+        cursor = await c.execute("SELECT task_id, lease_token, kind, worker, unwind_ms FROM control.lease_loss")
+        assert await cursor.fetchall() == [(task.id, task.lease_token, "expired", WORKER, None)]
+        cursor = await c.execute("SELECT state, error_class, error_type FROM control.task WHERE id = %s", (task.id,))
+        assert await cursor.fetchone() == ("pending", "LeaseExpired", None)
+        cursor = await c.execute("SELECT control.expire_leases()")
+        assert await cursor.fetchone() == (0,)
+        cursor = await c.execute("SELECT count(*) FROM control.lease_loss")
+        assert await cursor.fetchone() == (1,)
+
+
+async def test_complete_stores_the_error_type_beside_the_class(pool: Pool, instruments: Instruments) -> None:
+    """Check a failure report stores its exception's type beside its error class, and is not retried when failed."""
+    task = await claimed(pool)
+    held = Lease(pool, task, worker_id=WORKER, instruments=instruments, claim_started=started())
+    report = TaskReport(
+        outcome=Outcome.FAILED,
+        error_class="KeyViolation",
+        error_type="KeyViolation",
+        error_message="warehouse: unique key line_pkey violated",
+        retry_after=None,
+        rows_fetched=3,
+        rows_written=0,
+        rows_rejected=0,
+        duration=timedelta(seconds=1),
+    )
+    async with pool.connection() as c:
+        assert await held.complete(c, report) == "failed"
+        cursor = await c.execute(
+            "SELECT error_class, error_type, rows_fetched FROM control.task WHERE id = %s", (task.id,)
+        )
+        assert await cursor.fetchone() == ("KeyViolation", "KeyViolation", 3)

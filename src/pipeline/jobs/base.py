@@ -9,7 +9,7 @@ Public API:
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
-from typing import Any, Literal, Protocol, final
+from typing import Any, Final, Literal, Protocol, final
 from zoneinfo import ZoneInfo
 
 from pipeline.checks.checks import Validation
@@ -21,8 +21,8 @@ from pipeline.db.control import ClaimedTask, Fence, TaskReport
 from pipeline.db.pool import Connection, Pool
 from pipeline.errors import Outcome
 from pipeline.stages.extract import extract
-from pipeline.stages.load import load
-from pipeline.stages.transform import Transformed, transform
+from pipeline.stages.load import Loaded, load
+from pipeline.stages.transform import transform
 from pipeline.stages.validate import validate
 from pipeline.telemetry import Instruments
 from pipeline.timeutil import TimeFrame, utc_now
@@ -30,6 +30,10 @@ from pipeline.timeutil import TimeFrame, utc_now
 #: How a job's tasks slice its endpoint: ``"day"`` is one local day per task, keyed ``YYYY-MM-DD``; ``"none"`` is the
 #: whole endpoint in one task, with no time frame.
 type Partition = Literal["day", "none"]
+
+#: Name of the attribute ``BatchJob.__call__`` sets on an ``Exception`` from a stage after Extract to the records
+#: fetched, as ``stages.extract`` does for its own; ``worker.loop`` reads it back with ``_count(err, "rows_fetched")``.
+_ROWS_FETCHED: Final = "rows_fetched"
 
 
 class TaskLease(Fence, Protocol):
@@ -142,32 +146,6 @@ class _Completing:
         async with self._lease.fenced(conn):
             yield
             await self._lease.complete(conn, self._report())
-
-
-def _rows_written(transformed: Transformed, *, held: bool) -> int:
-    """Count the rows Load writes: every frame's rows, less a ``ReplacePartition`` frame's when records are held.
-
-    ``load`` skips a ``ReplacePartition`` target when records are held and writes every other frame whole (its
-    contract), so the count is the sum of the heights of the frames ``load`` reports as ``sent``. It is computed here
-    because ``load`` returns its own counts only after the transaction the report must be part of has committed.
-
-    Preconditions:
-        ``held`` is true exactly when ``load`` receives a non-empty ``validated.held``.
-
-    Args:
-        transformed: The frames handed to Load.
-        held: Whether Validate held any record.
-
-    Returns:
-        The number of rows in the frames Load writes.
-
-    Raises:
-        Nothing.
-
-    """
-    return sum(
-        data.height for target, data in transformed.frames if not (held and isinstance(target.writer, ReplacePartition))
-    )
 
 
 class BatchJob[R: Record]:
@@ -284,9 +262,12 @@ class BatchJob[R: Record]:
             5. ``load`` writes the held rows and the frames in one transaction fenced on the lease; its last write
                is ``lease.complete`` with a ``SUCCEEDED`` report, so the rows and the outcome commit together.
 
-        The report counts the records fetched, the rows Load writes (``_rows_written``) and the rows held, and its
+        The report counts the records fetched, the rows Load changed (the sum of ``Loaded.changed``, which ``load``
+        hands over through ``on_loaded`` before the report is built) and the rows held (``Loaded.held``), and its
         duration runs from ``task.claimed_at`` until Load's writes are done, floored at zero when the wall clock is
-        behind the claim time. The text ``lease.complete`` returns is discarded.
+        behind the claim time. The text ``lease.complete`` returns is discarded. An ``Exception`` from Validate,
+        Transform or Load escapes with ``rows_fetched`` set to the records Extract fetched; one from Extract carries
+        Extract's own count.
 
         Preconditions:
             ``lease`` is the lease this worker holds on ``task``.
@@ -303,27 +284,44 @@ class BatchJob[R: Record]:
                 before anything is written.
             OverflowError: From ``frame``, for a ``"day"`` key of ``"9999-12-30"`` or ``"9999-12-31"``, or one whose
                 local midnight leaves the ``datetime`` range in UTC, before anything is written.
-            Exception: Anything a stage, ``lease.complete`` or ``TaskReport`` raises, unchanged; the worker reports it
-                as the task's outcome. Pages landed by ``extract`` stay committed when a later stage raises.
+            Exception: Anything a stage, ``lease.complete`` or ``TaskReport`` raises, unchanged but for its
+                ``rows_fetched``; the worker reports it as the task's outcome. Pages landed by ``extract`` stay
+                committed when a later stage raises.
 
         """
         frame = self.frame(task.partition_key)
         pool = lease.pool
         fetched = await extract(pool, task, lease, self._client, self.spec, self.window, frame, self._instruments)
-        validated = await validate(pool, task, self.spec, frame, self.validation, self._instruments)
-        transformed = transform(self.validation.model, validated.accepted, task.source_id)
-        written = _rows_written(transformed, held=bool(validated.held))
+        loaded: list[Loaded] = []  # load hands its result over inside its transaction, before the report is built
 
         def report() -> TaskReport:
             return TaskReport(
                 outcome=Outcome.SUCCEEDED,
                 error_class=None,
+                error_type=None,
                 error_message=None,
                 retry_after=None,
                 rows_fetched=fetched,
-                rows_written=written,
-                rows_rejected=len(validated.held),
+                rows_written=sum(loaded[-1].changed.values()),
+                rows_rejected=loaded[-1].held,
                 duration=max(utc_now() - task.claimed_at, timedelta(0)),
             )
 
-        await load(pool, task, _Completing(lease, report), validated, transformed, frame, self._instruments)
+        try:
+            validated = await validate(pool, task, self.spec, frame, self.validation, self._instruments)
+            transformed = transform(self.validation.model, validated.accepted, task.source_id)
+            completing = _Completing(lease, report)
+            await load(
+                pool,
+                task,
+                completing,
+                validated,
+                transformed,
+                frame,
+                self._instruments,
+                policy=self.validation.policy,
+                on_loaded=loaded.append,
+            )
+        except Exception as err:  # a failure after Extract still reports the records fetched
+            setattr(err, _ROWS_FETCHED, fetched)
+            raise

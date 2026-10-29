@@ -22,6 +22,7 @@ import re
 import socket
 import stat
 from collections.abc import Mapping
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -418,6 +419,9 @@ class Settings(BaseSettings):
             ``"INFO"``.
         polars_threads (int): Size of Polars' thread pool, 1 or more, with no upper bound here. Defaults to 2. Not
             checked against the container's CPU limit by this class; the caller does that at startup.
+        raw_retention (timedelta): How long a page stays in ``raw.page`` after it was fetched, the argument
+            ``control.purge_raw`` is called with. An ISO-8601 duration such as ``PT60H``, longer than zero. Defaults to
+            60 hours.
 
     Connector secrets (app keys, API keys) are not settings: each connector client takes its own as constructor
     arguments, so ``ENV_FILE`` must not hold them.
@@ -445,6 +449,7 @@ class Settings(BaseSettings):
     concurrency: int = Field(default=1, ge=1, le=4)
     log_level: Literal["DEBUG", "INFO", "WARNING"] = "INFO"
     polars_threads: int = Field(default=2, ge=1)  # Polars' thread-pool size; fixed apart from the container's CPU limit
+    raw_retention: timedelta = Field(default=timedelta(hours=60), gt=timedelta(0))  # PIPELINE_RAW_RETENTION, e.g. PT60H
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Refuse a subclass whose ``model_config`` changes ``env_prefix``, ``case_sensitive`` or ``env_file_encoding``.

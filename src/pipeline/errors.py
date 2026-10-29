@@ -28,6 +28,9 @@ Public API:
     ClientErrorUnhandled: A ``PipelineError`` with outcome ``UNEXPECTED`` for a connector response no rule handles.
     RowLimitReached: A ``PermanentError`` raised when an endpoint reaches its row limit and cannot split the frame.
     TokenRejected: An ``AuthBlocked`` raised when a connector rejects the credential sent with a request.
+    KeyViolation: A ``PermanentError`` raised when rows to be written share a key, in a batch or with the warehouse.
+    Overflow: A ``PermanentError`` raised when a value does not fit its warehouse column.
+    TooDeep: A ``PermanentError`` raised when a response body is nested too deeply to parse or store.
     db_errors: Context manager that converts warehouse connection and conflict errors into pipeline errors.
 
 """
@@ -996,6 +999,52 @@ class TokenRejected(AuthBlocked):
     pass  # the connector rejected the credential itself; the client reports it to its CredentialProvider
 
 
+class KeyViolation(PermanentError):
+    """Signal that rows to be written share a key, within one batch or with a row already in the warehouse.
+
+    Adds no constructor or attributes of its own; the raiser supplies a message that names the table or constraint,
+    never key values. ``db_errors`` raises it for a ``unique_violation`` the warehouse reports; ``stages.load`` names it
+    as the rule of the records it holds for sharing a key in their batch. The same input always reproduces it, so it is
+    a ``PermanentError`` and is not retried.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.FAILED``, inherited from ``PermanentError``.
+
+    """
+
+    pass
+
+
+class Overflow(PermanentError):
+    """Signal that a value does not fit its warehouse column, such as a sum too large for its ``numeric`` column.
+
+    Adds no constructor or attributes of its own; the raiser supplies a message that names the table, column and type,
+    never the value. ``stages.transform.frame_of`` raises it, and ``stages.transform.transform`` holds the record whose
+    row it was raised for instead of failing the task. The same input always reproduces it, so it is not retried.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.FAILED``, inherited from ``PermanentError``.
+
+    """
+
+    pass
+
+
+class TooDeep(PermanentError):
+    """Signal that a response body is nested too deeply for the client to parse or clean it.
+
+    Adds no constructor or attributes of its own; the raiser supplies the message. ``stages.extract.extract`` raises it
+    in place of the ``RecursionError`` a connector client lets through, so the task fails as permanent: the same
+    response always reproduces it, so it is not retried.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.FAILED``, inherited from ``PermanentError``.
+
+    """
+
+    pass
+
+
 #: Errors that mean the warehouse is unreachable or the connection was lost, including the server ending an idle
 #: session (57P05) or an idle transaction (25P03).
 _DB_UNAVAILABLE: tuple[type[Exception], ...] = (
@@ -1016,11 +1065,13 @@ _DB_CONFLICT: tuple[type[Exception], ...] = (psycopg.errors.SerializationFailure
 
 @contextmanager
 def db_errors() -> Iterator[None]:
-    """Convert warehouse connection and conflict errors raised inside the block into pipeline errors.
+    """Convert warehouse connection, conflict and unique-key errors raised inside the block into pipeline errors.
 
     An error in ``_DB_CONFLICT`` becomes ``DatabaseConflict``. An error in ``_DB_UNAVAILABLE``, or an exception whose
-    type is exactly ``psycopg.OperationalError``, becomes ``DatabaseUnavailable``. Each replacement has the message
-    ``"warehouse: {exception type name}: {original message}"`` and the original as its ``__cause__``. Every other
+    type is exactly ``psycopg.OperationalError``, becomes ``DatabaseUnavailable``. Each of those replacements has the
+    message ``"warehouse: {exception type name}: {original message}"``. A ``psycopg.errors.UniqueViolation`` becomes
+    ``KeyViolation`` with the message ``"warehouse: unique key {constraint name} violated"``, which leaves out the key
+    values Postgres puts in its detail. Every replacement has the original as its ``__cause__``. Every other
     exception, including other ``psycopg.OperationalError`` subclasses, propagates unchanged.
 
     Preconditions:
@@ -1036,10 +1087,13 @@ def db_errors() -> Iterator[None]:
         DatabaseConflict: When the block raises an error in ``_DB_CONFLICT``.
         DatabaseUnavailable: When the block raises an error in ``_DB_UNAVAILABLE`` or a bare
             ``psycopg.OperationalError``.
+        KeyViolation: When the block raises ``psycopg.errors.UniqueViolation``.
 
     """
     try:
         yield
+    except psycopg.errors.UniqueViolation as err:  # the detail holds the key values, so only the constraint is named
+        raise KeyViolation(f"warehouse: unique key {err.diag.constraint_name} violated") from err
     except _DB_CONFLICT as err:
         raise DatabaseConflict(f"warehouse: {type(err).__name__}: {err}") from err
     except _DB_UNAVAILABLE as err:

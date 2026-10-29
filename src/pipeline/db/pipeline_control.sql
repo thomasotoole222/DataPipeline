@@ -9,14 +9,15 @@
 --         minutes after that transaction's start.
 --     control.report_outcome: Record an attempt's outcome, release the lease and return the task's new state.
 --     control.record_lease_loss: Log a lease a worker gave up.
---     control.expire_leases: Release every expired lease whose row is not locked and count them.
+--     control.expire_leases: Release every expired lease whose row is not locked, log each one and count them.
+--     control.purge_raw: Delete the raw pages past a retention whose task is not open, then the payloads left unused.
 --     control.notify_task: Trigger function that notifies channel control_task with the task's id.
 --     task_notify: Trigger that runs control.notify_task when a task is inserted as, or moved to, pending.
 --
 -- Create the control schema that holds every object below.
 --
 CREATE SCHEMA control;
-COMMENT ON SCHEMA control IS 'The task queue the workers claim from, and the record of every lease a worker gave up.';
+COMMENT ON SCHEMA control IS 'The task queue the workers claim from, and the record of every lease lost.';
 
 -- Hold one unit of work: one job for one source of one connector and one partition, inside one run.
 --
@@ -27,12 +28,12 @@ COMMENT ON SCHEMA control IS 'The task queue the workers claim from, and the rec
 -- only report_outcome copies the released token to last_lease_token. heartbeat_at is set by heartbeat and cleared by
 -- claim. started_at is set by claim; finished_at is set by report_outcome and expire_leases and cleared by claim. The
 -- report columns (error_class to duration_ms) are written by report_outcome and kept by claim; expire_leases sets
--- error_class to 'LeaseExpired' and clears error_message, the row counts and duration_ms. Constraints: state is one
--- of the eight listed values, not_before and created_at are finite, and state is 'running' exactly when lease_token
--- and lease_expires_at are both set, so every running task has a lease that expire_leases can see. lease_owner is
--- not constrained. max_attempts is 1 to 100 and attempt is 0 to max_attempts; claim takes only a task with attempts
--- left, so no claim or backoff can overflow, and a row with no attempts left waits for a person instead of blocking
--- the queue. priority is unchecked.
+-- error_class to 'LeaseExpired' and clears error_type, error_message, the row counts and duration_ms. Constraints:
+-- state is one of the eight listed values, not_before and created_at are finite, and state is 'running' exactly when
+-- lease_token and lease_expires_at are both set, so every running task has a lease that expire_leases can see.
+-- lease_owner is not constrained. max_attempts is 1 to 100 and attempt is 0 to max_attempts; claim takes only a task
+-- with attempts left, so no claim or backoff can overflow, and a row with no attempts left waits for a person instead
+-- of blocking the queue. priority is unchecked.
 --
 CREATE TABLE control.task (
     id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -57,7 +58,8 @@ CREATE TABLE control.task (
     -- The last report. last_lease_token is the token report_outcome released; expire_leases rewrites error_class to
     -- duration_ms but not last_lease_token.
     last_lease_token uuid,
-    error_class      text,
+    error_class      text,                                    -- the category, e.g. 'Unexpected' or 'TransientError'
+    error_type       text,                                    -- the exception's own type, e.g. 'RecursionError'
     error_message    text,
     rows_fetched     bigint,
     rows_written     bigint,
@@ -85,21 +87,23 @@ CREATE INDEX task_claimable ON control.task (priority, created_at) WHERE state I
 CREATE UNIQUE INDEX task_live ON control.task (connector, job, source_id, partition_key)
     WHERE state IN ('pending', 'running', 'retry_wait', 'blocked');
 
--- Log one row each time a worker gave up a lease it could no longer prove it held; written by record_lease_loss.
+-- Log one row each time a worker gave up a lease it could no longer prove it held, written by record_lease_loss, and
+-- one each time expire_leases released a lease that ran out, kind expired.
 --
--- task_id must name an existing task and kind is heartbeat, silence or commit; worker and unwind_ms may be NULL, and at
--- defaults to the inserting transaction's start. There is no key: the same loss recorded twice is two rows.
+-- task_id must name an existing task and kind is heartbeat, silence, commit or expired; worker and unwind_ms may be
+-- NULL, and at defaults to the inserting transaction's start. There is no key: the same loss recorded twice is two
+-- rows.
 --
 CREATE TABLE control.lease_loss (
     task_id     bigint      NOT NULL REFERENCES control.task (id),
     lease_token uuid        NOT NULL,
-    kind        text        NOT NULL CHECK (kind IN ('heartbeat', 'silence', 'commit')),
-    worker      text,                                         -- the worker that gave up the lease
+    kind        text        NOT NULL CHECK (kind IN ('heartbeat', 'silence', 'commit', 'expired')),
+    worker      text,                                         -- the worker that held the lease
     unwind_ms   bigint,                                       -- how long the task took to unwind; NULL if unknown
     at          timestamptz NOT NULL DEFAULT now()
 );
 COMMENT ON TABLE control.lease_loss IS
-    'Leases workers gave up. Grain: one row per lease given up. Writer: control.record_lease_loss. Layer: control.';
+    'Leases lost. Grain: one row per lease given up or expired. Writer: control.record_lease_loss, control.expire_leases. Layer: control.';
 
 -- Claim the next due pending or retry_wait task for a worker, or return no row.
 --
@@ -269,6 +273,7 @@ $$;
 --     lease_token: Token the caller's lease was issued with.
 --     outcome: 'succeeded', 'retryable', 'blocked', 'failed' or 'unexpected'.
 --     error_class: Error class of an unsuccessful run, or NULL; 'Interrupted' marks a shutdown.
+--     error_type: Type name of the exception that ended the run, or NULL; stored as given.
 --     error_message: Error text, or NULL.
 --     retry_after: Smallest wait the source asked for, or NULL; read only for outcome 'retryable'.
 --     rows_fetched: Rows fetched, stored as given.
@@ -285,8 +290,8 @@ $$;
 --     invalid_parameter_value (22023): outcome is not one of the five values and error_class is not 'Interrupted'.
 --
 CREATE FUNCTION control.report_outcome(
-    task_id bigint, lease_token uuid, outcome text, error_class text, error_message text, retry_after interval,
-    rows_fetched bigint, rows_written bigint, rows_rejected bigint, duration_ms bigint
+    task_id bigint, lease_token uuid, outcome text, error_class text, error_type text, error_message text,
+    retry_after interval, rows_fetched bigint, rows_written bigint, rows_rejected bigint, duration_ms bigint
 )
 RETURNS text
 LANGUAGE plpgsql AS $$
@@ -340,6 +345,7 @@ BEGIN
            lease_owner      = NULL,
            lease_expires_at = NULL,
            error_class      = report_outcome.error_class,
+           error_type       = report_outcome.error_type,
            error_message    = report_outcome.error_message,
            rows_fetched     = report_outcome.rows_fetched,
            rows_written     = report_outcome.rows_written,
@@ -359,7 +365,7 @@ $$;
 -- Args:
 --     task_id: ID of the task whose lease was given up.
 --     lease_token: Token of the lease given up.
---     kind: 'heartbeat', 'silence' or 'commit'.
+--     kind: 'heartbeat', 'silence', 'commit' or 'expired'.
 --     worker: ID of the worker that gave it up, or NULL.
 --     unwind_ms: Time the task took to unwind in milliseconds, or NULL if unknown; stored as given.
 --
@@ -368,7 +374,7 @@ $$;
 --
 -- Raises:
 --     foreign_key_violation (23503): task_id names no task.
---     check_violation (23514): kind is not one of the three values.
+--     check_violation (23514): kind is not one of the four values.
 --     not_null_violation (23502): task_id, lease_token or kind is NULL.
 --
 CREATE FUNCTION control.record_lease_loss(task_id bigint, lease_token uuid, kind text, worker text, unwind_ms bigint)
@@ -378,16 +384,18 @@ LANGUAGE sql AS $$
     VALUES (task_id, lease_token, kind, worker, unwind_ms)
 $$;
 
--- Release every running task whose lease expired and whose row is not locked, and return how many were released.
+-- Release every running task whose lease expired and whose row is not locked, log each one, and return how many.
 --
 -- Matches rows with state 'running' and lease_expires_at < now(). SKIP LOCKED passes over a row another transaction
 -- holds, such as a fenced Load, so a lease cannot be taken over while that transaction is open; under READ COMMITTED a
 -- row renewed and committed meanwhile fails the recheck. Each released row becomes 'dead_lettered' when attempt >=
 -- max_attempts, else 'pending'; either way not_before = now(), lease_token, lease_owner and lease_expires_at are
--- cleared, error_class is 'LeaseExpired', error_message, rows_fetched, rows_written, rows_rejected and duration_ms are
--- NULL, and finished_at is now(), so the report columns describe the attempt whose lease expired, not an earlier one.
--- attempt and last_lease_token keep their earlier values, so the released token is not in last_lease_token and its
--- holder gets CH001 from control.fence and control.report_outcome. A row moved to 'pending' fires task_notify.
+-- cleared, error_class is 'LeaseExpired', error_type, error_message, rows_fetched, rows_written, rows_rejected and
+-- duration_ms are NULL, and finished_at is now(), so the report columns describe the attempt whose lease expired, not
+-- an earlier one. attempt and last_lease_token keep their earlier values, so the released token is not in
+-- last_lease_token and its holder gets CH001 from control.fence and control.report_outcome. Each released lease is
+-- logged in control.lease_loss with kind 'expired', its token, its lease_owner as worker and a NULL unwind_ms, since a
+-- worker that died cannot log its own loss. A row moved to 'pending' fires task_notify.
 --
 -- Preconditions:
 --     None.
@@ -405,6 +413,11 @@ CREATE FUNCTION control.expire_leases()
 RETURNS bigint
 LANGUAGE sql AS $$
     WITH expired AS (
+        SELECT q.id, q.lease_token, q.lease_owner
+          FROM control.task AS q
+         WHERE q.state = 'running' AND q.lease_expires_at < now()
+           FOR UPDATE SKIP LOCKED
+    ), released AS (
         UPDATE control.task AS t
            SET state            = CASE WHEN t.attempt >= t.max_attempts THEN 'dead_lettered' ELSE 'pending' END,
                not_before       = now(),
@@ -412,21 +425,60 @@ LANGUAGE sql AS $$
                lease_owner      = NULL,
                lease_expires_at = NULL,
                error_class      = 'LeaseExpired',
+               error_type       = NULL,
                error_message    = NULL,
                rows_fetched     = NULL,
                rows_written     = NULL,
                rows_rejected    = NULL,
                duration_ms      = NULL,
                finished_at      = now()
-         WHERE t.id IN (
-                   SELECT q.id
-                     FROM control.task AS q
-                    WHERE q.state = 'running' AND q.lease_expires_at < now()
-                      FOR UPDATE SKIP LOCKED
-               )
+          FROM expired AS e
+         WHERE t.id = e.id
+        RETURNING e.id, e.lease_token, e.lease_owner
+    ), logged AS (
+        INSERT INTO control.lease_loss (task_id, lease_token, kind, worker, unwind_ms)
+        SELECT r.id, r.lease_token, 'expired', r.lease_owner, NULL FROM released AS r
         RETURNING 1
     )
-    SELECT count(*) FROM expired
+    SELECT count(*) FROM logged
+$$;
+
+-- Delete the raw pages fetched more than retention ago whose task is not open, then every payload no page references.
+--
+-- A page goes when fetched_at < now() - retention and no control.task row with its task_id is pending, running or
+-- blocked; a page whose task_id names no task goes too. Then every raw.payload row that no raw.page row references
+-- goes, whatever its age. The two deletes are separate statements, so the second sees the first's deletions. now()
+-- is the calling transaction's start. A page saved while the purge runs can find the payload it shares deleted
+-- between raw.save_page's two statements; that save then fails with foreign_key_violation. Called by the
+-- Orchestrator with the PIPELINE_RAW_RETENTION setting.
+--
+-- Preconditions:
+--     raw.page and raw.payload exist, as pipeline_raw_quarantine.sql creates them. retention is not checked: a NULL
+--     retention deletes no page, and a negative one deletes pages fetched up to now().
+--
+-- Args:
+--     retention: How long a page is kept after it was fetched.
+--
+-- Returns:
+--     One row: pages, the raw.page rows deleted, and payloads, the raw.payload rows deleted; 0 when none.
+--
+-- Raises:
+--     Nothing of its own; database errors propagate.
+--
+CREATE FUNCTION control.purge_raw(retention interval)
+RETURNS TABLE (pages bigint, payloads bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM raw.page AS p
+     WHERE p.fetched_at < now() - retention
+       AND NOT EXISTS (SELECT FROM control.task AS t
+                        WHERE t.id = p.task_id AND t.state IN ('pending', 'running', 'blocked'));
+    GET DIAGNOSTICS pages = ROW_COUNT;
+    DELETE FROM raw.payload AS y
+     WHERE NOT EXISTS (SELECT FROM raw.page AS p WHERE p.payload_hash = y.hash);
+    GET DIAGNOSTICS payloads = ROW_COUNT;
+    RETURN NEXT;
+END
 $$;
 
 -- Notify channel 'control_task' (TASK_CHANNEL) with NEW.id as text, delivered when the firing transaction commits.

@@ -6,7 +6,7 @@ Public API:
     To: Field mark that loads a single value into the named column.
     Rows: Field mark that loads a ``list`` of child parts as rows of the child's own table.
     Upsert: Writer that inserts rows or updates them on a conflict over ``key``.
-    ReplaceChildren: Writer for a child table whose rows are replaced under each parent's key.
+    ReplaceChildren: Writer for a child table whose rows are replaced under each parent's key, matched on ``key``.
     ReplacePartition: Writer that replaces the rows whose ``column`` lies in the task's time frame.
     Snapshot: Writer keyed by ``key`` that sets ``removed_at`` itself.
     Update: Writer that updates existing rows matched on ``key``; ``missing`` says what happens to rows not returned.
@@ -15,6 +15,7 @@ Public API:
     Target: A table, its writer, source column, columns and child targets.
     target_of: Return a model's top-level target.
     build_target: Build and check a model's target from its table, writer, source column and field marks.
+    row_key: Return the columns that identify one row of a target's table, or None for a writer without them.
     mismatches: List the ways a table in the catalog does not fit a target.
     alias_value: Return a ``type`` alias's value, with a subscripted generic alias's arguments substituted.
 
@@ -93,7 +94,7 @@ class Rows:
     """Field mark that loads a ``list`` of child parts as rows of the child's own table.
 
     Only a ``list[SomePart]`` field of the class that declares the table may carry it, and ``SomePart`` must declare a
-    table with ``ReplaceChildren()``; ``_columns`` and ``_child`` check this.
+    table with ``ReplaceChildren``; ``_columns`` and ``_child`` check this.
 
     """
 
@@ -118,14 +119,20 @@ class Upsert:
 
 @dataclass(frozen=True, slots=True)
 class ReplaceChildren:
-    """Writer for a child table whose rows are replaced under each parent's key.
+    """Writer for a child table whose rows are replaced under each parent's key, matched on ``key``.
 
-    It has no key of its own: the child target inherits the parent writer's key columns. A target with this writer
-    has no source column (``build_target`` refuses one) and is reached only through its parent's ``children``.
+    The child target inherits the parent writer's key columns; ``key`` names the child's own columns that, after the
+    inherited ones, identify one row (``row_key``). ``__post_init__`` is not defined, so ``key`` is not validated here;
+    ``_check_writer`` checks it when the target is built. ``_key`` gives ``None`` for this writer, so a child cannot
+    have children of its own. A target with this writer has no source column (``build_target`` refuses one) and is
+    reached only through its parent's ``children``.
+
+    Attributes:
+        key: The child's own column names: non-empty, distinct, not nullable, none of them inherited.
 
     """
 
-    ...  # key = the columns inherited from the parent
+    key: tuple[str, ...]  # the child's own columns; the row key is the inherited columns, then these
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,9 +277,9 @@ def build_target(model: type[BaseModel], table: str, writer: Writer, source_colu
     The columns are the source column (``uuid``, not nullable, path ``()``) when given, then the columns ``_columns``
     collects. Each ``Rows`` field gives a child whose target is rebuilt with the writer key's columns (inherited)
     before its own and ``inherited`` set to the key names. A child cannot have children of its own: its writer is
-    ``ReplaceChildren``, which has no key, so its own build refused any ``Rows``. An ``Update`` parent cannot have
-    children: the row it updates may not exist, so its child rows would have no parent. The model's table and its
-    children's tables must all differ.
+    ``ReplaceChildren``, for which ``_key`` gives no key, so its own build refused any ``Rows``. An ``Update`` parent
+    cannot have children: the row it updates may not exist, so its child rows would have no parent. The model's table
+    and its children's tables must all differ.
 
     Preconditions:
         None.
@@ -667,7 +674,8 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
     outside its key, and with ``missing="zero"`` every such column must be ``bigint`` or ``numeric(p,s)``.
     ``ReplaceChildren`` needs at least one column: ``columns`` are the child's own, as ``build_target`` adds the
     inherited key columns only when it rebuilds the child target, and without one every list item would load as the
-    same key-only row. ``Upsert`` has no check beyond the key's.
+    same key-only row; its ``key`` is then checked as a writer key is, against those own columns. ``Upsert`` has no
+    check beyond the key's.
 
     Preconditions:
         Column names in ``columns`` are distinct (``build_target`` calls ``_check_names`` first).
@@ -687,7 +695,9 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
 
     """
     by_name = {column.name: column for column in columns}
-    key = _key(writer)
+    if isinstance(writer, ReplaceChildren) and not columns:
+        raise TypeError(f"{name}: a ReplaceChildren table needs a column of its own besides the parent's key")
+    key = writer.key if isinstance(writer, ReplaceChildren) else _key(writer)  # a child's own key columns
     if key is not None:
         if not key or len(set(key)) != len(key):
             raise ValueError(f"{name}: the writer's key must name distinct columns, got {key!r}")
@@ -699,8 +709,6 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
         if source_column is not None and source_column not in key:
             raise ValueError(f"{name}: the writer's key must include the source column {source_column!r}")
     match writer:
-        case ReplaceChildren() if not columns:
-            raise TypeError(f"{name}: a ReplaceChildren table needs a column of its own besides the parent's key")
         case ReplacePartition(column=column):
             if column not in by_name or by_name[column].postgres not in (_TIMESTAMPTZ, "date"):
                 raise ValueError(f"{name}: ReplacePartition needs a target column of type {_TIMESTAMPTZ} or date")
@@ -741,6 +749,28 @@ def _key(writer: Writer) -> tuple[str, ...] | None:
     return None
 
 
+def row_key(target: Target) -> tuple[str, ...] | None:
+    """Return the columns that identify one row of a target's table, or None for a writer without them.
+
+    Preconditions:
+        None.
+
+    Args:
+        target: The target, as ``build_target`` built it.
+
+    Returns:
+        The writer's ``key`` for ``Upsert``, ``Snapshot`` and ``Update``; for ``ReplaceChildren``, the inherited
+        columns followed by the writer's ``key``; None for ``ReplacePartition``.
+
+    Raises:
+        Nothing.
+
+    """
+    if isinstance(target.writer, ReplaceChildren):
+        return (*target.inherited, *target.writer.key)
+    return _key(target.writer)
+
+
 def mismatches(target: Target, info: TableInfo | None) -> list[str]:
     """List the ways a table in the catalog does not fit a target.
 
@@ -749,9 +779,9 @@ def mismatches(target: Target, info: TableInfo | None) -> list[str]:
     not writable (a generated or ``GENERATED ALWAYS`` identity column), except an ``Update``'s key columns, which
     are only matched, never written. Then, unless the writer is ``Update`` (which never inserts), each table column
     that is ``NOT NULL`` with no default and not a target column gets a message, except ``removed_at`` for a
-    ``Snapshot``. A writer key needs a unique key on exactly its columns, and a ``Snapshot`` needs a nullable
-    ``timestamptz`` ``removed_at`` that is writable, since the writer sets it. Only ``target.table`` is compared;
-    ``target.children`` are not visited, so each child target is checked by its own call.
+    ``Snapshot``. A row key (``row_key``) needs a unique key on exactly its columns, and a ``Snapshot`` needs a
+    nullable ``timestamptz`` ``removed_at`` that is writable, since the writer sets it. Only ``target.table`` is
+    compared; ``target.children`` are not visited, so each child target is checked by its own call.
 
     Preconditions:
         ``info`` is ``table_info``'s result for ``target.table``.
@@ -791,7 +821,7 @@ def mismatches(target: Target, info: TableInfo | None) -> list[str]:
             unfilled = not actual.nullable and not actual.has_default and actual.name not in names
             if unfilled and not (snapshot and actual.name == "removed_at"):
                 found.append(f"{table}.{actual.name} is NOT NULL with no default, but the model does not fill it")
-    key = _key(target.writer)
+    key = row_key(target)
     if key is not None and frozenset(key) not in info.unique_keys:
         found.append(f"{table} has no unique key on ({', '.join(key)})")
     if snapshot:

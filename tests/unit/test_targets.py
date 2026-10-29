@@ -14,11 +14,14 @@ from pipeline.checks.targets import (
     To,
     Upsert,
     Writer,
+    mismatches,
+    row_key,
     target_of,
 )
+from pipeline.db.catalog import TableColumn, TableInfo
 
 
-class Line(Part, table="sales.line", writer=ReplaceChildren()):
+class Line(Part, table="sales.line", writer=ReplaceChildren(key=("sku_id",))):
     """An order line; loads as child rows of ``Order``."""
 
     sku_id: Annotated[str, To("sku_id")]
@@ -184,3 +187,42 @@ def test_record_table_key_refused() -> None:
 
             order_id: Annotated[str, To("order_id")]
             code: Annotated[str, To("code")]
+
+
+def test_child_row_key_is_inherited_then_own() -> None:
+    """Check a child's row key is the parent's writer key followed by its own key, and a root's is its writer key."""
+    root = target_of(Order)
+    assert row_key(root) == ("source_id", "order_id")
+    assert row_key(dict(root.children)["lines"]) == ("source_id", "order_id", "sku_id")
+
+
+@pytest.mark.parametrize(
+    ("key", "field", "message"),
+    [
+        ((), "sku_id: Annotated[str, To('sku_id')]", "the writer's key must name distinct columns"),
+        (("qty",), "sku_id: Annotated[str, To('sku_id')]", "names 'qty', which is not a target column"),
+        (("sku_id",), "sku_id: Annotated[str | None, To('sku_id')] = None", "key column 'sku_id' cannot allow None"),
+    ],
+    ids=["empty key", "unknown column", "nullable column"],
+)
+def test_replace_children_key_refused(key: tuple[str, ...], field: str, message: str) -> None:
+    """Check a ReplaceChildren key must name the child's own non-nullable columns."""
+    code = f"class Child(Part, table='sales.child', writer=ReplaceChildren(key={key!r})):\n    {field}\n"
+    with pytest.raises(ValueError, match=message):
+        exec(code, {"Annotated": Annotated, "Part": Part, "ReplaceChildren": ReplaceChildren, "To": To})  # noqa: S102
+
+
+def test_mismatches_needs_a_unique_key_on_the_child_row_key() -> None:
+    """Check a child table without a unique key on its row key is refused."""
+    line = dict(target_of(Order).children)["lines"]
+    columns = {
+        name: TableColumn(name=name, type="text", nullable=False, has_default=False, writable=True)
+        for name in ("source_id", "order_id", "sku_id")
+    }
+    columns["source_id"] = TableColumn(name="source_id", type="uuid", nullable=False, has_default=False, writable=True)
+    parent_only = TableInfo(table="sales.line", columns=columns, unique_keys=frozenset({frozenset({"order_id"})}))
+    assert mismatches(line, parent_only) == ["sales.line has no unique key on (source_id, order_id, sku_id)"]
+    full = TableInfo(
+        table="sales.line", columns=columns, unique_keys=frozenset({frozenset({"source_id", "order_id", "sku_id"})})
+    )
+    assert mismatches(line, full) == []

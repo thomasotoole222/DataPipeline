@@ -2,12 +2,13 @@
 
 Public API:
     Loaded: Per-table rows sent and changed, and the number of rows held, from one ``load`` call.
-    load: Fence the task, hold its rejected rows, write every target's frame and record row metrics.
+    load: Hold the records that share a key or misfit, then fence the task, hold every rejected row and write the rest.
 
 """
 
 import logging
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Final
@@ -15,6 +16,7 @@ from uuid import UUID
 
 import polars as pl
 
+from pipeline.checks.checks import BatchPolicy
 from pipeline.checks.targets import (
     ReplaceChildren,
     ReplacePartition,
@@ -23,14 +25,16 @@ from pipeline.checks.targets import (
     Update,
     Upsert,
     mismatches,
+    row_key,
 )
 from pipeline.db import quarantine
 from pipeline.db.catalog import table_info
 from pipeline.db.control import ClaimedTask, Fence
 from pipeline.db.pool import Connection, Pool
-from pipeline.errors import NothingLoaded, TableMismatch
+from pipeline.db.quarantine import Failure
+from pipeline.errors import KeyViolation, NothingLoaded, TableMismatch
 from pipeline.stages.transform import Transformed
-from pipeline.stages.validate import Validated
+from pipeline.stages.validate import Validated, held_accepted, judge
 from pipeline.telemetry import Instruments
 from pipeline.timeutil import TimeFrame
 from pipeline.writers import sql
@@ -52,8 +56,10 @@ class Loaded:
 
     Attributes:
         sent: Rows in each written target's frame, keyed by table name (``"schema.table"``).
-        changed: The count each written table's ``sql`` writer returned, keyed by table name.
-        held: Number of rows ``quarantine.hold`` copied into the hold table (``len(validated.held)``).
+        changed: The count each written table's ``sql`` writer returned, keyed by table name: the rows it inserted,
+            updated, deleted or marked, so a table left unchanged counts 0.
+        held: Number of rows ``quarantine.hold`` copied into the hold table: Validate's held rows, then the records
+            held for a key shared in their batch or a value that misfits.
 
     """
 
@@ -70,42 +76,64 @@ async def load(
     transformed: Transformed,
     frame: TimeFrame | None,  # the task's time window; needed by a ReplacePartition target
     instruments: Instruments,
+    *,
+    policy: BatchPolicy,  # the job's batch policy, applied again with the records held here
+    on_loaded: Callable[[Loaded], None] | None = None,  # called inside the transaction once every write is done
 ) -> Loaded:
-    """Fence the task, hold its rejected rows, write every target's frame, then record row metrics.
+    """Hold the records that share a key or misfit, then fence the task, hold every rejected row and write the rest.
+
+    Before anything is written, ``_key_violations`` finds the records whose rows share a row key in a frame, and each
+    becomes a held row whose failure's rule is ``KeyViolation``'s ``error_class`` and whose version is its model's
+    ``record_version``; Transform's misfits become held rows with their ``Overflow`` failures. Both are built with
+    ``held_accepted`` and follow ``validated.held`` in position order, and every row they own is taken out of the
+    frames (``_without``), so the rest of the task loads. When it holds any, ``judge`` applies ``policy`` again, to
+    ``validated.judged`` followed by these held rows, out of ``validated.judged_total``: they count towards the batch
+    policy as Validate's held rows do, and a batch that now breaks it raises ``QualityFailed`` before anything is
+    written.
 
     Everything up to the writes runs on one pooled connection inside one transaction that ``fence.fenced`` opens and
-    fences on the task's lease: ``quarantine.hold`` of ``validated.held``, then ``_columns_checked`` for each target,
-    then a check that no ``Snapshot`` or ``Update(missing="zero")`` frame is empty when pruning, then ``_write`` for
-    each pair in ``transformed.frames`` order. After a written target, its children's ``parents`` entry is the target's
+    fences on the task's lease: ``quarantine.hold`` of the held rows, then ``_columns_checked`` for each target, then
+    a check that no ``Snapshot`` or ``Update(missing="zero")`` frame is empty when pruning, then ``_write`` for each
+    pair in ``transformed.frames`` order. After a written target, its children's ``parents`` entry is the target's
     staged table. ``prune`` is true only when nothing was held; ``_write`` passes it to ``Snapshot`` and ``Update``
     writers. When records were held, a ``ReplacePartition`` target is skipped, not written at all (no ``sent`` or
     ``changed`` entry), since replacing the partition would delete the held records' earlier rows. A held parent's
     children are safe without ``prune``, because ``sql.replace_children`` deletes only under parents in the staged
-    parent table. Any error rolls the whole transaction back. The metrics run only after commit: for each written table,
-    ``sent`` is added to ``instruments.rows`` with ``stage="written"`` and ``changed`` with ``stage="changed"``; for
-    each skipped table, its frame height is added with ``stage="skipped"`` and a warning says it was not written because
-    records are held. When records were held, every ``Snapshot`` and ``Update(missing="zero")`` target is left unpruned:
-    for each, ``held`` is added with ``stage="prune_skipped"`` and a warning is logged.
+    parent table. Once every write is done, the ``Loaded`` result is built and passed to ``on_loaded`` while the
+    transaction is still open, so a success report written in the same transaction can count it. Any error rolls the
+    whole transaction back. The metrics run only after commit: for each written table, ``sent`` is added to
+    ``instruments.rows`` with ``stage="written"`` and ``changed`` with ``stage="changed"``; for each skipped table, its
+    frame height is added with ``stage="skipped"`` and a warning says it was not written because records are held.
+    When records were held, every ``Snapshot`` and ``Update(missing="zero")`` target is left unpruned: for each,
+    ``held`` is added with ``stage="prune_skipped"`` and a warning is logged. The records held here are added with
+    ``stage="quarantined"``, and a warning per rule gives their count, never their keys.
 
     Preconditions:
         ``frame`` is not ``None`` when a target uses ``ReplacePartition``. A ``ReplacePartition`` target has no
         children: it has no key, so ``build_target`` refuses ``Rows`` on it. Every frame came from ``frame_of``, so a
         non-nullable column has no nulls; ``Transformed`` checks each frame's columns and types but not its nulls.
-        ``Transformed`` guarantees every child target's parent is in ``transformed.frames`` before it.
+        ``Transformed`` guarantees every child target's parent is in ``transformed.frames`` before it, and one owner
+        per frame row. ``transformed`` is ``transform``'s result for ``validated.accepted``, so every owner and misfit
+        is a position in it.
 
     Args:
         pool: Pool the connection is taken from.
-        task: The claimed task; its ``source_id``, ``id`` and ``job`` are used.
+        task: The claimed task; its ``source_id``, ``id`` and ``job`` are used, and it is the task of the held rows.
         fence: Fences the load transaction on the task's lease (the worker's ``Lease``).
-        validated: The validate result; only ``held`` is read.
-        transformed: One (target, frame) pair per target, in load order.
+        validated: The validate result; ``held``, ``accepted`` and ``landed`` are read.
+        transformed: One (target, frame) pair per target, in load order, with each row's owner and the misfits.
         frame: The task's time frame, or ``None``; only ``ReplacePartition`` targets read it.
         instruments: Instruments whose ``rows`` counter gets the metrics.
+        policy: Keyword-only. The job's batch policy, which Validate applied first.
+        on_loaded: Keyword-only. Called once with the result inside the transaction, after the writes; ``None``, the
+            default, calls nothing.
 
     Returns:
         ``Loaded`` with each written table's frame height and changed count, and the number of rows held.
 
     Raises:
+        QualityFailed: From ``judge``, when Validate's counted held rows and the records held here break
+            ``policy``; nothing is written.
         LeaseConflict: From ``fence.fenced``, when the task's lease is no longer held; nothing is written.
         TableMismatch: From ``_columns_checked``, when a target not yet in ``_checked`` does not match its table; a
             target cached earlier in this process is not compared again, so a table altered since fails as a
@@ -118,19 +146,30 @@ async def load(
             range in ``frame.zone``.
         DatabaseConflict: From ``db_errors`` in the callees, on a serialization failure or deadlock.
         DatabaseUnavailable: From ``db_errors`` in the callees, on a lost or refused connection.
+        KeyViolation: From ``db_errors`` in the callees, when a written row violates a unique key of its table.
         psycopg.Error: Any other database error from the callees, unchanged.
+        Exception: Whatever ``on_loaded`` raises, after the transaction has rolled back.
 
     """
-    prune = not validated.held  # a held record is missing from the frames, so it must not be pruned
+    rejected = dict(transformed.misfits)
+    for position, table in _key_violations(transformed).items():
+        version = type(validated.accepted[position].record).record_version
+        rejected[position] = Failure(KeyViolation.error_class, version, f"{table}: another row has the same key")
+    later = tuple(held_accepted(task, validated, position, failure) for position, failure in sorted(rejected.items()))
+    if later:  # they count towards the batch policy with Validate's, before anything is written
+        judge(policy, validated.judged_total, (*validated.judged, *later))
+    holding = (*validated.held, *later)
+    frames = _without(transformed, rejected.keys())
+    prune = not holding  # a held record is missing from the frames, so it must not be pruned
     skipped = {  # would delete held records' earlier rows
         target.table: data.height
-        for target, data in transformed.frames
+        for target, data in frames
         if not prune and isinstance(target.writer, ReplacePartition)
     }
-    sent = {target.table: data.height for target, data in transformed.frames if target.table not in skipped}
+    sent = {target.table: data.height for target, data in frames if target.table not in skipped}
     unpruned = [
         target.table
-        for target, _ in transformed.frames
+        for target, _ in frames
         if not prune
         and (
             isinstance(target.writer, Snapshot)
@@ -139,21 +178,24 @@ async def load(
     ]
     changed: dict[str, int] = {}
     async with pool.connection() as conn, fence.fenced(conn):
-        held = await quarantine.hold(conn, validated.held)
-        for target, _ in transformed.frames:
+        held = await quarantine.hold(conn, holding)
+        for target, _ in frames:
             await _columns_checked(conn, target)
-        for target, data in transformed.frames:
+        for target, data in frames:
             if isinstance(target.writer, Snapshot) and data.height == 0 and prune:  # held records skip the prune
                 raise NothingLoaded(f"{target.table}: a snapshot with no rows would remove every row of the source")
             zeroing = isinstance(target.writer, Update) and target.writer.missing == "zero"
             if zeroing and data.height == 0 and prune:
                 raise NothingLoaded(f"{target.table}: an update with no rows would zero every row of the source")
         parents: dict[Target, str] = {}  # a child target's parent's staged table
-        for target, data in transformed.frames:
+        for target, data in frames:
             if target.table in skipped:
                 continue
             staged, changed[target.table] = await _write(conn, task.source_id, target, data, parents, frame, prune)
             parents.update((child, staged) for _, child in target.children)
+        loaded = Loaded(sent=sent, changed=changed, held=held)
+        if on_loaded is not None:
+            on_loaded(loaded)
     for table in sent:
         instruments.rows.add(sent[table], {"job": task.job, "stage": "written", "table": table})
         instruments.rows.add(changed[table], {"job": task.job, "stage": "changed", "table": table})
@@ -163,7 +205,69 @@ async def load(
     for table in unpruned:
         instruments.rows.add(held, {"job": task.job, "stage": "prune_skipped", "table": table})
         _log.warning("task %s %s: %s not pruned, %d records held", task.id, task.job, table, held)
-    return Loaded(sent=sent, changed=changed, held=held)
+    if rejected:
+        instruments.rows.add(len(rejected), {"job": task.job, "stage": "quarantined"})
+    for rule, count in sorted(Counter(failure.rule for failure in rejected.values()).items()):
+        _log.warning("task %s %s: %d quarantined by %s at load", task.id, task.job, count, rule)
+    return loaded
+
+
+def _key_violations(transformed: Transformed) -> dict[int, str]:
+    """Find the records whose rows share a row key with another row of the same frame.
+
+    For each frame whose target has a row key (``row_key``), every row whose key columns equal another row's is
+    found, and the record that owns it is named; a record owning such rows in several frames is named for the first.
+
+    Preconditions:
+        ``transformed`` gives one owner per frame row, as ``Transformed`` checks.
+
+    Args:
+        transformed: The frames to check, with each row's owner.
+
+    Returns:
+        Each such record's position in the accepted records, mapped to the table of the first frame its rows share a
+        key in; empty when no key is shared.
+
+    Raises:
+        Nothing.
+
+    """
+    found: dict[int, str] = {}
+    for (target, data), owners in zip(transformed.frames, transformed.owners, strict=True):
+        key = row_key(target)
+        if key is None or data.height < 2:
+            continue
+        shared = data.select(key).is_duplicated()
+        for owner, duplicate in zip(owners, shared, strict=True):
+            if duplicate:
+                found.setdefault(owner, target.table)
+    return found
+
+
+def _without(transformed: Transformed, positions: Collection[int]) -> list[tuple[Target, pl.DataFrame]]:
+    """Return the frames without the rows the given records own.
+
+    Preconditions:
+        ``transformed`` gives one owner per frame row, as ``Transformed`` checks.
+
+    Args:
+        transformed: The frames and each row's owner.
+        positions: The positions, in the accepted records, of the records whose rows are left out.
+
+    Returns:
+        One ``(target, frame)`` pair per frame of ``transformed``, in order; a frame is returned as it is when none of
+        its rows is left out.
+
+    Raises:
+        Nothing.
+
+    """
+    if not positions:
+        return list(transformed.frames)
+    return [
+        (target, data.filter(pl.Series([owner not in positions for owner in owners], dtype=pl.Boolean)))
+        for (target, data), owners in zip(transformed.frames, transformed.owners, strict=True)
+    ]
 
 
 async def _write(
@@ -237,8 +341,9 @@ async def _write(
     match target.writer:
         case Upsert(key=key):
             changed = await sql.upsert(conn, table, staged, columns, key)
-        case ReplaceChildren():
-            changed = await sql.replace_children(conn, table, staged, columns, target.inherited, parents[target])
+        case ReplaceChildren(key=own):
+            key = (*target.inherited, *own)  # the row key, as row_key gives it
+            changed = await sql.replace_children(conn, table, staged, columns, target.inherited, key, parents[target])
         case ReplacePartition(column=column) if bounds is not None:  # bounds is always set for ReplacePartition
             changed = await sql.replace_partition(
                 conn, table, staged, columns, target.source_column, source, column, *bounds

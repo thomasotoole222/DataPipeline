@@ -20,7 +20,7 @@ from pipeline.db import control, raw
 from pipeline.db.control import ClaimedTask, claim
 from pipeline.db.pool import Connection, Pool
 from pipeline.db.raw import RawPage
-from pipeline.errors import LeaseConflict, TransientError
+from pipeline.errors import LeaseConflict, Outcome, TooDeep, TransientError, classify
 from pipeline.stages.extract import extract
 from pipeline.telemetry import Instruments
 from pipeline.timeutil import TimeFrame
@@ -56,6 +56,7 @@ class FakeClient:
     """A connector client that returns queued bodies and runs a hook before each send."""
 
     connector = "tiktok_shop"
+    hashed_keys = frozenset({"data"})
 
     def __init__(self, bodies: list[dict[str, Any] | Exception], hook: Hook | None = None) -> None:
         """Queue the responses, in order; an exception is raised instead of returned."""
@@ -84,7 +85,7 @@ async def pool() -> AsyncIterator[Pool]:
     await p.open(wait=True)
     async with p.connection() as c:
         await c.execute("TRUNCATE control.lease_loss, control.task RESTART IDENTITY")
-        await c.execute("TRUNCATE raw.page")
+        await c.execute("TRUNCATE raw.page, raw.payload")
     try:
         yield p
     finally:
@@ -236,7 +237,7 @@ async def test_other_tasks_pages_are_kept(pool: Pool, instruments: Instruments) 
         payload={},
     )
     async with pool.connection() as c:
-        await raw.save_page(c, other)
+        await raw.save_page(c, other, frozenset({"data"}))
     task = await claimed(pool)
     await run(pool, task, FakeClient([body(["a"])]), instruments)
     assert len(await pages(pool, 999)) == 1
@@ -300,3 +301,29 @@ async def test_rows_fetched_are_counted_per_page(
     task = await claimed(pool)
     await run(pool, task, FakeClient([body(["a", "b"], "t1"), body(["c"])]), instruments)
     assert fetched_points(reader) == [(3, {"job": "orders", "stage": "fetched"})]
+
+
+async def test_a_body_nested_too_deeply_fails_as_too_deep(pool: Pool, instruments: Instruments) -> None:
+    """Check a RecursionError from the connector becomes TooDeep, unchained, with the attempt's count."""
+    task = await claimed(pool)
+    client = FakeClient([body(["a", "b"], "t1"), RecursionError("maximum recursion depth exceeded")])
+    with pytest.raises(TooDeep) as caught:
+        await run(pool, task, client, instruments)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__
+    assert classify(caught.value) == (Outcome.FAILED, "TooDeep")
+    assert caught.value.rows_fetched == 2  # type: ignore[attr-defined]
+    assert [p.page_no for p in await pages(pool, task.id)] == [0]
+
+
+async def test_each_page_stores_its_hashed_part_once(pool: Pool, instruments: Instruments) -> None:
+    """Check a page's data is stored under the client's hashed keys, apart from its envelope."""
+    task = await claimed(pool)
+    reply = body(["a"]) | {"request_id": "r1"}
+    await run(pool, task, FakeClient([reply]), instruments)
+    async with pool.connection() as c:
+        cursor = await c.execute("SELECT envelope FROM raw.page WHERE task_id = %s", (task.id,))
+        assert await cursor.fetchone() == ({"code": 0, "request_id": "r1"},)
+        cursor = await c.execute("SELECT body FROM raw.payload")
+        assert await cursor.fetchall() == [({"data": reply["data"]},)]
+    assert [p.payload for p in await pages(pool, task.id)] == [reply]
