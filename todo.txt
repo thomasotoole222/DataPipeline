@@ -37,3 +37,50 @@ Open build items
 7. Stage 10: the Orchestrator's lease-expiry function must take the task row lock (as control.claim does with
    FOR UPDATE SKIP LOCKED), so a fenced Load's row lock prevents a takeover. The control-schema DDL enters the build
    spec with stage 10.
+
+Application package
+-------------------
+8. Nothing enforces that a connector client inherits connectors.client.HttpConnectorClient. extract accepts any
+   ConnectorClient (a connector name and a send method), so a client written straight to the protocol would skip
+   the base class's credential handling, retries, error rules and request metrics.
+   Fix: refuse, at start-up, any client handed over by the application package that is not an HttpConnectorClient.
+
+9. Credentials are not optional: HttpConnectorClient always takes a CredentialProvider and calls get on every
+   attempt, so a connector to an API that needs no auth still needs a provider. Every connector today needs a key
+   or token, so nothing needs this yet.
+   Fix: tokens: CredentialProvider[C] | None; with None, _attempt skips get and reject and passes None to build,
+   and the connector is an HttpConnectorClient[None].
+
+Walking skeleton
+----------------
+Found by the walking-skeleton review round and left open on purpose; they are in stage 4 code the skeleton did not
+change. Fix one if integration testing or production shows it matters.
+
+10. __main__.run: once SHUTDOWN_TIMEOUT has passed, run_worker returns but asyncio.run's teardown still awaits every
+    cancelled task with no time limit, then waits up to 300 s for its default executor. telemetry.shutdown runs only
+    after that, so SIGKILL can arrive first and the last spans, metrics and logs of a bad shutdown are lost. A runner
+    is only required to end once cancelled (worker.loop.TaskRunner), with no time limit.
+    Fix: shut telemetry down before asyncio.run's teardown, or bound the teardown.
+
+11. __main__._Deadline.run: when the caller of run_worker is cancelled during the drain (for example by wrapping it in
+    asyncio.timeout), Worker.run is cancelled but not awaited, and the exit stack closes /health, the listener and
+    the pool while the drain's cut-off tasks may still be writing failure reports. run cannot reach this: after the
+    signal handlers are added, SIGINT goes to _stop.
+    Fix: await the cancelled step, bounded by the deadline, before the closes run.
+
+12. worker.lease.Lease.complete: called on a second autocommit connection while a fenced block is open on another,
+    control.report_outcome waits for the task row lock that the fenced transaction holds, and the block waits for
+    complete, so the task hangs; the paused heartbeats never check the silence limit. complete's precondition allows
+    the call. BatchJob reports on the fenced connection, so it does not hit this.
+    Fix: refuse (RuntimeError) a complete on any connection but the fenced one while a fenced block is open.
+
+13. jobs.base.BatchJob.frame: a "day" key for a date the source's home zone skips entirely ("2011-12-30" in
+    Pacific/Apia) holds no instants, so there is nothing to fetch, yet TimeFrame.days raises ValueError ("empty time
+    frame") and the task fails on every attempt.
+    Fix: report such a day as succeeded with nothing fetched.
+
+14. Stage 11 (Cipher application package), cipher.connectors.cruva.client.CruvaCredential.__post_init__: the
+    ValueError message ends with the rejected shop id ({self.shop_id!r}), so a bad value lands in logs and task
+    reports, against the rule that error messages name keys or fields and never show values.
+    Fix: drop the value from the message ("Cruva shop id must be non-empty printable ASCII with no whitespace"), in
+    the build spec's stage 11 tab and in the code.

@@ -179,6 +179,25 @@ class Lease:
         """
         return self._lost_at
 
+    @property
+    def pool(self) -> Pool:
+        """Return the pool the lease was created with, which its heartbeats and the task's stages use.
+
+        Preconditions:
+            None.
+
+        Args:
+            None.
+
+        Returns:
+            The ``pool`` given to ``__init__``.
+
+        Raises:
+            None.
+
+        """
+        return self._pool
+
     @asynccontextmanager
     async def hold(self) -> AsyncIterator[Self]:
         """Run a background heartbeat task for the duration of the ``async with`` block.
@@ -231,7 +250,7 @@ class Lease:
         in a failed state (it caught a database error) is not committed: ``RuntimeError`` is raised and the
         transaction rolls back, so ``completed`` stays ``False`` and the silence clock does not move. Whether it
         commits or rolls back, the fenced connection is then cleared, so a connection back in the pool is never taken
-        for this lease's, and the paused heartbeats are woken so they check the silence limit at once.
+        for this lease's fenced connection, and the paused heartbeats are woken so they check the silence limit at once.
 
         Preconditions:
             ``conn`` is open, in autocommit mode with no transaction open (a pool connection), and not used by another
@@ -312,6 +331,14 @@ class Lease:
         uncommitted transaction's, which a rollback undoes. While a report on any connection but the fenced one is in
         progress, a heartbeat that returns ``False`` waits for it to end before it judges the lease (see
         ``_heartbeats``).
+
+        Nothing checks that a ``fenced`` block is open on another connection. If one is, ``control.report_outcome``
+        waits on the task's row lock that block's transaction holds, with no timeout; called from inside that block,
+        the call never returns, and the paused heartbeats never check the silence limit.
+
+        TODO(review) 1: reject a call on any connection but the fenced one while a ``fenced`` block is open (raise
+        ``RuntimeError`` when ``self._fenced is not None and conn is not self._fenced``); the precondition below admits
+        ``async with lease.fenced(a): await lease.complete(b, report)``, which deadlocks on the row lock ``a`` holds.
 
         Preconditions:
             ``conn`` is open and not used by another coroutine. It is either the connection of the open ``fenced``

@@ -5,12 +5,16 @@ deploy fails the host's health check and the previous deployment keeps running. 
 30 seconds between SIGTERM and SIGKILL: 15 (``SHUTDOWN_TIMEOUT``) from the stop signal for everything before telemetry
 (the drain, whose grace period is ``DRAIN_TIMEOUT``'s 10, then its cut-off and the failure reports it writes, then
 closing ``/health``, the listener and the pool), 10 for telemetry (``Telemetry.shutdown``) and 5 spare. Whatever is
-still running when ``SHUTDOWN_TIMEOUT`` runs out is cancelled and logged (see ``run_worker``). The host's stop grace
+still running when ``SHUTDOWN_TIMEOUT`` runs out is cancelled and logged (see ``run_worker``); ``asyncio.run`` then
+awaits every cancelled task without a time limit before telemetry is shut down (see ``run``). The host's stop grace
 period must be at least the budget; the deployment config, which is not in this repository, sets it.
 
 Public API:
     SHUTDOWN_TIMEOUT: Longest time from the stop signal, or the start of shutdown, to the end of ``run_worker``.
-    main: Read the settings, pin Polars, set up telemetry and run the worker until it is stopped.
+    HTTP_TIMEOUT: Timeout of the shared HTTP client the connector clients send through.
+    BuildRegistry: The application package's function that builds its registry.
+    run: Read the settings, pin Polars, set up telemetry, build the registry and run the worker until it is stopped.
+    main: ``run`` with the framework's settings and no jobs: the smoke run of ``python -m pipeline``.
     run_worker: Open the pool, check the schema, run the worker and ``/health``, then shut down in order.
 """
 
@@ -22,9 +26,12 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import timedelta
 from typing import Final
 
+import httpx
+
 from pipeline.config import Settings
 from pipeline.db.control import open_listener
 from pipeline.db.pool import check_schema, open_pool
+from pipeline.registry import Registry
 from pipeline.telemetry import Instruments, configure
 from pipeline.worker.health import HEALTH_PORT, serve_health
 from pipeline.worker.loop import TaskRunner, Worker
@@ -38,6 +45,13 @@ _log: Final = logging.getLogger(__name__)
 #: drain and its cut-off after ``DRAIN_TIMEOUT``'s 10 s, the cut-off tasks' reports and the closes of ``/health``, the
 #: listener and the pool. ``Telemetry.shutdown``'s 10 s follow it, leaving 5 s of the 30 s budget spare.
 SHUTDOWN_TIMEOUT: Final = timedelta(seconds=15)
+
+#: Timeout of the shared HTTP client: connect, read, write and pool checkout, each.
+HTTP_TIMEOUT: Final = httpx.Timeout(60.0)
+
+#: Builds the application package's registry from its settings, the shared HTTP client and the instruments. It
+#: imports the package's job code, so that code, and Polars with it, loads only after ``run`` has pinned Polars.
+type BuildRegistry[S: Settings] = Callable[[S, httpx.AsyncClient, Instruments], Registry]
 
 
 class _Deadline:
@@ -120,7 +134,7 @@ class _Deadline:
             What ``run`` returns.
 
         Raises:
-            Exception: Whatever ``run`` raises.
+            BaseException: Whatever ``run`` raises.
             asyncio.CancelledError: If the call is cancelled.
 
         """
@@ -131,7 +145,12 @@ class _Deadline:
         """Run ``step`` until it ends or the deadline passes, whichever comes first.
 
         At the deadline, ``step`` is cancelled and not awaited, which is logged at ``ERROR``. A step called after the
-        deadline has passed is not started, and that is logged at ``ERROR`` too.
+        deadline has passed is not started, and that is logged at ``ERROR`` too. If this call is cancelled, ``step``
+        is cancelled and not awaited either, so it may still be unwinding when the cancellation propagates.
+
+        TODO(review) 2: when ``run_worker`` is cancelled during ``"draining the worker"``, ``Worker.run`` is cancelled
+        here and not awaited, so ``run_worker``'s closes of ``/health``, the listener and the pool run while the
+        cancelled drain is still unwinding and its cut-off tasks may still be writing failure reports through the pool.
 
         Preconditions:
             Awaited on the deadline's loop.
@@ -144,8 +163,10 @@ class _Deadline:
             ``True`` once ``step`` has ended before the deadline; ``False`` if it was abandoned or skipped.
 
         Raises:
-            Exception: Whatever ``step`` raises, unchanged, when it ends before the deadline.
-            asyncio.CancelledError: If the call is cancelled; ``step`` is cancelled too.
+            BaseException: Whatever ``step`` raises, unchanged, when it ends before the deadline, including a
+                ``_FATAL`` exception re-raised by ``Worker.run`` or ``asyncio.CancelledError`` if ``step`` was
+                cancelled by something else.
+            asyncio.CancelledError: If the call is cancelled; ``step`` is cancelled too, and not awaited.
 
         """
         if self._passed.is_set():
@@ -294,6 +315,9 @@ async def run_worker(
             mapping of a missing ``alembic_version`` table or ``DatabaseConflict`` from the listener's ``LISTEN``. If
             a shutdown step raises after an earlier error, its exception propagates in place of the earlier one, which
             becomes its ``__context__``. A step abandoned at the deadline raises nothing.
+        BaseException: A ``_FATAL`` exception (``KeyboardInterrupt``, ``SystemExit`` or ``GeneratorExit``) a runner
+            raised, re-raised by ``Worker.run`` after its drain, after the closes; not raised if the deadline passed
+            first.
 
     """
     loop = asyncio.get_running_loop()
@@ -323,46 +347,121 @@ async def run_worker(
             _log.info("worker %s drained; shutting down", settings.worker_id)
 
 
-def main() -> None:
-    """Read the settings, pin Polars, set up telemetry and run the worker until it is stopped.
+async def _serve[S: Settings](settings: S, instruments: Instruments, build_registry: BuildRegistry[S]) -> None:
+    """Open the shared HTTP client, build the registry with it and run the worker on its jobs, then close the client.
 
-    Until the job registry loader exists the worker knows no jobs: any claimed task fails as ``UnknownJob``. Settings
-    and Polars failures raise before logging is configured, so they reach stderr only as the uncaught traceback. None
-    of this module's imports loads Polars, so ``pin_polars_threads`` runs before the first import of it.
+    Preconditions:
+        As ``run_worker``.
+
+    Args:
+        settings: The worker's settings.
+        instruments: Where the worker and the connector clients record their metrics.
+        build_registry: Builds the registry.
+
+    Returns:
+        None, once ``run_worker`` has returned and the client is closed.
+
+    Raises:
+        BaseException: Whatever ``build_registry``, ``run_worker`` or closing the client raises, unchanged; the client
+            is closed first.
+
+    """
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as http:
+        registry = build_registry(settings, http, instruments)
+        runners = registry.runners
+        await run_worker(settings, instruments, runners=runners, known_jobs=frozenset(runners))
+
+
+def run[S: Settings](settings_type: type[S], build_registry: BuildRegistry[S]) -> None:
+    """Read the settings, pin Polars, set up telemetry, build the registry and run the worker until it is stopped.
+
+    The application package's entry point calls it. The module that calls it imports no job code at module level:
+    ``build_registry`` does, after Polars is pinned, or ``pin_polars_threads`` refuses to start. Settings and Polars
+    failures raise before logging is configured, so they reach stderr only as the uncaught traceback.
+
+    Once ``run_worker`` returns, ``asyncio.run`` cancels every task still pending, including any step ``run_worker``
+    abandoned at the shutdown deadline (a cancelled ``Worker.run`` and its cancelled runners), and awaits them all
+    without a time limit, then waits up to 300 s for its default executor; only then is ``telemetry.shutdown`` called.
+
+    TODO(review) 1: the 30 s shutdown budget is not bounded after ``SHUTDOWN_TIMEOUT``: a runner that takes longer than
+    the remaining budget to unwind once cancelled (``TaskRunner`` sets no time limit) holds ``asyncio.run``'s teardown,
+    so ``telemetry.shutdown`` runs late or SIGKILL arrives first and spans, metrics and logs are not flushed.
 
     Preconditions:
         Called once per process, on the main thread, before anything imports Polars or job code.
+
+    Args:
+        settings_type: The application package's ``Settings`` subclass, or ``Settings``.
+        build_registry: Builds the registry; called once, inside the running loop, before the pool opens.
 
     Returns:
         None, once the worker has stopped and telemetry has been flushed.
 
     Raises:
         pydantic.ValidationError: The settings are missing or invalid.
-        StartupRefused: A compute resource check failed.
+        StartupRefused: A compute resource check failed, including Polars imported before it was pinned.
         ImportError: Polars could not be imported.
         UnicodeDecodeError: A cgroup file read by ``pin_polars_threads`` is not valid text.
         RuntimeError: Telemetry could not be configured, for example no OTLP endpoint outside ``local``.
         BaseException: Anything ``configure`` raises while registering providers, instrumenting or attaching
-            handlers, after it has shut its own telemetry down. ``log_level`` is a ``Literal`` on ``Settings``, so
-            ``configure``'s ``ValueError`` for an unknown level cannot arise here.
-        Exception: Whatever ``run_worker`` raises, after it is logged at ``CRITICAL`` and telemetry has been shut
-            down. ``Telemetry.shutdown`` logs each failed step itself and raises no ``Exception``, so it never
-            replaces this one.
-        KeyboardInterrupt: A SIGINT while ``asyncio.run`` runs, before the handlers were added or after they were
-            removed; it is not logged, and telemetry is still shut down. A SIGINT before ``asyncio.run`` starts
-            raises it from settings, Polars or telemetry set-up, before the ``try``, so telemetry is not shut down.
+            handlers, after it has shut its own telemetry down.
+        Exception: Whatever ``build_registry`` or ``run_worker`` raises, after it is logged at ``CRITICAL`` and
+            telemetry has been shut down.
+        KeyboardInterrupt: A SIGINT while ``asyncio.run`` runs, before the signal handlers are added or after they
+            are removed; it is not logged, and telemetry is still shut down.
+        BaseException: A ``_FATAL`` exception a runner raised, re-raised through ``run_worker``; it is not logged,
+            and telemetry is still shut down.
 
     """
-    settings = Settings()
+    settings = settings_type()
     pin_polars_threads(settings.polars_threads)
     telemetry = configure(env=settings.env, worker_id=settings.worker_id, log_level=settings.log_level)
     try:
-        asyncio.run(run_worker(settings, telemetry.instruments, runners={}, known_jobs=frozenset()))
+        asyncio.run(_serve(settings, telemetry.instruments, build_registry))
     except Exception:
         _log.critical("worker %s stopped on an error", settings.worker_id, exc_info=True)
         raise
     finally:
         telemetry.shutdown()
+
+
+def _no_jobs(settings: Settings, http: httpx.AsyncClient, instruments: Instruments) -> Registry:
+    """Return an empty registry, for the smoke run.
+
+    Preconditions:
+        None.
+
+    Args:
+        settings: Unused.
+        http: Unused.
+        instruments: Unused.
+
+    Returns:
+        ``Registry()``.
+
+    Raises:
+        Nothing.
+
+    """
+    return Registry()
+
+
+def main() -> None:
+    """Run the worker with the framework's settings and no jobs: any claimed task fails as ``UnknownJob``.
+
+    Preconditions:
+        As ``run``.
+
+    Returns:
+        None, once the worker has stopped and telemetry has been flushed.
+
+    Raises:
+        Exception: Whatever ``run`` raises.
+        KeyboardInterrupt: As ``run``.
+        BaseException: Any other ``BaseException`` ``run`` raises.
+
+    """
+    run(Settings, _no_jobs)
 
 
 if __name__ == "__main__":
