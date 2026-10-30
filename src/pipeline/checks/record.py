@@ -1,6 +1,8 @@
 """Base models for parsed connector records, the check that each record type declares a usable key, and key lookup.
 
 Public API:
+    BOOL_VALUES: The only values a boolean field accepts, each mapped to its ``bool``.
+    Bool: A boolean field's type: its input mapped through ``BOOL_VALUES``, then checked as a strict ``bool``.
     Part: Frozen pydantic model that keeps unknown fields; the base for nested parts of a record.
     Record: A ``Part`` whose subclasses must declare ``record_key`` and ``record_version``, checked at class creation;
         each key field must be required, have a type defined when the model is declared, not accept ``None`` and have
@@ -14,6 +16,7 @@ A model may declare its target table, writer and source column as class keywords
 (checks.targets) when the class is defined.
 
 Private units:
+    _to_bool: Return the ``bool`` that ``BOOL_VALUES`` maps a boolean field's input to, or the input unchanged.
     _annotated: Return the field's type annotated with its own metadata, as a key field's form is checked.
     _allows_none: Return whether a field accepts ``None``.
     _key_refusal: Return why a type form is refused for a key field, or ``None`` when it is allowed.
@@ -22,11 +25,13 @@ Private units:
     _check_table_key: Check that a Record's writer key is its source column plus its ``record_key`` columns.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import IntEnum, StrEnum
 from functools import cache
+from types import MappingProxyType
 from typing import Annotated, Any, ClassVar, Final, Literal, NewType, TypeAliasType, get_args, get_origin
 from uuid import UUID
 
@@ -35,6 +40,7 @@ from pydantic import (
     AllowInfNan,
     AwareDatetime,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     PydanticSchemaGenerationError,
     PydanticUserError,
@@ -50,6 +56,66 @@ from pipeline.checks.targets import Snapshot, Target, To, Update, Upsert, Writer
 #: The classes a key field's type may be, besides a ``StrEnum`` or ``IntEnum`` subclass; ``float`` is not one, nor a
 #: plain ``datetime``, which accepts naive values: only Pydantic's ``AwareDatetime``, which refuses them.
 _KEY_CLASSES: Final = (str, int, bool, date, AwareDatetime, Decimal, UUID)
+
+#: The only values a boolean field accepts. Booleans are mapped here, in Validate, before the model's strict bool
+#: check, and not cast in Transform, because Polars cannot cast text to Boolean: Series.cast(pl.Boolean) on text
+#: raises InvalidOperationError ("casting from Utf8View to Boolean not supported", strict or not), building a strict
+#: frame fails the whole batch on one text value, building a non-strict frame silently turns it into null, and an
+#: integer cast turns any non-zero value (2) into True. Mapping in Validate is allowed only because it is a constant
+#: O(1) hash-map lookup over primitive keys (bool and str) that needs no conversion logic beyond trimming and
+#: lower-casing text. 1 and 0 hash and compare equal to True and False, so they are the same dict keys and match
+#: those entries; floats and Decimals are never looked up. Any other value fails the strict bool check, so the
+#: record is quarantined by the schema rule.
+BOOL_VALUES: Final[Mapping[object, bool]] = MappingProxyType(
+    {
+        True: True,
+        False: False,
+        "true": True,
+        "false": False,
+        "1": True,
+        "0": False,
+        "yes": True,
+        "no": False,
+        "y": True,
+        "n": False,
+        "t": True,
+        "f": False,
+        "on": True,
+        "off": False,
+    }
+)
+
+
+def _to_bool(value: object) -> object:
+    """Return the ``bool`` that ``BOOL_VALUES`` maps a boolean field's input to, or the input unchanged.
+
+    Runs before the field's strict ``bool`` check. Text is trimmed and lower-cased before the lookup; a ``bool`` or
+    ``int`` is looked up as it is, so ``1`` and ``0`` find ``True`` and ``False``. Any other value, a ``float`` or
+    ``Decimal`` included, is never looked up.
+
+    Preconditions:
+        None.
+
+    Args:
+        value: The field's input, as JSON decoded it.
+
+    Returns:
+        ``BOOL_VALUES``' ``bool`` for ``value``, or ``value`` unchanged when it is not a key, so the strict ``bool``
+        check after it fails the record.
+
+    Raises:
+        None.
+
+    """
+    if isinstance(value, str):
+        return BOOL_VALUES.get(value.strip().lower(), value)
+    if isinstance(value, int):  # a bool is an int too; 1 and 0 find the keys True and False
+        return BOOL_VALUES.get(value, value)
+    return value  # a float, Decimal or anything else is never looked up, so the strict bool check refuses it
+
+
+#: A boolean field: mapped through BOOL_VALUES, then checked strictly.
+Bool = Annotated[bool, BeforeValidator(_to_bool), Strict()]
 
 
 class Part(BaseModel):

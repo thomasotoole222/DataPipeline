@@ -26,6 +26,8 @@ matters.
    every pass of the "for name in key" loop although it does not depend on the name. Readability only.
    Fix: build it once before the loop.
 
+5. There needs to be a no future dates condition for the orders job
+
 Open build items
 ----------------
 5. Dockerfile and README.md are empty. The Dockerfile is specified on build-spec tab 1; stage 1 stays Modified until
