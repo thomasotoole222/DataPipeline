@@ -10,9 +10,10 @@ import logging
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Final
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -24,6 +25,7 @@ from pipeline.checks.targets import (
     Target,
     Update,
     Upsert,
+    Versioned,
     mismatches,
     row_key,
 )
@@ -78,6 +80,7 @@ async def load(
     instruments: Instruments,
     *,
     policy: BatchPolicy,  # the job's batch policy, applied again with the records held here
+    zone: ZoneInfo | None = None,  # the job's home zone; dates a Versioned target's observation day
     on_loaded: Callable[[Loaded], None] | None = None,  # called inside the transaction once every write is done
 ) -> Loaded:
     """Hold the records that share a key or misfit, then fence the task, hold every rejected row and write the rest.
@@ -125,6 +128,8 @@ async def load(
         frame: The task's time frame, or ``None``; only ``ReplacePartition`` targets read it.
         instruments: Instruments whose ``rows`` counter gets the metrics.
         policy: Keyword-only. The job's batch policy, which Validate applied first.
+        zone: Keyword-only. The job's home zone; a ``Versioned`` target's observation day is the task's ``claimed_at``
+            date in it. ``None``, the default, for a job with no ``Versioned`` target.
         on_loaded: Keyword-only. Called once with the result inside the transaction, after the writes; ``None``, the
             default, calls nothing.
 
@@ -177,6 +182,8 @@ async def load(
         )
     ]
     changed: dict[str, int] = {}
+    stale: dict[str, int] = {}
+    observed = task.claimed_at.astimezone(zone).date() if zone is not None else None  # a Versioned target's day
     async with pool.connection() as conn, fence.fenced(conn):
         held = await quarantine.hold(conn, holding)
         for target, _ in frames:
@@ -191,7 +198,9 @@ async def load(
         for target, data in frames:
             if target.table in skipped:
                 continue
-            staged, changed[target.table] = await _write(conn, task.source_id, target, data, parents, frame, prune)
+            staged, changed[target.table], stale[target.table] = await _write(
+                conn, task.source_id, target, data, parents, frame, prune, observed
+            )
             parents.update((child, staged) for _, child in target.children)
         loaded = Loaded(sent=sent, changed=changed, held=held)
         if on_loaded is not None:
@@ -199,6 +208,12 @@ async def load(
     for table in sent:
         instruments.rows.add(sent[table], {"job": task.job, "stage": "written", "table": table})
         instruments.rows.add(changed[table], {"job": task.job, "stage": "changed", "table": table})
+    for table, count in stale.items():
+        if count:
+            instruments.rows.add(count, {"job": task.job, "stage": "stale", "table": table})
+            _log.warning(
+                "task %s %s: %s left %d versions alone, observed before they started", task.id, task.job, table, count
+            )
     for table in skipped:
         instruments.rows.add(skipped[table], {"job": task.job, "stage": "skipped", "table": table})
         _log.warning("task %s %s: %s not written because %d records are held", task.id, task.job, table, held)
@@ -278,12 +293,15 @@ async def _write(
     parents: Mapping[Target, str],
     frame: TimeFrame | None,
     prune: bool,
-) -> tuple[str, int]:
+    observed: date | None = None,
+) -> tuple[str, int, int]:
     """Stage one frame in a temporary table and write it to the target's table with the target's writer.
 
     The frame is copied in with each target column's Postgres type. The task's source is passed only when the target
-    has a source column. Each of the five writers calls its ``sql`` function: ``Upsert``, ``ReplaceChildren``,
-    ``ReplacePartition``, ``Snapshot`` (with ``prune``) and ``Update`` (with its ``missing`` and ``prune``). For
+    has a source column. Each writer calls its ``sql`` function: ``Upsert``, ``ReplaceChildren``,
+    ``ReplacePartition``, ``Versioned`` (matched before ``Snapshot``, its base, with ``prune`` and the observation day
+    in the type of its ``valid_from`` column, read from the catalog), ``Snapshot`` (with ``prune``) and ``Update``
+    (with its ``missing`` and ``prune``). For
     ``ReplacePartition``, a ``date`` column is bounded by ``frame.dates`` and a timestamptz column by ``frame.start``
     and ``frame.end``, and no row's partition value may lie outside ``[start, end)``; both are checked before the
     frame is staged. A null partition value is not counted as outside. The column lookup always finds the column,
@@ -303,9 +321,11 @@ async def _write(
         parents: Staged table of each child target's parent, keyed by the child target.
         frame: The task's time frame, or ``None``; read only for ``ReplacePartition``.
         prune: Passed to ``sql.snapshot`` and ``sql.update``.
+        observed: The task's observation day in the job's zone, for a ``Versioned`` target; None otherwise.
 
     Returns:
-        The staged table's name and the count the ``sql`` writer returned.
+        The staged table's name, the count the ``sql`` writer returned, and the stale versions a ``Versioned``
+        writer left alone (0 for every other writer).
 
     Raises:
         ValueError: For ``ReplacePartition`` when ``frame`` is ``None``, when the column is a ``date`` and ``frame`` is
@@ -348,11 +368,53 @@ async def _write(
             changed = await sql.replace_partition(
                 conn, table, staged, columns, target.source_column, source, column, *bounds
             )
+        case Versioned(key=key, valid_from=first, valid_to=last, opens_from=opens):
+            if observed is None:
+                raise ValueError(f"{table}: a Versioned target needs the job's zone to date its observation day")
+            info = await table_info(conn, table)
+            day_type = info.columns[first].type if info is not None and first in info.columns else "date"
+            day, previous = _day_value(observed, day_type), _day_value(observed - timedelta(days=1), day_type)
+            changed, stale = await sql.versioned(
+                conn,
+                table,
+                staged,
+                columns,
+                key,
+                target.source_column,
+                source,
+                first,
+                last,
+                opens,
+                day,
+                previous,
+                prune,
+            )
+            return staged, changed, stale
         case Snapshot(key=key):
             changed = await sql.snapshot(conn, table, staged, columns, key, target.source_column, source, prune)
         case Update(key=key, missing=missing):
             changed = await sql.update(conn, table, staged, columns, key, target.source_column, source, missing, prune)
-    return staged, changed
+    return staged, changed, 0
+
+
+def _day_value(day: date, column_type: str) -> date | int:
+    """Return a day in a ``Versioned`` writer's column type: a ``YYYYMMDD`` integer, or the date itself.
+
+    Preconditions:
+        None.
+
+    Args:
+        day: The day.
+        column_type: The column's type as the catalog gives it; ``"integer"`` or ``"bigint"`` for date keys.
+
+    Returns:
+        ``year * 10000 + month * 100 + day`` for ``"integer"`` or ``"bigint"``, else ``day``.
+
+    Raises:
+        Nothing.
+
+    """
+    return day.year * 10000 + day.month * 100 + day.day if column_type in ("integer", "bigint") else day
 
 
 async def _columns_checked(conn: Connection, target: Target) -> None:

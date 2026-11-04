@@ -5,6 +5,7 @@ Public API:
     replace_children: Delete the rows of listed parents missing from the stage, then upsert the staged rows by key.
     replace_partition: Delete the rows in one source's half-open range of a column, then insert the staged rows.
     snapshot: Upsert staged rows, clear their ``removed_at``, and optionally mark rows missing from the stage removed.
+    versioned: Keep one open version per key: close changed and missing ones, overwrite today's, open new ones.
     update: Update existing rows by key from the stage, and optionally zero rows missing from the stage.
 
 """
@@ -216,6 +217,135 @@ async def snapshot(
         "UPDATE {table} AS t SET removed_at = now() WHERE {source} AND {missing} AND t.removed_at IS NULL"
     ).format(table=_table(table), source=source, missing=_missing(staged, key))
     return changed + await _changed(conn, mark, params)
+
+
+async def versioned(
+    conn: Connection,
+    table: str,
+    staged: str,
+    columns: Sequence[str],
+    key: Sequence[str],
+    source_column: str | None,
+    source_id: UUID | None,
+    valid_from: str,
+    valid_to: str,
+    opens_from: str | None,
+    day: date | int,
+    previous: date | int,
+    prune: bool,
+) -> tuple[int, int]:
+    """Make each staged key's open version equal its staged row, closing versions rather than changing or deleting them.
+
+    ``day`` is the observation day D and ``previous`` the day before it, both in the type of ``valid_from`` (a
+    ``YYYYMMDD`` integer or a ``date``). An open version is a row whose ``valid_to`` is null. In order:
+
+    1. Count the staged keys whose open version starts after D: stale observations, left alone by every step.
+    2. Overwrite, in place, the open versions that started on D and differ from their staged row.
+    3. Close on ``previous`` the open versions that started before D and differ from their staged row.
+    4. With ``prune``, close the source's open versions whose key is not staged and that started on or before D:
+       on ``previous``, or on D for one that started on D (``valid_to`` never precedes ``valid_from``).
+    5. Insert a version for every staged key with no open version left: from D when the key has an earlier version
+       (it changed, or was closed and is back), else from its ``opens_from`` value (D when ``opens_from`` is None or
+       the value is null), but never after D.
+
+    Rows differ when any column of ``columns`` outside ``key`` is distinct (``IS DISTINCT FROM``). Closing runs before
+    inserting, so a non-deferrable exclusion constraint on a key's version ranges never sees two open versions.
+
+    Preconditions:
+        As for ``snapshot``, except that the table has no ``removed_at`` and several rows per key: ``valid_from`` and
+        ``valid_to`` are its day columns and ``columns`` includes neither. ``staged`` has no two rows with one key.
+        ``day`` and ``previous`` match ``valid_from``'s type, and ``opens_from``, when set, is in ``columns`` and of
+        that type (``checks.targets`` checks the table with ``mismatches``).
+
+    Args:
+        conn: Connection the statements run on; the caller owns the transaction.
+        table: Target table as ``"schema.name"``.
+        staged: Unqualified name of the staged table.
+        columns: Columns copied from the stage to the table.
+        key: Columns that identify a key's versions, the source column included when the table has one.
+        source_column: Column holding the source, or ``None`` to prune across the whole table.
+        source_id: Source to prune; ignored when ``source_column`` is ``None``.
+        valid_from: Column holding a version's first day.
+        valid_to: Column holding a version's last day, null while it is open.
+        opens_from: Column dating a new key's first version, or ``None``.
+        day: The observation day.
+        previous: The day before ``day``.
+        prune: Whether to close the open versions of keys missing from the stage.
+
+    Returns:
+        The rows changed (overwritten, closed and inserted) and the number of stale staged keys.
+
+    Raises:
+        ValueError: When ``table`` does not contain exactly one ``.``.
+        DatabaseConflict: From ``db_errors``, on a serialization failure or deadlock.
+        DatabaseUnavailable: From ``db_errors``, on a lost or refused connection.
+        KeyViolation: From ``db_errors``, when a written row violates a unique key of the table.
+        psycopg.Error: Any other database error, unchanged, among them an exclusion violation when the table's
+            versions would overlap.
+
+    """
+    t_table, first, last = _table(table), sql.Identifier(valid_from), sql.Identifier(valid_to)
+    same = sql.SQL("ROW({s}) = ROW({t})").format(s=_names(key, "s"), t=_names(key, "t"))
+    details = [column for column in columns if column not in key]
+    differs = (
+        sql.SQL("ROW({t}) IS DISTINCT FROM ROW({s})").format(t=_names(details, "t"), s=_names(details, "s"))
+        if details
+        else sql.SQL("FALSE")  # a key-only table has nothing that can change
+    )
+    stale_query = sql.SQL(
+        "SELECT count(*) FROM {staged} AS s JOIN {table} AS t ON {same} WHERE t.{last} IS NULL AND t.{first} > %s"
+    ).format(staged=sql.Identifier(staged), table=t_table, same=same, last=last, first=first)
+    with db_errors():
+        cursor = await conn.execute(stale_query, (day,))
+        row = await cursor.fetchone()
+    stale = int(row[0]) if row is not None else 0
+    changed = 0
+    if details:
+        overwrite = sql.SQL(
+            "UPDATE {table} AS t SET ({cols}) = ROW({values}) FROM {staged} AS s "
+            "WHERE {same} AND t.{last} IS NULL AND t.{first} = %s AND {differs}"
+        ).format(
+            table=t_table,
+            cols=_names(details),
+            values=_names(details, "s"),
+            staged=sql.Identifier(staged),
+            same=same,
+            last=last,
+            first=first,
+            differs=differs,
+        )
+        changed += await _changed(conn, overwrite, (day,))
+        close = sql.SQL(
+            "UPDATE {table} AS t SET {last} = %s FROM {staged} AS s "
+            "WHERE {same} AND t.{last} IS NULL AND t.{first} < %s AND {differs}"
+        ).format(table=t_table, last=last, staged=sql.Identifier(staged), same=same, first=first, differs=differs)
+        changed += await _changed(conn, close, (previous, day))
+    if prune:
+        source, params = _source(source_column, source_id)
+        close_missing = sql.SQL(
+            "UPDATE {table} AS t SET {last} = CASE WHEN t.{first} = %s THEN %s ELSE %s END "
+            "WHERE {source} AND t.{last} IS NULL AND t.{first} <= %s AND {missing}"
+        ).format(table=t_table, last=last, first=first, source=source, missing=_missing(staged, key))
+        changed += await _changed(conn, close_missing, (day, day, previous, *params, day))
+    opening = (
+        sql.SQL("COALESCE(s.{opens}, %s)").format(opens=sql.Identifier(opens_from)) if opens_from else sql.SQL("%s")
+    )
+    insert = sql.SQL(
+        "INSERT INTO {table} ({cols}, {first}) SELECT {values}, "
+        "CASE WHEN EXISTS (SELECT FROM {table} AS t WHERE {same}) THEN %s ELSE LEAST({opening}, %s) END "
+        "FROM {staged} AS s WHERE NOT EXISTS (SELECT FROM {table} AS t WHERE {same} AND t.{last} IS NULL)"
+    ).format(
+        table=t_table,
+        cols=_names(columns),
+        first=first,
+        values=_names(columns, "s"),
+        same=same,
+        opening=opening,
+        staged=sql.Identifier(staged),
+        last=last,
+    )
+    changed += await _changed(conn, insert, (day, day, day))
+    return changed, stale
 
 
 async def update(

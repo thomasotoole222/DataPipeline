@@ -13,6 +13,7 @@ from pipeline.checks.targets import (
     Snapshot,
     To,
     Upsert,
+    Versioned,
     Writer,
     mismatches,
     row_key,
@@ -226,3 +227,120 @@ def test_mismatches_needs_a_unique_key_on_the_child_row_key() -> None:
         table="sales.line", columns=columns, unique_keys=frozenset({frozenset({"source_id", "order_id", "sku_id"})})
     )
     assert mismatches(line, full) == []
+
+
+VERSIONED = Versioned(("source_id", "sku"), valid_from="valid_from_key", valid_to="valid_to_key", opens_from="created")
+
+
+class Sku(Record, table="cipher.dim_sku", writer=VERSIONED):
+    """A versioned SKU: versions keyed by its id and first day."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("id",)
+    record_version: ClassVar[int] = 1
+
+    id: Annotated[str, To("sku")]
+    title: Annotated[str | None, To("title")] = None
+    created: Annotated[int | None, To("created")] = None
+
+
+def _sku_table(**changes: TableColumn | None) -> TableInfo:
+    """Build a fitting dim_sku catalog entry, then apply ``changes`` (a column, or None to drop it)."""
+
+    def col(name: str, kind: str, nullable: bool, writable: bool = True, default: bool = False) -> TableColumn:
+        return TableColumn(name=name, type=kind, nullable=nullable, has_default=default, writable=writable)
+
+    columns = {
+        "source_id": col("source_id", "uuid", False),
+        "sku": col("sku", "text", False),
+        "title": col("title", "text", True),
+        "created": col("created", "bigint", True),
+        "valid_from_key": col("valid_from_key", "integer", False),
+        "valid_to_key": col("valid_to_key", "integer", True),
+        "is_current": col("is_current", "boolean", True, writable=False, default=True),
+    }
+    for name, column in changes.items():
+        if column is None:
+            columns.pop(name)
+        else:
+            columns[name] = column
+    return TableInfo(
+        table="cipher.dim_sku", columns=columns, unique_keys=frozenset({frozenset({"sku", "valid_from_key"})})
+    )
+
+
+def test_versioned_is_a_snapshot_with_the_snapshot_key_rules() -> None:
+    """Check a Versioned target keeps its writer, counts as a Snapshot, and has the key as its row key."""
+    target = target_of(Sku)
+    assert target.writer == VERSIONED
+    assert isinstance(target.writer, Snapshot)
+    assert row_key(target) == ("source_id", "sku")
+
+
+@pytest.mark.parametrize(
+    ("writer", "field", "message"),
+    [
+        ("Versioned(('source_id', 'sku'), valid_from='d', valid_to='d')", "", "two distinct lower-case column names"),
+        ("Versioned(('source_id', 'sku'), valid_from='valid_from_key', valid_to='e')",
+         "f: Annotated[int, To('valid_from_key')]", "sets valid_from_key itself"),
+        ("Versioned(('source_id', 'sku'), valid_from='d', valid_to='e', opens_from='nope')", "",
+         "opens_from must be a target column"),
+        ("Versioned(('source_id', 'sku'), valid_from='d', valid_to='e', opens_from='name')",
+         "name: Annotated[str, To('name')]", "opens_from must be a target column"),
+        ("Versioned(('sku',), valid_from='d', valid_to='e')", "", "must include the source column 'source_id'"),
+    ],
+)  # fmt: skip
+def test_versioned_declarations_refused(writer: str, field: str, message: str) -> None:
+    """Check a Versioned writer refuses equal day columns, a field loading into one, a bad opens_from, no source."""
+    code = (
+        f"class Bad(Record, table='cipher.bad', writer={writer}):\n"
+        "    record_key: ClassVar[tuple[str, ...]] = ('id',)\n"
+        "    record_version: ClassVar[int] = 1\n"
+        "    id: Annotated[str, To('sku')]\n"
+        f"    {field}\n"
+    )
+    names = {"Annotated": Annotated, "ClassVar": ClassVar, "Record": Record, "To": To, "Versioned": Versioned}
+    with pytest.raises(ValueError, match=message):
+        exec(code, names)  # noqa: S102
+
+
+def test_versioned_refuses_rows_children() -> None:
+    """Check a Versioned table cannot own Rows children: its rows are versions, not one row per parent."""
+    with pytest.raises(TypeError, match="Rows is not for a Versioned table"):
+
+        class Kit(Record, table="cipher.kit", writer=Versioned(("source_id", "kit"), valid_from="f", valid_to="t")):
+            record_key: ClassVar[tuple[str, ...]] = ("id",)
+            record_version: ClassVar[int] = 1
+
+            id: Annotated[str, To("kit")]
+            lines: Annotated[list[Line], Rows()]
+
+
+def test_versioned_table_that_fits() -> None:
+    """Check a fitting table: integer day columns, a version key, no removed_at, valid_from left to the writer."""
+    assert mismatches(target_of(Sku), _sku_table()) == []
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"valid_from_key": None}, "cipher.dim_sku.valid_from_key does not exist"),
+        ({"valid_to_key": TableColumn(name="valid_to_key", type="integer", nullable=False, has_default=False,
+                                      writable=True)}, "valid_to_key must be nullable"),
+        ({"valid_to_key": TableColumn(name="valid_to_key", type="text", nullable=True, has_default=False,
+                                      writable=True)}, "valid_to_key is text, a Versioned writer needs"),
+        ({"valid_from_key": TableColumn(name="valid_from_key", type="date", nullable=False, has_default=False,
+                                        writable=True)}, "must both be date keys or both dates"),
+    ],
+)  # fmt: skip
+def test_versioned_table_mismatches(changes: dict[str, TableColumn | None], message: str) -> None:
+    """Check missing, nullable, mistyped and mixed day columns are reported."""
+    assert any(message in found for found in mismatches(target_of(Sku), _sku_table(**changes)))
+
+
+def test_versioned_table_needs_a_unique_key_on_its_versions() -> None:
+    """Check a table whose only unique key is the id (one row per id) is refused: versions need their first day."""
+    info = _sku_table()
+    narrow = TableInfo(table=info.table, columns=info.columns, unique_keys=frozenset({frozenset({"sku"})}))
+    assert mismatches(target_of(Sku), narrow) == [
+        "cipher.dim_sku has no unique key on its versions (within sku, source_id, valid_from_key, with valid_from_key)"
+    ]

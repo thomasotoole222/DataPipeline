@@ -320,6 +320,7 @@ class BatchJob[R: Record]:
                 frame,
                 self._instruments,
                 policy=self.validation.policy,
+                zone=self._zone,
                 on_loaded=loaded.append,
             )
         except Exception as err:  # a failure after Extract still reports the records fetched

@@ -10,7 +10,8 @@ Public API:
     ReplacePartition: Writer that replaces the rows whose ``column`` lies in the task's time frame.
     Snapshot: Writer keyed by ``key`` that sets ``removed_at`` itself.
     Update: Writer that updates existing rows matched on ``key``; ``missing`` says what happens to rows not returned.
-    Writer: The union of the five writer classes.
+    Versioned: A ``Snapshot`` that keeps history: a change closes the open version and opens a new one.
+    Writer: The union of the writer classes.
     Column: One target column: its name, frame and Postgres types, nullability and path on the record.
     Target: A table, its writer, source column, columns and child targets.
     target_of: Return a model's top-level target.
@@ -57,6 +58,8 @@ COLUMN_PATTERN: Final = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 #: The Postgres type name of a ``timestamptz`` column, as ``format_type`` prints it.
 _TIMESTAMPTZ: Final = "timestamp with time zone"
+#: A ``Versioned`` writer's day column types: ``YYYYMMDD`` date keys of either integer width, or dates.
+_VERSION_TYPES: Final = ("integer", "bigint", "date")
 #: The frame type and Postgres type of each scalar annotation a ``To`` field may have; ``Decimal`` is mapped apart,
 #: in ``_column_type``. A plain ``datetime`` is not mapped, only ``AwareDatetime``; ``UUID`` is a string in the frame.
 _SCALARS: Final[dict[object, tuple[pl.DataType, str]]] = {
@@ -188,8 +191,41 @@ class Update:
     missing: Literal["keep", "zero"] = "keep"  # what happens to the source's rows the connector did not return
 
 
+@dataclass(frozen=True, slots=True)
+class Versioned(Snapshot):
+    """A ``Snapshot`` that keeps history: each id has versions, and a change closes the open one and opens another.
+
+    The writer owns ``valid_from`` and ``valid_to``: each version's first and last day (inclusive; ``valid_to`` is
+    None while the version is open). On the task's observation day D (``load``'s ``zone`` date of the task's
+    ``claimed_at``), for each staged id: a new id opens a version from its ``opens_from`` value (or D when
+    ``opens_from`` is None or the value is null); an id whose open version's other columns equal the staged row is
+    left alone; a changed id has its open version closed on D - 1 and a new one opened from D, unless the open version
+    already started on D, which is overwritten in place; an id whose versions are all closed opens a new one from D;
+    an id whose open version starts after D is a stale observation, left alone and counted. With pruning, an open
+    version of the source whose id is not staged is closed on D - 1 (on D when it started on D). Nothing is deleted.
+
+    As a ``Snapshot`` subclass it shares ``Snapshot``'s rules wherever they test for ``Snapshot``: ``key`` is checked
+    as a writer key (non-empty, distinct, not nullable, the source column included), no missing id is closed while
+    records are held, and an empty frame is refused when pruning. ``_check_writer`` and ``mismatches`` give it checks
+    of its own in place of ``Snapshot``'s ``removed_at`` ones, and ``build_target`` refuses ``Rows`` children.
+
+    Attributes:
+        key: As for ``Snapshot``: the columns that identify an id, the source column included when the table has one.
+        valid_from: The table column holding a version's first day; ``integer`` (``YYYYMMDD`` date keys) or ``date``,
+            not nullable, set by the writer only.
+        valid_to: The table column holding a version's last day, of ``valid_from``'s type, nullable (None while the
+            version is open), set by the writer only.
+        opens_from: A target column of ``valid_from``'s type dating a new id's first version, or None to open it on D.
+
+    """
+
+    valid_from: str  # the version's first day; set by the writer
+    valid_to: str  # the version's last day, inclusive; NULL while open; set by the writer
+    opens_from: str | None = None  # a target column dating a new id's first version, or None for the observation day
+
+
 #: The writer of a target: how its frame is written to its table.
-type Writer = Upsert | ReplaceChildren | ReplacePartition | Snapshot | Update
+type Writer = Upsert | ReplaceChildren | ReplacePartition | Snapshot | Versioned | Update
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +358,8 @@ def build_target(model: type[BaseModel], table: str, writer: Writer, source_colu
     key = _key(writer)
     if rows and key is None:
         raise TypeError(f"{name}: Rows needs a writer with a key (Upsert or Snapshot)")
+    if rows and isinstance(writer, Versioned):
+        raise TypeError(f"{name}: Rows is not for a Versioned table; its rows are versions, not one row per parent")
     if rows and isinstance(writer, Update):
         raise TypeError(f"{name}: Rows is not for an Update table; its rows may not exist to own the children")
     by_name = {column.name: column for column in columns}
@@ -670,8 +708,10 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
 
     A writer key must be non-empty, name distinct target columns that do not allow None, and include the source column
     when there is one. ``ReplacePartition`` needs its column to be a target column of type ``timestamptz`` or
-    ``date`` that does not allow None. ``Snapshot`` refuses a column named ``removed_at``. ``Update`` needs a column
-    outside its key, and with ``missing="zero"`` every such column must be ``bigint`` or ``numeric(p,s)``.
+    ``date`` that does not allow None. ``Versioned`` needs distinct ``valid_from`` and ``valid_to`` names that no field
+    loads into, and an ``opens_from`` that is a target column of an ``int`` or ``date`` field; it is matched before
+    ``Snapshot``, whose check it does not take. ``Snapshot`` refuses a column named ``removed_at``. ``Update`` needs a
+    column outside its key, and with ``missing="zero"`` every such column must be ``bigint`` or ``numeric(p,s)``.
     ``ReplaceChildren`` needs at least one column: ``columns`` are the child's own, as ``build_target`` adds the
     inherited key columns only when it rebuilds the child target, and without one every list item would load as the
     same key-only row; its ``key`` is then checked as a writer key is, against those own columns. ``Upsert`` has no
@@ -714,6 +754,20 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
                 raise ValueError(f"{name}: ReplacePartition needs a target column of type {_TIMESTAMPTZ} or date")
             if by_name[column].nullable:
                 raise ValueError(f"{name}: the ReplacePartition column {column!r} cannot allow None")
+        case Versioned(valid_from=valid_from, valid_to=valid_to, opens_from=opens_from):
+            if valid_from == valid_to or not all(COLUMN_PATTERN.fullmatch(c) for c in (valid_from, valid_to)):
+                raise ValueError(f"{name}: valid_from and valid_to must be two distinct lower-case column names")
+            loaded = sorted(c for c in (valid_from, valid_to) if c in by_name)
+            if loaded:
+                raise ValueError(
+                    f"{name}: a Versioned writer sets {', '.join(loaded)} itself, so no field may load into it"
+                )
+            if opens_from is not None and (
+                opens_from not in by_name or by_name[opens_from].postgres not in _VERSION_TYPES
+            ):
+                raise ValueError(
+                    f"{name}: opens_from must be a target column of an int or date field, got {opens_from!r}"
+                )
         case Snapshot():
             if "removed_at" in by_name:
                 raise ValueError(f"{name}: a Snapshot sets removed_at itself, so no field may load into it")
@@ -771,6 +825,73 @@ def row_key(target: Target) -> tuple[str, ...] | None:
     return _key(target.writer)
 
 
+def _day_kind(postgres: str) -> str:
+    """Return ``"date"`` for a ``date`` type and ``"key"`` for an integer ``YYYYMMDD`` date key of either width.
+
+    Preconditions:
+        None.
+
+    Args:
+        postgres: A Postgres type name.
+
+    Returns:
+        ``"date"`` or ``"key"``.
+
+    Raises:
+        Nothing.
+
+    """
+    return "date" if postgres == "date" else "key"
+
+
+def _version_mismatches(target: Target, writer: Versioned, info: TableInfo) -> list[str]:
+    """List the ways a table does not fit a ``Versioned`` writer's day columns and version key.
+
+    Preconditions:
+        ``info`` describes ``target.table``.
+
+    Args:
+        target: A target whose writer is ``writer``.
+        writer: The target's ``Versioned`` writer.
+        info: The table as the catalog describes it.
+
+    Returns:
+        One message per mismatch: ``valid_from`` or ``valid_to`` missing, not ``integer``, ``bigint`` or ``date``,
+        one a date key and the other a date, not writable, ``valid_from`` nullable or ``valid_to`` ``NOT NULL``;
+        ``opens_from`` a date key where the days are dates or the reverse; no unique key that includes
+        ``valid_from`` and lies within ``writer.key`` and ``valid_from``. ``[]`` when it fits.
+
+    Raises:
+        Nothing.
+
+    """
+    table, found = target.table, []
+    first, last = info.columns.get(writer.valid_from), info.columns.get(writer.valid_to)
+    for column, actual in ((writer.valid_from, first), (writer.valid_to, last)):
+        if actual is None:
+            found.append(f"{table}.{column} does not exist")
+        elif actual.type not in _VERSION_TYPES:
+            found.append(f"{table}.{column} is {actual.type}, a Versioned writer needs integer, bigint or date")
+        elif not actual.writable:
+            found.append(f"{table}.{column} is generated, so the Versioned writer cannot set it")
+    if first is not None and last is not None:
+        if _day_kind(first.type) != _day_kind(last.type):
+            found.append(f"{table}.{writer.valid_from} and {writer.valid_to} must both be date keys or both dates")
+        if first.nullable:
+            found.append(f"{table}.{writer.valid_from} must be NOT NULL")
+        if not last.nullable:
+            found.append(f"{table}.{writer.valid_to} must be nullable: an open version has none")
+        opens = next((c for c in target.columns if c.name == writer.opens_from), None)
+        if opens is not None and _day_kind(opens.postgres) != _day_kind(first.type):
+            found.append(f"{table}.{writer.opens_from} must be a date key or a date as {writer.valid_from} is")
+    allowed = frozenset((*writer.key, writer.valid_from))
+    if not any(writer.valid_from in unique and unique <= allowed for unique in info.unique_keys):
+        found.append(
+            f"{table} has no unique key on its versions (within {', '.join(sorted(allowed))}, with {writer.valid_from})"
+        )
+    return found
+
+
 def mismatches(target: Target, info: TableInfo | None) -> list[str]:
     """List the ways a table in the catalog does not fit a target.
 
@@ -779,8 +900,12 @@ def mismatches(target: Target, info: TableInfo | None) -> list[str]:
     not writable (a generated or ``GENERATED ALWAYS`` identity column), except an ``Update``'s key columns, which
     are only matched, never written. Then, unless the writer is ``Update`` (which never inserts), each table column
     that is ``NOT NULL`` with no default and not a target column gets a message, except ``removed_at`` for a
-    ``Snapshot``. A row key (``row_key``) needs a unique key on exactly its columns, and a ``Snapshot`` needs a
-    nullable ``timestamptz`` ``removed_at`` that is writable, since the writer sets it. Only ``target.table`` is
+    ``Snapshot`` and ``valid_from`` for a ``Versioned``. A row key (``row_key``) needs a unique key on exactly its
+    columns, and a ``Snapshot`` needs a nullable ``timestamptz`` ``removed_at`` that is writable, since the writer sets
+    it. A ``Versioned`` table instead holds several versions per key, so it needs a unique key that includes
+    ``valid_from`` and lies within the key and ``valid_from``; ``valid_from`` and ``valid_to`` of one type, ``integer``
+    or ``date``, writable, ``valid_from`` ``NOT NULL`` and ``valid_to`` nullable; and ``opens_from``, when set, of that
+    type. Only ``target.table`` is
     compared; ``target.children`` are not visited, so each child target is checked by its own call.
 
     Preconditions:
@@ -815,14 +940,18 @@ def mismatches(target: Target, info: TableInfo | None) -> list[str]:
             found.append(f"{table}.{column.name} is NOT NULL, but the model allows None")
         elif not actual.writable and column.name not in matched:
             found.append(f"{table}.{column.name} is generated, so the model cannot fill it")
-    snapshot = isinstance(target.writer, Snapshot)
+    versioned = target.writer if isinstance(target.writer, Versioned) else None
+    snapshot = isinstance(target.writer, Snapshot) and versioned is None
+    writer_set = {versioned.valid_from} if versioned is not None else {"removed_at"} if snapshot else set()
     if not update:  # an Update never inserts
         for actual in info.columns.values():
             unfilled = not actual.nullable and not actual.has_default and actual.name not in names
-            if unfilled and not (snapshot and actual.name == "removed_at"):
+            if unfilled and actual.name not in writer_set:
                 found.append(f"{table}.{actual.name} is NOT NULL with no default, but the model does not fill it")
     key = row_key(target)
-    if key is not None and frozenset(key) not in info.unique_keys:
+    if versioned is not None:
+        found.extend(_version_mismatches(target, versioned, info))
+    elif key is not None and frozenset(key) not in info.unique_keys:
         found.append(f"{table} has no unique key on ({', '.join(key)})")
     if snapshot:
         removed = info.columns.get("removed_at")
