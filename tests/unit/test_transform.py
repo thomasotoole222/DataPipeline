@@ -5,7 +5,7 @@ from uuid import UUID
 
 import pytest
 
-from pipeline.checks.record import Keyed, Part, Record
+from pipeline.checks.record import Int16, Int32, Keyed, Part, Record
 from pipeline.checks.targets import ReplaceChildren, Rows, To, Upsert, target_of
 from pipeline.db.quarantine import Failure
 from pipeline.errors import Overflow
@@ -59,3 +59,33 @@ def test_a_record_that_misfits_is_left_out_with_its_rows() -> None:
     with pytest.raises(ValueError, match=r"owners of sales\.order do not give one record per row"):
         Transformed(frames=built.frames, owners=((0,), (0, 2, 2)))
     assert order.table == "sales.order"
+
+
+class Stat(Record, table="cipher.stat", writer=Upsert(("source_id", "day"))):
+    """A day's stat with an integer date key and a smallint code."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("day",)
+    record_version: ClassVar[int] = 1
+
+    day: Annotated[Int32, To("day")]
+    code: Annotated[Int16, To("code")]
+
+
+@pytest.mark.parametrize(
+    ("day", "code", "refused"),
+    [
+        (2**31 - 1, 2**15 - 1, None),
+        (-(2**31), -(2**15), None),
+        (2**31, 0, "day: a value does not fit integer NOT NULL"),
+        (0, 2**15, "code: a value does not fit smallint NOT NULL"),
+    ],
+)
+def test_frame_of_keeps_ints_in_their_columns_width(day: int, code: int, refused: str | None) -> None:
+    """Check an int fits an integer or smallint column only within that width, as it does a bigint one."""
+    row: dict[str, object] = {"source_id": str(SHOP), "day": day, "code": code}
+    if refused is None:
+        frame = frame_of(target_of(Stat), [row])
+        assert (frame["day"].to_list(), frame["code"].to_list()) == ([day], [code])
+    else:
+        with pytest.raises(Overflow, match=rf"^cipher\.stat\.{refused}$"):
+            frame_of(target_of(Stat), [row])

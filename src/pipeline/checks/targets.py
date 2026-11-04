@@ -5,6 +5,7 @@ Public API:
     COLUMN_PATTERN: The pattern a bare column name matches, used with ``fullmatch``.
     To: Field mark that loads a single value into the named column.
     Rows: Field mark that loads a ``list`` of child parts as rows of the child's own table.
+    Width: Field mark that loads an ``int`` field into a narrower integer column: ``integer`` or ``smallint``.
     Upsert: Writer that inserts rows or updates them on a conflict over ``key``.
     ReplaceChildren: Writer for a child table whose rows are replaced under each parent's key, matched on ``key``.
     ReplacePartition: Writer that replaces the rows whose ``column`` lies in the task's time frame.
@@ -72,9 +73,11 @@ _SCALARS: Final[dict[object, tuple[pl.DataType, str]]] = {
 }
 #: The largest ``max_digits`` a loaded ``Decimal`` may have: the largest precision ``pl.Decimal`` holds.
 _MAX_DIGITS: Final = 38
-#: The Postgres types an ``Update`` with ``missing="zero"`` can set to zero: ``bigint`` or ``numeric(p,s)``. Used with
-#: ``fullmatch``.
-_NUMERIC: Final = re.compile(r"bigint|numeric\(\d+,\d+\)")
+#: The frame type and Postgres type of an ``int`` field with a ``Width`` mark, by its bits; without one, ``bigint``.
+_INT_WIDTHS: Final[dict[int, tuple[pl.DataType, str]]] = {32: (pl.Int32(), "integer"), 16: (pl.Int16(), "smallint")}
+#: The Postgres types an ``Update`` with ``missing="zero"`` can set to zero: an integer of any width or
+#: ``numeric(p,s)``. Used with ``fullmatch``.
+_NUMERIC: Final = re.compile(r"bigint|integer|smallint|numeric\(\d+,\d+\)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +93,38 @@ class To:
     """
 
     column: str
+
+
+@dataclass(frozen=True, slots=True)
+class Width:
+    """Field mark that loads an ``int`` field into a narrower integer column than the default ``bigint``.
+
+    Used through ``pipeline.checks.record``'s ``Int32`` and ``Int16``, which carry it with the matching bounds so an
+    out-of-range value fails Validate instead of the load. ``__post_init__`` refuses any width but 32 and 16;
+    ``_column_type`` refuses the mark on a field that is not an ``int``.
+
+    Attributes:
+        bits: 32 for an ``integer`` column, 16 for a ``smallint`` column.
+
+    """
+
+    bits: Literal[16, 32]
+
+    def __post_init__(self) -> None:
+        """Refuse a width other than 32 or 16.
+
+        Preconditions:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: ``bits`` is not 32 or 16.
+
+        """
+        if self.bits not in _INT_WIDTHS:
+            raise ValueError(f"Width needs 32 or 16 bits, got {self.bits!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,7 +674,8 @@ def _column_type(where: str, annotation: Any, metadata: Sequence[object]) -> tup
 
     ``Decimal`` maps to ``pl.Decimal(p, s)`` and ``numeric(p,s)``, with ``p`` and ``s`` the last non-None
     ``max_digits`` and ``decimal_places`` found on the metadata items; ``p`` must lie from 1 to 38 (the precisions
-    polars holds) and ``s`` from 0 to ``p``. Any other annotation is looked up in ``_SCALARS``.
+    polars holds) and ``s`` from 0 to ``p``. An ``int`` with a ``Width`` mark maps to ``integer`` (32 bits) or
+    ``smallint`` (16 bits), the last mark found winning. Any other annotation is looked up in ``_SCALARS``.
 
     Preconditions:
         None.
@@ -653,8 +689,8 @@ def _column_type(where: str, annotation: Any, metadata: Sequence[object]) -> tup
         The frame type and the Postgres type as ``format_type`` prints it.
 
     Raises:
-        TypeError: A ``Decimal`` lacks ``max_digits`` or ``decimal_places``, or the annotation is not in ``_SCALARS``
-            (an unhashable annotation included).
+        TypeError: A ``Decimal`` lacks ``max_digits`` or ``decimal_places``; a ``Width`` mark is on a field that is
+            not an ``int``; or the annotation is not in ``_SCALARS`` (an unhashable annotation included).
         ValueError: A ``Decimal``'s ``max_digits`` or ``decimal_places`` lies outside the ranges above.
 
     """
@@ -674,6 +710,11 @@ def _column_type(where: str, annotation: Any, metadata: Sequence[object]) -> tup
                 f"max_digits, got {digits} and {places}"
             )
         return pl.Decimal(digits, places), f"numeric({digits},{places})"
+    widths = [item.bits for item in metadata if isinstance(item, Width)]
+    if widths and annotation is not int:
+        raise TypeError(f"{where}: a Width mark is for an int field, not {annotation!r}")
+    if widths:
+        return _INT_WIDTHS[widths[-1]]
     try:
         return _SCALARS[annotation]
     except (KeyError, TypeError) as err:  # TypeError: an unhashable annotation

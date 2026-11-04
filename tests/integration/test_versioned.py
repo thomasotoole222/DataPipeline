@@ -18,7 +18,7 @@ from opentelemetry.sdk.metrics import MeterProvider
 from psycopg_pool import AsyncConnectionPool
 
 from pipeline.checks.checks import Validation
-from pipeline.checks.record import Record
+from pipeline.checks.record import Int16, Int32, Record
 from pipeline.checks.targets import To, Versioned
 from pipeline.connectors.paging import NoPaging
 from pipeline.connectors.spec import EndpointSpec
@@ -61,7 +61,8 @@ class Product(
 
     id: Annotated[str, To("product_id")]
     title: Annotated[str, To("title")]
-    created: Annotated[int | None, To("created_date_key")] = None
+    status: Annotated[Int16 | None, To("status")] = None  # a smallint column
+    created: Annotated[Int32 | None, To("created_date_key")] = None  # an integer date key, as valid_from is
 
 
 VALIDATION = Validation(model=Product)
@@ -80,7 +81,7 @@ async def pool() -> AsyncIterator[Pool]:
         await c.execute("CREATE SCHEMA t_ver")
         await c.execute(
             "CREATE TABLE t_ver.product (source_id uuid NOT NULL, product_id text NOT NULL, title text NOT NULL, "
-            "created_date_key bigint, valid_from_key integer NOT NULL, valid_to_key integer, "
+            "status smallint, created_date_key integer, valid_from_key integer NOT NULL, valid_to_key integer, "
             "is_current boolean GENERATED ALWAYS AS (valid_to_key IS NULL) STORED, "
             "PRIMARY KEY (product_id, valid_from_key), "
             "EXCLUDE USING gist (product_id WITH =, int4range(valid_from_key, valid_to_key, '[]') WITH &&))"

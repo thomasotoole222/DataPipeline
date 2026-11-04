@@ -31,6 +31,8 @@ _EXACT: Final = Context(prec=MAX_PREC, Emax=MAX_EMAX, Emin=MIN_EMIN)
 
 #: The first and last instants Python's ``datetime`` can hold in UTC, as ``frame.iter_rows()`` in
 #: ``writers.staging.copy_in`` converts each value back to one; ``_fits`` refuses an aware ``datetime`` outside them.
+#: The bits of each integer frame type an ``int`` may load into: bigint, integer and smallint.
+_INT_BITS: Final[dict[type[pl.DataType], int]] = {pl.Int64: 64, pl.Int32: 32, pl.Int16: 16}
 _FIRST_UTC: Final = datetime.min.replace(tzinfo=UTC)
 _LAST_UTC: Final = datetime.max.replace(tzinfo=UTC)
 
@@ -270,9 +272,9 @@ def _fitted(target: Target, row: Mapping[str, object]) -> dict[str, object]:
 
     Raises:
         KeyError: When the row lacks a column's name.
-        Overflow: When a value does not fit its column (an ``int`` outside bigint's range and a ``Decimal`` whose
-            exponent is near ``MAX_EMAX`` included); the message names the table, the column and its type, never the
-            value.
+        Overflow: When a value does not fit its column (an ``int`` outside its column's integer range and a
+            ``Decimal`` whose exponent is near ``MAX_EMAX`` included); the message names the table, the column and its
+            type, never the value.
 
     """
     fitted: dict[str, object] = {}
@@ -352,7 +354,8 @@ def _fits(column: Column, value: object) -> bool:
         True when the value's type matches the column's polars type and the value is in range:
 
         - a ``bool`` in a Boolean column;
-        - an ``int`` from -2**63 to 2**63 - 1 in an Int64 column;
+        - an ``int`` in an Int64, Int32 or Int16 column within that width's range (-2**63 to 2**63 - 1, -2**31 to
+          2**31 - 1, -2**15 to 2**15 - 1: Postgres ``bigint``, ``integer`` and ``smallint``);
         - a ``str`` Postgres ``text`` can store (no NUL and no surrogate, the rule of ``db.pool.storable_text``) in a
           String column, and, when the column is ``uuid`` (its frame type is String), also a uuid text form
           (``_is_uuid``);
@@ -376,7 +379,8 @@ def _fits(column: Column, value: object) -> bool:
         case bool():
             return isinstance(dtype, pl.Boolean)
         case int():
-            return isinstance(dtype, pl.Int64) and -(2**63) <= value < 2**63  # bigint's range too
+            bits = _INT_BITS.get(type(dtype))  # Int64, Int32 or Int16: bigint, integer or smallint
+            return bits is not None and -(2 ** (bits - 1)) <= value < 2 ** (bits - 1)
         case str():
             storable = isinstance(dtype, pl.String) and storable_text(value) is value  # the same string when storable
             return storable and (column.postgres != "uuid" or _is_uuid(value))

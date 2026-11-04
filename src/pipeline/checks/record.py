@@ -3,6 +3,8 @@
 Public API:
     BOOL_VALUES: The only values a boolean field accepts, each mapped to its ``bool``.
     Bool: A boolean field's type: its input mapped through ``BOOL_VALUES``, then checked as a strict ``bool``.
+    Int32: An ``int`` field loaded into an ``integer`` column: -2**31 to 2**31 - 1, checked at Validate.
+    Int16: An ``int`` field loaded into a ``smallint`` column: -2**15 to 2**15 - 1, checked at Validate.
     Part: Frozen pydantic model that keeps unknown fields; the base for nested parts of a record.
     Record: A ``Part`` whose subclasses must declare ``record_key`` and ``record_version``, checked at class creation;
         each key field must be required, have a type defined when the model is declared, not accept ``None`` and have
@@ -35,7 +37,7 @@ from types import MappingProxyType
 from typing import Annotated, Any, ClassVar, Final, Literal, NewType, TypeAliasType, get_args, get_origin
 from uuid import UUID
 
-from annotated_types import BaseMetadata, GroupedMetadata, Predicate
+from annotated_types import BaseMetadata, Ge, GroupedMetadata, Le, Predicate
 from pydantic import (
     AllowInfNan,
     AwareDatetime,
@@ -51,7 +53,7 @@ from pydantic import (
 )
 from pydantic.fields import FieldInfo
 
-from pipeline.checks.targets import Snapshot, Target, To, Update, Upsert, Writer, alias_value, build_target
+from pipeline.checks.targets import Snapshot, Target, To, Update, Upsert, Width, Writer, alias_value, build_target
 
 #: The classes a key field's type may be, besides a ``StrEnum`` or ``IntEnum`` subclass; ``float`` is not one, nor a
 #: plain ``datetime``, which accepts naive values: only Pydantic's ``AwareDatetime``, which refuses them.
@@ -116,6 +118,13 @@ def _to_bool(value: object) -> object:
 
 #: A boolean field: mapped through BOOL_VALUES, then checked strictly.
 Bool = Annotated[bool, BeforeValidator(_to_bool), Strict()]
+
+#: An int field loaded into an ``integer`` column (Postgres ``int4``), e.g. a ``YYYYMMDD`` date key. A value outside
+#: the column's range fails the field's bounds at Validate, so the record is held rather than the load failing.
+Int32 = Annotated[int, Ge(-(2**31)), Le(2**31 - 1), Width(32)]
+
+#: An int field loaded into a ``smallint`` column (Postgres ``int2``), e.g. a coded status or an ``HHMM`` time key.
+Int16 = Annotated[int, Ge(-(2**15)), Le(2**15 - 1), Width(16)]
 
 
 class Part(BaseModel):
@@ -566,7 +575,9 @@ def _declarative(item: object) -> bool:
         return all(_declarative(inner) for inner in item)
     if isinstance(item, Strict):
         return not item.strict  # strict Python mode refuses the JSON string forms the key arrives in
-    return isinstance(item, BaseMetadata | AllowInfNan | To) and not isinstance(item, Predicate)  # Predicate runs code
+    return isinstance(item, BaseMetadata | AllowInfNan | To | Width) and not isinstance(
+        item, Predicate
+    )  # Predicate runs code
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,7 +5,7 @@ from typing import Annotated, ClassVar
 
 import pytest
 
-from pipeline.checks.record import Part, Record
+from pipeline.checks.record import Int16, Int32, Part, Record
 from pipeline.checks.targets import (
     ReplaceChildren,
     ReplacePartition,
@@ -14,6 +14,7 @@ from pipeline.checks.targets import (
     To,
     Upsert,
     Versioned,
+    Width,
     Writer,
     mismatches,
     row_key,
@@ -344,3 +345,50 @@ def test_versioned_table_needs_a_unique_key_on_its_versions() -> None:
     assert mismatches(target_of(Sku), narrow) == [
         "cipher.dim_sku has no unique key on its versions (within sku, source_id, valid_from_key, with valid_from_key)"
     ]
+
+
+def test_int32_and_int16_load_into_integer_and_smallint() -> None:
+    """Check Int32 and Int16 fields map to integer and smallint, nullable under None, a plain int staying bigint."""
+
+    class Day(Record, table="cipher.fact_day", writer=Upsert(("source_id", "date_key"))):
+        record_key: ClassVar[tuple[str, ...]] = ("day",)
+        record_version: ClassVar[int] = 1
+
+        day: Annotated[Int32, To("date_key")]
+        status: Annotated[Int16 | None, To("status")] = None
+        orders: Annotated[int, To("orders")] = 0
+
+    found = {column.name: (column.postgres, column.nullable) for column in target_of(Day).columns}
+    assert found == {
+        "source_id": ("uuid", False),
+        "date_key": ("integer", False),
+        "status": ("smallint", True),
+        "orders": ("bigint", False),
+    }
+
+
+def test_int32_bounds_hold_an_out_of_range_value() -> None:
+    """Check a value past an Int32 column's range fails the field, so Validate holds the record."""
+
+    class Key(Record, table="cipher.k", writer=Upsert(("source_id", "date_key"))):
+        record_key: ClassVar[tuple[str, ...]] = ("day",)
+        record_version: ClassVar[int] = 1
+
+        day: Annotated[Int32, To("date_key")]
+
+    assert Key.model_validate({"day": 2**31 - 1}).day == 2**31 - 1
+    with pytest.raises(ValueError, match="less than or equal to 2147483647"):
+        Key.model_validate({"day": 2**31})
+
+
+def test_width_mark_refusals() -> None:
+    """Check Width refuses a width other than 32 or 16, and a field that is not an int."""
+    with pytest.raises(ValueError, match="Width needs 32 or 16 bits"):
+        Width(8)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="a Width mark is for an int field"):
+
+        class Bad(Record, table="cipher.bad", writer=Upsert(("source_id", "code"))):
+            record_key: ClassVar[tuple[str, ...]] = ("id",)
+            record_version: ClassVar[int] = 1
+
+            id: Annotated[str, To("code"), Width(32)]
