@@ -260,7 +260,9 @@ class BatchJob[R: Record]:
             3. ``validate`` splits the landed records into accepted and held.
             4. ``transform`` turns the accepted records into one frame per target table.
             5. ``load`` writes the held rows and the frames in one transaction fenced on the lease; its last write
-               is ``lease.complete`` with a ``SUCCEEDED`` report, so the rows and the outcome commit together.
+               is ``lease.complete`` with a ``SUCCEEDED`` report, so the rows and the outcome commit together. It
+               takes the job's zone to date a Versioned target's observation day as the local date of
+               ``task.claimed_at`` in that zone; a job with no Versioned target ignores it.
 
         The report counts the records fetched, the rows Load changed (the sum of ``Loaded.changed``, which ``load``
         hands over through ``on_loaded`` before the report is built) and the rows held (``Loaded.held``), and its

@@ -5,7 +5,7 @@ Public API:
     replace_children: Delete the rows of listed parents missing from the stage, then upsert the staged rows by key.
     replace_partition: Delete the rows in one source's half-open range of a column, then insert the staged rows.
     snapshot: Upsert staged rows, clear their ``removed_at``, and optionally mark rows missing from the stage removed.
-    versioned: Keep one open version per key: close changed and missing ones, overwrite today's, open new ones.
+    versioned: Keep day-ranged versions per key: rewrite or drop today's, close older changed or missing ones.
     update: Update existing rows by key from the stage, and optionally zero rows missing from the stage.
 
 """
@@ -234,28 +234,41 @@ async def versioned(
     previous: date | int,
     prune: bool,
 ) -> tuple[int, int]:
-    """Make each staged key's open version equal its staged row, closing versions rather than changing or deleting them.
+    """Make each staged key's open version equal its staged row; only versions opened on the day change in place.
 
     ``day`` is the observation day D and ``previous`` the day before it, both in the type of ``valid_from`` (a
-    ``YYYYMMDD`` integer or a ``date``). An open version is a row whose ``valid_to`` is null. In order:
+    ``YYYYMMDD`` integer or a ``date``). An open version is a row whose ``valid_to`` is null. Rows differ when any
+    column of ``columns`` outside ``key`` is distinct (``IS DISTINCT FROM``, so nulls compare equal); a key-only
+    table never differs and skips steps 2 and 3. Keys compare with ``ROW(...) = ROW(...)``, which the non-nullable
+    writer key (``checks.targets``) keeps exact.
 
-    1. Count the staged keys whose open version starts after D: stale observations, left alone by every step.
-    2. Overwrite, in place, the open versions that started on D and differ from their staged row.
+    A version that reaches past ``previous`` (starts after D, or was closed on D or later) can only have been
+    written by a later day's task: a task on D closes on ``previous`` and drops, rather than closes, a version it
+    opened on D. A staged key with such a version is stale. In order:
+
+    1. Count the stale staged keys. Non-overlapping versions mean a stale key has no open version starting on or
+       before D, so steps 2 and 3 never touch it, step 4 only touches unstaged keys and step 5 skips it: the count
+       holds after them and these keys are left alone.
+    2. Overwrite, in place, the non-key columns of the open versions that started on D and differ from their
+       staged row (the day's last observation wins).
     3. Close on ``previous`` the open versions that started before D and differ from their staged row.
-    4. With ``prune``, close the source's open versions whose key is not staged and that started on or before D:
-       on ``previous``, or on D for one that started on D (``valid_to`` never precedes ``valid_from``).
-    5. Insert a version for every staged key with no open version left: from D when the key has an earlier version
-       (it changed, or was closed and is back), else from its ``opens_from`` value (D when ``opens_from`` is None or
-       the value is null), but never after D.
+    4. With ``prune``, for the source's open versions whose key is not staged: delete those that started on D (the
+       day's last observation is that the key is gone, so the day keeps no version of it) and close on ``previous``
+       those that started before D.
+    5. Insert a version for every staged key that is not stale and has no open version left: from D when the key
+       has any version at all, else from its ``opens_from`` value (D when ``opens_from`` is None or the value is
+       null), but never after D. Every version of a non-stale key ends on or before ``previous``, so the new one
+       neither shares ``valid_from`` with nor overlaps any of them.
 
-    Rows differ when any column of ``columns`` outside ``key`` is distinct (``IS DISTINCT FROM``). Closing runs before
-    inserting, so a non-deferrable exclusion constraint on a key's version ranges never sees two open versions.
+    Closing runs before inserting, so a non-deferrable exclusion constraint on a key's version ranges never sees
+    two open versions.
 
     Preconditions:
         As for ``snapshot``, except that the table has no ``removed_at`` and several rows per key: ``valid_from`` and
-        ``valid_to`` are its day columns and ``columns`` includes neither. ``staged`` has no two rows with one key.
-        ``day`` and ``previous`` match ``valid_from``'s type, and ``opens_from``, when set, is in ``columns`` and of
-        that type (``checks.targets`` checks the table with ``mismatches``).
+        ``valid_to`` are its day columns and ``columns`` includes neither. ``staged`` has no two rows with one key
+        (Load holds key violations first). ``day`` and ``previous`` match ``valid_from``'s type, and ``opens_from``,
+        when set, is in ``columns`` and of that type (``checks.targets`` checks the table with ``mismatches``). With
+        ``prune``, ``staged`` is not empty (Load raises ``NothingLoaded`` first, as ``Versioned`` is a ``Snapshot``).
 
     Args:
         conn: Connection the statements run on; the caller owns the transaction.
@@ -273,15 +286,15 @@ async def versioned(
         prune: Whether to close the open versions of keys missing from the stage.
 
     Returns:
-        The rows changed (overwritten, closed and inserted) and the number of stale staged keys.
+        The rows changed (overwritten, closed, deleted and inserted, so a changed key counts twice) and the number of
+        stale staged keys.
 
     Raises:
         ValueError: When ``table`` does not contain exactly one ``.``.
         DatabaseConflict: From ``db_errors``, on a serialization failure or deadlock.
         DatabaseUnavailable: From ``db_errors``, on a lost or refused connection.
         KeyViolation: From ``db_errors``, when a written row violates a unique key of the table.
-        psycopg.Error: Any other database error, unchanged, among them an exclusion violation when the table's
-            versions would overlap.
+        psycopg.Error: Any other database error, unchanged.
 
     """
     t_table, first, last = _table(table), sql.Identifier(valid_from), sql.Identifier(valid_to)
@@ -292,11 +305,15 @@ async def versioned(
         if details
         else sql.SQL("FALSE")  # a key-only table has nothing that can change
     )
-    stale_query = sql.SQL(
-        "SELECT count(*) FROM {staged} AS s JOIN {table} AS t ON {same} WHERE t.{last} IS NULL AND t.{first} > %s"
-    ).format(staged=sql.Identifier(staged), table=t_table, same=same, last=last, first=first)
+    # a version reaching past the day before D was written by a later day's task: the staged row is older than it
+    later = sql.SQL("EXISTS (SELECT FROM {table} AS t WHERE {same} AND (t.{first} > %s OR t.{last} >= %s))").format(
+        table=t_table, same=same, first=first, last=last
+    )
+    stale_query = sql.SQL("SELECT count(*) FROM {staged} AS s WHERE {later}").format(
+        staged=sql.Identifier(staged), later=later
+    )
     with db_errors():
-        cursor = await conn.execute(stale_query, (day,))
+        cursor = await conn.execute(stale_query, (day, day))
         row = await cursor.fetchone()
     stale = int(row[0]) if row is not None else 0
     changed = 0
@@ -322,18 +339,23 @@ async def versioned(
         changed += await _changed(conn, close, (previous, day))
     if prune:
         source, params = _source(source_column, source_id)
+        missing = _missing(staged, key)
+        drop_today = sql.SQL(
+            "DELETE FROM {table} AS t WHERE {source} AND t.{last} IS NULL AND t.{first} = %s AND {missing}"
+        ).format(table=t_table, source=source, last=last, first=first, missing=missing)
+        changed += await _changed(conn, drop_today, (*params, day))
         close_missing = sql.SQL(
-            "UPDATE {table} AS t SET {last} = CASE WHEN t.{first} = %s THEN %s ELSE %s END "
-            "WHERE {source} AND t.{last} IS NULL AND t.{first} <= %s AND {missing}"
-        ).format(table=t_table, last=last, first=first, source=source, missing=_missing(staged, key))
-        changed += await _changed(conn, close_missing, (day, day, previous, *params, day))
+            "UPDATE {table} AS t SET {last} = %s WHERE {source} AND t.{last} IS NULL AND t.{first} < %s AND {missing}"
+        ).format(table=t_table, last=last, source=source, first=first, missing=missing)
+        changed += await _changed(conn, close_missing, (previous, *params, day))
     opening = (
         sql.SQL("COALESCE(s.{opens}, %s)").format(opens=sql.Identifier(opens_from)) if opens_from else sql.SQL("%s")
     )
     insert = sql.SQL(
         "INSERT INTO {table} ({cols}, {first}) SELECT {values}, "
         "CASE WHEN EXISTS (SELECT FROM {table} AS t WHERE {same}) THEN %s ELSE LEAST({opening}, %s) END "
-        "FROM {staged} AS s WHERE NOT EXISTS (SELECT FROM {table} AS t WHERE {same} AND t.{last} IS NULL)"
+        "FROM {staged} AS s WHERE NOT EXISTS (SELECT FROM {table} AS t WHERE {same} AND t.{last} IS NULL) "
+        "AND NOT {later}"
     ).format(
         table=t_table,
         cols=_names(columns),
@@ -343,8 +365,9 @@ async def versioned(
         opening=opening,
         staged=sql.Identifier(staged),
         last=last,
+        later=later,
     )
-    changed += await _changed(conn, insert, (day, day, day))
+    changed += await _changed(conn, insert, (day, day, day, day, day))
     return changed, stale
 
 

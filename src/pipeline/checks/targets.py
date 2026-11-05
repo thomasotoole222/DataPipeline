@@ -31,9 +31,12 @@ Private units:
     _check_names: Check that no column name appears more than once.
     _check_writer: Check that a writer fits the columns.
     _key: Return a writer's key, or None for a writer without one.
+    _day_kind: Return ``"date"`` for a ``date`` type and ``"key"`` for any other type.
+    _version_mismatches: List the ways a table does not fit a ``Versioned`` writer's day columns and version key.
 
 """
 
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -44,6 +47,7 @@ from typing import Annotated, Any, Final, Literal, TypeAliasType, TypeVar, Union
 from uuid import UUID
 
 import polars as pl
+from annotated_types import Ge, Gt, Le, Lt
 from pydantic import AwareDatetime, BaseModel
 from pydantic.fields import FieldInfo
 
@@ -59,7 +63,9 @@ COLUMN_PATTERN: Final = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 #: The Postgres type name of a ``timestamptz`` column, as ``format_type`` prints it.
 _TIMESTAMPTZ: Final = "timestamp with time zone"
-#: A ``Versioned`` writer's day column types: ``YYYYMMDD`` date keys of either integer width, or dates.
+#: The Postgres types a ``Versioned`` writer's day columns may have: ``integer`` or ``bigint`` (``YYYYMMDD`` date keys)
+#: or ``date``. ``_check_writer`` holds ``opens_from`` to them; ``_version_mismatches`` holds ``valid_from`` and
+#: ``valid_to`` to them. ``smallint`` is left out: it cannot hold a ``YYYYMMDD`` key.
 _VERSION_TYPES: Final = ("integer", "bigint", "date")
 #: The frame type and Postgres type of each scalar annotation a ``To`` field may have; ``Decimal`` is mapped apart,
 #: in ``_column_type``. A plain ``datetime`` is not mapped, only ``AwareDatetime``; ``UUID`` is a string in the frame.
@@ -74,9 +80,10 @@ _SCALARS: Final[dict[object, tuple[pl.DataType, str]]] = {
 #: The largest ``max_digits`` a loaded ``Decimal`` may have: the largest precision ``pl.Decimal`` holds.
 _MAX_DIGITS: Final = 38
 #: The frame type and Postgres type of an ``int`` field with a ``Width`` mark, by its bits; without one, ``bigint``.
+#: Its keys are also the widths ``Width.__post_init__`` accepts.
 _INT_WIDTHS: Final[dict[int, tuple[pl.DataType, str]]] = {32: (pl.Int32(), "integer"), 16: (pl.Int16(), "smallint")}
-#: The Postgres types an ``Update`` with ``missing="zero"`` can set to zero: an integer of any width or
-#: ``numeric(p,s)``. Used with ``fullmatch``.
+#: The Postgres types an ``Update`` with ``missing="zero"`` can set to zero: ``bigint``, ``integer``, ``smallint`` (the
+#: types ``_column_type`` gives an ``int``) or ``numeric(p,s)`` (a ``Decimal``). Used with ``fullmatch``.
 _NUMERIC: Final = re.compile(r"bigint|integer|smallint|numeric\(\d+,\d+\)")
 
 
@@ -100,8 +107,11 @@ class Width:
     """Field mark that loads an ``int`` field into a narrower integer column than the default ``bigint``.
 
     Used through ``pipeline.checks.record``'s ``Int32`` and ``Int16``, which carry it with the matching bounds so an
-    out-of-range value fails Validate instead of the load. ``__post_init__`` refuses any width but 32 and 16;
-    ``_column_type`` refuses the mark on a field that is not an ``int``.
+    out-of-range value fails Validate instead of the load. ``__post_init__`` refuses any width but 32 and 16 (the keys
+    of ``_INT_WIDTHS``). The mark takes effect only on a ``To`` field, where ``_column_type`` refuses it unless it is
+    the field's only ``Width``, the field is an ``int``, and the field's bounds lie within the width's range (so a
+    bare ``Width``, or one nested over an ``Int32``, cannot let a value through Validate that the column refuses). On
+    any other field it is ignored.
 
     Attributes:
         bits: 32 for an ``integer`` column, 16 for a ``smallint`` column.
@@ -236,8 +246,9 @@ class Versioned(Snapshot):
     ``opens_from`` is None or the value is null); an id whose open version's other columns equal the staged row is
     left alone; a changed id has its open version closed on D - 1 and a new one opened from D, unless the open version
     already started on D, which is overwritten in place; an id whose versions are all closed opens a new one from D;
-    an id whose open version starts after D is a stale observation, left alone and counted. With pruning, an open
-    version of the source whose id is not staged is closed on D - 1 (on D when it started on D). Nothing is deleted.
+    an id with a version that starts after D, or was closed on D or later, was written by a later day's task, so the
+    observation is stale: left alone and counted. With pruning, an open version of the source whose id is not staged
+    is closed on D - 1, or deleted when it started on D (the day's last observation wins). Nothing else is deleted.
 
     As a ``Snapshot`` subclass it shares ``Snapshot``'s rules wherever they test for ``Snapshot``: ``key`` is checked
     as a writer key (non-empty, distinct, not nullable, the source column included), no missing id is closed while
@@ -246,11 +257,12 @@ class Versioned(Snapshot):
 
     Attributes:
         key: As for ``Snapshot``: the columns that identify an id, the source column included when the table has one.
-        valid_from: The table column holding a version's first day; ``integer`` (``YYYYMMDD`` date keys) or ``date``,
-            not nullable, set by the writer only.
-        valid_to: The table column holding a version's last day, of ``valid_from``'s type, nullable (None while the
-            version is open), set by the writer only.
-        opens_from: A target column of ``valid_from``'s type dating a new id's first version, or None to open it on D.
+        valid_from: The table column holding a version's first day; ``integer`` or ``bigint`` (``YYYYMMDD`` date keys)
+            or ``date``, not nullable, set by the writer only.
+        valid_to: The table column holding a version's last day, of ``valid_from``'s kind (a date key of either
+            width, or a date), nullable (None while the version is open), set by the writer only.
+        opens_from: A target column of an ``int`` field without a 16-bit ``Width``, or of a ``date`` field, of
+            ``valid_from``'s kind, dating a new id's first version; or None to open it on D.
 
     """
 
@@ -259,7 +271,8 @@ class Versioned(Snapshot):
     opens_from: str | None = None  # a target column dating a new id's first version, or None for the observation day
 
 
-#: The writer of a target: how its frame is written to its table.
+#: The writer of a target: how its frame is written to its table. ``Versioned`` is a ``Snapshot`` subclass, so a
+#: ``match`` or ``isinstance`` test that must tell them apart tests ``Versioned`` first.
 type Writer = Upsert | ReplaceChildren | ReplacePartition | Snapshot | Versioned | Update
 
 
@@ -349,8 +362,9 @@ def build_target(model: type[BaseModel], table: str, writer: Writer, source_colu
     collects. Each ``Rows`` field gives a child whose target is rebuilt with the writer key's columns (inherited)
     before its own and ``inherited`` set to the key names. A child cannot have children of its own: its writer is
     ``ReplaceChildren``, for which ``_key`` gives no key, so its own build refused any ``Rows``. An ``Update`` parent
-    cannot have children: the row it updates may not exist, so its child rows would have no parent. The model's table
-    and its children's tables must all differ.
+    cannot have children: the row it updates may not exist, so its child rows would have no parent. A ``Versioned``
+    parent cannot either: its rows are versions, not one row per parent. The model's table and its children's tables
+    must all differ.
 
     Preconditions:
         None.
@@ -369,11 +383,13 @@ def build_target(model: type[BaseModel], table: str, writer: Writer, source_colu
             characters included); from ``_columns``, for a malformed ``To`` column or a ``Decimal`` precision or scale
             out of range; from ``_check_writer``, for a writer that does not fit the columns.
         TypeError: ``source_column`` is given with ``ReplaceChildren``; ``model`` is not complete; ``Rows`` is used with
-            a writer that has no key or with ``Update``; two targets load into one table; from ``_columns``, for a
-            misused mark (``Rows`` on a ``list`` without exactly one argument included), a type with no column type,
-            a part that contains itself, an unmarked union with a part among its members or a generic type alias
-            whose arguments cannot be substituted; from ``_check_names``, for a repeated column name in the model or
-            in a child; from ``_check_writer``, for a ``ReplaceChildren`` model with no column of its own.
+            a writer that has no key, with ``Versioned`` or with ``Update``; two targets load into one table; from
+            ``_columns``, for a misused mark (``Rows`` on a ``list`` without exactly one argument included, a
+            ``Width`` on a ``To`` field that is not an ``int``, is one of several or is unbounded for its width), a
+            type with no column type, a part that contains itself, an unmarked union with a part among its members or
+            a generic type alias whose arguments cannot be substituted; from ``_check_names``, for a repeated column
+            name in the model or in a child; from ``_check_writer``, for a ``ReplaceChildren`` model with no column of
+            its own.
 
     """
     name = model.__name__
@@ -675,7 +691,9 @@ def _column_type(where: str, annotation: Any, metadata: Sequence[object]) -> tup
     ``Decimal`` maps to ``pl.Decimal(p, s)`` and ``numeric(p,s)``, with ``p`` and ``s`` the last non-None
     ``max_digits`` and ``decimal_places`` found on the metadata items; ``p`` must lie from 1 to 38 (the precisions
     polars holds) and ``s`` from 0 to ``p``. An ``int`` with a ``Width`` mark maps to ``integer`` (32 bits) or
-    ``smallint`` (16 bits), the last mark found winning. Any other annotation is looked up in ``_SCALARS``.
+    ``smallint`` (16 bits) through ``_INT_WIDTHS``. The mark must be the field's only ``Width``, and the field's
+    numeric ``Ge``/``Gt`` and ``Le``/``Lt`` bounds must put its values within the width's range, as ``Int32`` and
+    ``Int16`` do, so every value Validate accepts fits the column. Any other annotation is looked up in ``_SCALARS``.
 
     Preconditions:
         None.
@@ -690,10 +708,33 @@ def _column_type(where: str, annotation: Any, metadata: Sequence[object]) -> tup
 
     Raises:
         TypeError: A ``Decimal`` lacks ``max_digits`` or ``decimal_places``; a ``Width`` mark is on a field that is
-            not an ``int``; or the annotation is not in ``_SCALARS`` (an unhashable annotation included).
+            not an ``int``, is one of several, or lacks a lower or upper bound within its range; or the annotation is
+            not in ``_SCALARS`` (an unhashable annotation included).
         ValueError: A ``Decimal``'s ``max_digits`` or ``decimal_places`` lies outside the ranges above.
 
     """
+    widths = [item.bits for item in metadata if isinstance(item, Width)]
+    if widths:
+        if annotation is not int:
+            raise TypeError(f"{where}: a Width mark is for an int field, not {annotation!r}")
+        if len(widths) > 1:
+            raise TypeError(f"{where}: a field takes one Width mark, got {len(widths)}")
+        bits = widths[0]
+        least, most = -(2 ** (bits - 1)), 2 ** (bits - 1) - 1
+        lows: list[int] = []
+        highs: list[int] = []
+        for item in metadata:  # only numeric bounds count; an int above Gt(n) is at least floor(n) + 1, and so on
+            if isinstance(item, Ge) and isinstance(item.ge, int | float):
+                lows.append(math.ceil(item.ge))
+            elif isinstance(item, Gt) and isinstance(item.gt, int | float):
+                lows.append(math.floor(item.gt) + 1)
+            elif isinstance(item, Le) and isinstance(item.le, int | float):
+                highs.append(math.floor(item.le))
+            elif isinstance(item, Lt) and isinstance(item.lt, int | float):
+                highs.append(math.ceil(item.lt) - 1)
+        if not lows or not highs or max(lows) < least or min(highs) > most:
+            raise TypeError(f"{where}: Width({bits}) needs bounds within {least} to {most}; use Int{bits}")
+        return _INT_WIDTHS[bits]
     if annotation is Decimal:
         found = {
             name: getattr(item, name)
@@ -710,11 +751,6 @@ def _column_type(where: str, annotation: Any, metadata: Sequence[object]) -> tup
                 f"max_digits, got {digits} and {places}"
             )
         return pl.Decimal(digits, places), f"numeric({digits},{places})"
-    widths = [item.bits for item in metadata if isinstance(item, Width)]
-    if widths and annotation is not int:
-        raise TypeError(f"{where}: a Width mark is for an int field, not {annotation!r}")
-    if widths:
-        return _INT_WIDTHS[widths[-1]]
     try:
         return _SCALARS[annotation]
     except (KeyError, TypeError) as err:  # TypeError: an unhashable annotation
@@ -750,9 +786,11 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
     A writer key must be non-empty, name distinct target columns that do not allow None, and include the source column
     when there is one. ``ReplacePartition`` needs its column to be a target column of type ``timestamptz`` or
     ``date`` that does not allow None. ``Versioned`` needs distinct ``valid_from`` and ``valid_to`` names that no field
-    loads into, and an ``opens_from`` that is a target column of an ``int`` or ``date`` field; it is matched before
+    loads into, and an ``opens_from`` that is a target column whose type is in ``_VERSION_TYPES`` (``bigint``,
+    ``integer`` or ``date``: an ``int`` field with no 16-bit ``Width``, or a ``date`` field); it is matched before
     ``Snapshot``, whose check it does not take. ``Snapshot`` refuses a column named ``removed_at``. ``Update`` needs a
-    column outside its key, and with ``missing="zero"`` every such column must be ``bigint`` or ``numeric(p,s)``.
+    column outside its key, and with ``missing="zero"`` every such column must match ``_NUMERIC`` (``bigint``,
+    ``integer``, ``smallint`` or ``numeric(p,s)``).
     ``ReplaceChildren`` needs at least one column: ``columns`` are the child's own, as ``build_target`` adds the
     inherited key columns only when it rebuilds the child target, and without one every list item would load as the
     same key-only row; its ``key`` is then checked as a writer key is, against those own columns. ``Upsert`` has no
@@ -867,7 +905,10 @@ def row_key(target: Target) -> tuple[str, ...] | None:
 
 
 def _day_kind(postgres: str) -> str:
-    """Return ``"date"`` for a ``date`` type and ``"key"`` for an integer ``YYYYMMDD`` date key of either width.
+    """Return ``"date"`` for a ``date`` type and ``"key"`` for any other type.
+
+    Meant for the types in ``_VERSION_TYPES``, where any type but ``date`` is an ``integer`` or ``bigint`` ``YYYYMMDD``
+    date key; any other type (``text``, say) also gives ``"key"``, and its callers report such a type on its own.
 
     Preconditions:
         None.
@@ -896,11 +937,14 @@ def _version_mismatches(target: Target, writer: Versioned, info: TableInfo) -> l
         writer: The target's ``Versioned`` writer.
         info: The table as the catalog describes it.
 
+    Each day column gets at most one of: missing, not in ``_VERSION_TYPES``, not writable. When both exist, the two
+    are compared by ``_day_kind`` (an ``integer`` and a ``bigint`` match), ``valid_from`` must be ``NOT NULL`` and
+    ``valid_to`` nullable, and ``opens_from``, when set, must be of their kind. Last, a unique key must be on exactly
+    ``writer.key`` and ``valid_from``, as ``mismatches`` requires for a row key: a narrower one would refuse versions
+    the writer may write, a wider one would let two versions of a key share a day.
+
     Returns:
-        One message per mismatch: ``valid_from`` or ``valid_to`` missing, not ``integer``, ``bigint`` or ``date``,
-        one a date key and the other a date, not writable, ``valid_from`` nullable or ``valid_to`` ``NOT NULL``;
-        ``opens_from`` a date key where the days are dates or the reverse; no unique key that includes
-        ``valid_from`` and lies within ``writer.key`` and ``valid_from``. ``[]`` when it fits.
+        One message per mismatch, in the order above; ``[]`` when it fits.
 
     Raises:
         Nothing.
@@ -925,11 +969,9 @@ def _version_mismatches(target: Target, writer: Versioned, info: TableInfo) -> l
         opens = next((c for c in target.columns if c.name == writer.opens_from), None)
         if opens is not None and _day_kind(opens.postgres) != _day_kind(first.type):
             found.append(f"{table}.{writer.opens_from} must be a date key or a date as {writer.valid_from} is")
-    allowed = frozenset((*writer.key, writer.valid_from))
-    if not any(writer.valid_from in unique and unique <= allowed for unique in info.unique_keys):
-        found.append(
-            f"{table} has no unique key on its versions (within {', '.join(sorted(allowed))}, with {writer.valid_from})"
-        )
+    versions = frozenset((*writer.key, writer.valid_from))
+    if versions not in info.unique_keys:
+        found.append(f"{table} has no unique key on exactly {', '.join(sorted(versions))}")
     return found
 
 
@@ -943,10 +985,10 @@ def mismatches(target: Target, info: TableInfo | None) -> list[str]:
     that is ``NOT NULL`` with no default and not a target column gets a message, except ``removed_at`` for a
     ``Snapshot`` and ``valid_from`` for a ``Versioned``. A row key (``row_key``) needs a unique key on exactly its
     columns, and a ``Snapshot`` needs a nullable ``timestamptz`` ``removed_at`` that is writable, since the writer sets
-    it. A ``Versioned`` table instead holds several versions per key, so it needs a unique key that includes
-    ``valid_from`` and lies within the key and ``valid_from``; ``valid_from`` and ``valid_to`` of one type, ``integer``
-    or ``date``, writable, ``valid_from`` ``NOT NULL`` and ``valid_to`` nullable; and ``opens_from``, when set, of that
-    type. Only ``target.table`` is
+    it. A ``Versioned`` table instead holds several versions per key, so ``_version_mismatches`` gives its checks:
+    ``valid_from`` and ``valid_to`` of one kind (``integer`` or ``bigint`` date keys, mixed widths allowed, or both
+    ``date``), writable, ``valid_from`` ``NOT NULL`` and ``valid_to`` nullable; ``opens_from``, when set, of that kind;
+    and a unique key on exactly the key and ``valid_from``. Only ``target.table`` is
     compared; ``target.children`` are not visited, so each child target is checked by its own call.
 
     Preconditions:

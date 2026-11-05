@@ -3,8 +3,8 @@
 Public API:
     BOOL_VALUES: The only values a boolean field accepts, each mapped to its ``bool``.
     Bool: A boolean field's type: its input mapped through ``BOOL_VALUES``, then checked as a strict ``bool``.
-    Int32: An ``int`` field loaded into an ``integer`` column: -2**31 to 2**31 - 1, checked at Validate.
-    Int16: An ``int`` field loaded into a ``smallint`` column: -2**15 to 2**15 - 1, checked at Validate.
+    Int32: An ``int`` field bounded to -2**31 to 2**31 - 1 and marked ``Width(32)``, so it loads into ``integer``.
+    Int16: An ``int`` field bounded to -2**15 to 2**15 - 1 and marked ``Width(16)``, so it loads into ``smallint``.
     Part: Frozen pydantic model that keeps unknown fields; the base for nested parts of a record.
     Record: A ``Part`` whose subclasses must declare ``record_key`` and ``record_version``, checked at class creation;
         each key field must be required, have a type defined when the model is declared, not accept ``None`` and have
@@ -22,7 +22,8 @@ Private units:
     _annotated: Return the field's type annotated with its own metadata, as a key field's form is checked.
     _allows_none: Return whether a field accepts ``None``.
     _key_refusal: Return why a type form is refused for a key field, or ``None`` when it is allowed.
-    _declarative: Return whether a metadata item is a declarative constraint or mark, which a key field may carry.
+    _declarative: Return whether a metadata item is a declarative constraint or mark (``To``, ``Width``), which a key
+        field may carry.
     _key_model: Return a model of only a Record's ``record_key`` fields, built once per record model.
     _check_table_key: Check that a Record's writer key is its source column plus its ``record_key`` columns.
 """
@@ -119,11 +120,16 @@ def _to_bool(value: object) -> object:
 #: A boolean field: mapped through BOOL_VALUES, then checked strictly.
 Bool = Annotated[bool, BeforeValidator(_to_bool), Strict()]
 
-#: An int field loaded into an ``integer`` column (Postgres ``int4``), e.g. a ``YYYYMMDD`` date key. A value outside
-#: the column's range fails the field's bounds at Validate, so the record is held rather than the load failing.
+#: An int field loaded into an ``integer`` column (Postgres ``int4``), e.g. a ``YYYYMMDD`` date key. ``Ge`` and ``Le``
+#: bound it to the column's range, so a value outside it fails model validation in Validate and the record is held
+#: rather than the load failing; ``Width(32)`` makes ``_column_type`` (checks.targets) give the column ``integer``.
+#: Both are declarative, so an Int32 may be a key field.
 Int32 = Annotated[int, Ge(-(2**31)), Le(2**31 - 1), Width(32)]
 
 #: An int field loaded into a ``smallint`` column (Postgres ``int2``), e.g. a coded status or an ``HHMM`` time key.
+#: ``Ge`` and ``Le`` bound it to the column's range, so a value outside it fails model validation in Validate and the
+#: record is held rather than the load failing; ``Width(16)`` makes ``_column_type`` (checks.targets) give the column
+#: ``smallint``. Both are declarative, so an Int16 may be a key field.
 Int16 = Annotated[int, Ge(-(2**15)), Le(2**15 - 1), Width(16)]
 
 
@@ -545,16 +551,17 @@ def _declarative(item: object) -> bool:
     string forms of dates, UUIDs and decimals, so the key could not be read.
 
     Allowed: an ``annotated_types`` constraint (``BaseMetadata``: ``MinLen``, ``Ge`` and Pydantic's own, such as
-    the general metadata ``Field(...)`` leaves), Pydantic's ``AllowInfNan``, a group of them
+    the general metadata ``Field(...)`` leaves), Pydantic's ``AllowInfNan``, ``Strict(False)``, a group of them
     (``GroupedMetadata``: ``StringConstraints``, ``Interval``) whose items are each allowed, a ``FieldInfo``
-    (``Field(...)`` inside an ``Annotated`` that is not the field's own) whose metadata items are each allowed, and a
-    ``To`` mark. Anything else is refused: ``Strict(True)`` (``Field(strict=True)``, ``StrictStr``, ...),
+    (``Field(...)`` inside an ``Annotated`` that is not the field's own) whose metadata items are each allowed, a
+    ``To`` mark and a ``Width`` mark (so ``Int32`` and ``Int16`` keys are allowed; Pydantic ignores the mark when it
+    validates). Anything else is refused: ``Strict(True)`` (``Field(strict=True)``, ``StrictStr``, ...),
     ``annotated_types.Predicate``, which runs code, and every validator (``AfterValidator``, ``BeforeValidator``,
-    ``WrapValidator``, ``PlainValidator``) among them. The test is
-    ``isinstance``, so an instance of any subclass of ``BaseMetadata``, ``AllowInfNan``, ``GroupedMetadata`` or ``To``
-    is allowed, including one whose class defines ``__get_pydantic_core_schema__`` and so runs code of its own;
-    ``key_of`` reads the key from the payload with ``_key_model`` alone, so such an item cannot give a failed copy and
-    a parsed copy of one payload different keys.
+    ``WrapValidator``, ``PlainValidator``) among them. The test is ``isinstance``, so an instance of any subclass of
+    ``BaseMetadata``, ``AllowInfNan``, ``GroupedMetadata``, ``To`` or ``Width`` is allowed, including one whose
+    class defines ``__get_pydantic_core_schema__`` and so runs code of its own; ``key_of`` reads the key from the
+    payload with ``_key_model`` alone, so such an item cannot give a failed copy and a parsed copy of one payload
+    different keys.
 
     Preconditions:
         None.

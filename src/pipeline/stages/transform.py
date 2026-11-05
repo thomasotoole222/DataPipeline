@@ -29,10 +29,14 @@ from pipeline.errors import Overflow
 #: rather than rounding; ``_fits`` treats that as a value that does not fit.
 _EXACT: Final = Context(prec=MAX_PREC, Emax=MAX_EMAX, Emin=MIN_EMIN)
 
-#: The first and last instants Python's ``datetime`` can hold in UTC, as ``frame.iter_rows()`` in
-#: ``writers.staging.copy_in`` converts each value back to one; ``_fits`` refuses an aware ``datetime`` outside them.
-#: The bits of each integer frame type an ``int`` may load into: bigint, integer and smallint.
+#: The width in bits of each integer frame type an ``int`` may load into, by the class of the frame type: ``pl.Int64``
+#: (``bigint``), ``pl.Int32`` (``integer``) and ``pl.Int16`` (``smallint``), the only integer types ``checks.targets``
+#: builds. ``_fits`` looks up ``type(column.polars)`` and refuses an ``int`` for a column whose type is not here.
 _INT_BITS: Final[dict[type[pl.DataType], int]] = {pl.Int64: 64, pl.Int32: 32, pl.Int16: 16}
+#: ``_FIRST_UTC`` and ``_LAST_UTC``: the first and last instants an aware Python ``datetime`` can hold in UTC
+#: (0001-01-01T00:00 and 9999-12-31T23:59:59.999999). ``frame.iter_rows()`` in ``writers.staging.copy_in`` converts
+#: each frame value back to such a ``datetime``, so ``_fits`` refuses an aware ``datetime`` whose instant lies outside
+#: them, such as ``0001-01-01T00:00+05:00``, though its local fields are in range.
 _FIRST_UTC: Final = datetime.min.replace(tzinfo=UTC)
 _LAST_UTC: Final = datetime.max.replace(tzinfo=UTC)
 
@@ -254,11 +258,13 @@ def frame_of(target: Target, rows: Sequence[Mapping[str, object]]) -> pl.DataFra
 def _fitted(target: Target, row: Mapping[str, object]) -> dict[str, object]:
     """Check one row against the target's columns and return it with each ``Decimal`` rescaled to its column.
 
-    A value fits when it is ``None`` in a nullable column, or ``_fits`` accepts it. Keys of the row that are not column
-    names are left out. Each ``Decimal`` is rescaled to its column's scale with ``quantize`` in ``_EXACT``, so polars
-    gets at most the column's precision in digits whatever the value's own digits and exponent (``Decimal("0E+39")``
-    and ``Decimal("0E-45")`` load into ``numeric(10,2)`` as ``0.00``); the rescaling is exact, as ``_fits`` accepted
-    the value.
+    A value fits when it is ``None`` in a nullable column, or is not ``None`` and ``_fits`` accepts it; so ``None`` in
+    a ``NOT NULL`` column, and a value of the wrong type for its column, are refused as ``Overflow`` too. Columns are
+    checked in column order and the first refused one raises. Keys of the row that are not column names are left out.
+    Each ``Decimal`` (only ever in a Decimal column, as ``_fits`` refuses one elsewhere) is rescaled to its column's
+    scale with ``quantize`` in ``_EXACT``, so polars gets at most the column's precision in digits whatever the value's
+    own digits and exponent (``Decimal("0E+39")`` and ``Decimal("0E-45")`` load into ``numeric(10,2)`` as ``0.00``);
+    the rescaling is exact, as ``_fits`` accepted the value.
 
     Preconditions:
         None.
@@ -268,13 +274,14 @@ def _fitted(target: Target, row: Mapping[str, object]) -> dict[str, object]:
         row: One row, as produced by ``_rows``.
 
     Returns:
-        A new dict of the row's value for each column, in column order.
+        A new dict of the row's value for each column, in column order; ``row`` is not changed.
 
     Raises:
         KeyError: When the row lacks a column's name.
-        Overflow: When a value does not fit its column (an ``int`` outside its column's integer range and a
-            ``Decimal`` whose exponent is near ``MAX_EMAX`` included); the message names the table, the column and its
-            type, never the value.
+        Overflow: When a value does not fit its column: ``None`` in a ``NOT NULL`` column, a value of a type the
+            column's frame type does not take, an ``int`` outside its column's integer range, or a ``Decimal`` too
+            wide or too fine for its column or whose exponent is near ``MAX_EMAX``. The message names the table, the
+            column and its Postgres type (followed by ``NOT NULL`` when not nullable), never the value.
 
     """
     fitted: dict[str, object] = {}
@@ -336,38 +343,42 @@ def _is_uuid(text: str) -> bool:
 
 
 def _fits(column: Column, value: object) -> bool:
-    """Return whether a non-``None`` value can be stored in the column's polars type.
+    """Return whether a non-``None`` value can be stored in the column's frame type without polars changing it.
 
-    ``bool`` is matched before ``int`` and ``datetime`` before ``date``, since each is a subclass of the next. A
-    ``Decimal`` is scaled by the column's scale in ``_EXACT``, and its magnitude is then taken with ``copy_abs``, which
-    is exact and never rounds or traps.
+    ``bool`` is matched before ``int`` and ``datetime`` before ``date``, since each is a subclass of the next, so a
+    ``bool`` never fits an integer column and a ``datetime`` never fits a Date column. An ``int``'s range comes from
+    ``_INT_BITS``. A ``str`` is storable when ``storable_text`` returns it unchanged. An aware ``datetime`` is compared
+    with ``_FIRST_UTC`` and ``_LAST_UTC`` as an instant, whatever its offset. A ``Decimal`` is scaled by the column's
+    scale in ``_EXACT``, and its magnitude is then taken with ``copy_abs``, which is exact and never rounds or traps.
 
     Preconditions:
-        ``column.polars`` of a Decimal column has a precision and scale: ``checks.targets`` always builds
-        ``pl.Decimal(p, s)`` and refuses a Decimal without ``max_digits`` and ``decimal_places``.
+        ``column.polars`` is a frame type instance as ``checks.targets`` builds it, and a Decimal column's has a
+        precision and scale: ``checks.targets`` always builds ``pl.Decimal(p, s)`` and refuses a Decimal without
+        ``max_digits`` and ``decimal_places``.
 
     Args:
         column: The target column; ``column.polars`` is read, and ``column.postgres`` for a ``str``.
-        value: The value to check.
+        value: The value to check; never ``None`` (``_fitted`` handles ``None`` itself).
 
     Returns:
-        True when the value's type matches the column's polars type and the value is in range:
+        True when the value's type matches the column's frame type and the value is in range:
 
         - a ``bool`` in a Boolean column;
-        - an ``int`` in an Int64, Int32 or Int16 column within that width's range (-2**63 to 2**63 - 1, -2**31 to
-          2**31 - 1, -2**15 to 2**15 - 1: Postgres ``bigint``, ``integer`` and ``smallint``);
+        - an ``int`` (not a ``bool``) in an Int64, Int32 or Int16 column within that width's range (-2**63 to
+          2**63 - 1, -2**31 to 2**31 - 1, -2**15 to 2**15 - 1: Postgres ``bigint``, ``integer`` and ``smallint``);
         - a ``str`` Postgres ``text`` can store (no NUL and no surrogate, the rule of ``db.pool.storable_text``) in a
           String column, and, when the column is ``uuid`` (its frame type is String), also a uuid text form
           (``_is_uuid``);
-        - an aware ``datetime`` whose UTC instant lies in years 1 to 9999 in a Datetime column;
-        - a ``date`` in a Date column;
+        - an aware ``datetime`` whose UTC instant lies from ``_FIRST_UTC`` to ``_LAST_UTC`` in a Datetime column;
+        - a ``date`` that is not a ``datetime`` in a Date column;
         - a finite ``Decimal`` in a Decimal column that it fills without rounding and whose exact magnitude, scaled
           by the column's scale, is below ``10**precision``.
 
-        False for everything else, including a ``Decimal`` whose scaling or integral check raises an
-        ``ArithmeticError`` (``decimal.Overflow`` when its exponent plus the column's scale passes ``MAX_EMAX``), an
-        aware ``0001-01-01T00:00+05:00`` (year 0 in UTC), and a ``str`` holding a NUL character or ``"abc"`` in a
-        ``uuid`` column, so these are refused here rather than failing at load.
+        False for everything else, including a naive ``datetime``, a NaN or infinite ``Decimal``, a ``Decimal`` whose
+        scaling or integral check raises an ``ArithmeticError`` (``decimal.Overflow`` when its exponent plus the
+        column's scale passes ``MAX_EMAX``), an aware ``0001-01-01T00:00+05:00`` (year 0 in UTC), and a ``str``
+        holding a NUL character or ``"abc"`` in a ``uuid`` column, so these are refused here rather than failing at
+        load.
 
     Raises:
         Nothing.

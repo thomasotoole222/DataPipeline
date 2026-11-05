@@ -83,7 +83,7 @@ async def pool() -> AsyncIterator[Pool]:
             "CREATE TABLE t_ver.product (source_id uuid NOT NULL, product_id text NOT NULL, title text NOT NULL, "
             "status smallint, created_date_key integer, valid_from_key integer NOT NULL, valid_to_key integer, "
             "is_current boolean GENERATED ALWAYS AS (valid_to_key IS NULL) STORED, "
-            "PRIMARY KEY (product_id, valid_from_key), "
+            "PRIMARY KEY (source_id, product_id, valid_from_key), "
             "EXCLUDE USING gist (product_id WITH =, int4range(valid_from_key, valid_to_key, '[]') WITH &&))"
         )
     try:
@@ -242,6 +242,45 @@ async def test_an_observation_older_than_the_open_version_is_left_alone(pool: Po
     await run(pool, instruments, date(2026, 11, 10), [product("p1", "Lash")])
     await run(pool, instruments, date(2026, 11, 8), [product("p1", "Lash Old")])
     assert await versions(pool) == [("p1", "Lash", 20261110, None, True)]
+
+
+async def test_an_id_gone_and_back_on_one_day_keeps_only_the_days_last_observation(
+    pool: Pool, instruments: Instruments
+) -> None:
+    """Check a version opened today and then missing today is dropped, so the id can come back the same day."""
+    day = date(2026, 11, 10)
+    await run(pool, instruments, date(2026, 11, 4), [product("p1", "Lash", 20260301), product("p2", "Brow")])
+    await run(pool, instruments, day, [product("p1", "Lash Pro", 20260301), product("p2", "Brow")])
+    await run(pool, instruments, day, [product("p2", "Brow"), product("p3", "Tint")])  # p1 gone, p3 new
+    assert await versions(pool) == [
+        ("p1", "Lash", 20260301, 20261109, False),
+        ("p2", "Brow", 20261104, None, True),
+        ("p3", "Tint", 20261110, None, True),
+    ]
+    await run(pool, instruments, day, [product("p1", "Lash Max", 20260301), product("p2", "Brow")])  # p3 gone
+    assert await versions(pool) == [
+        ("p1", "Lash", 20260301, 20261109, False),
+        ("p1", "Lash Max", 20261110, None, True),
+        ("p2", "Brow", 20261104, None, True),
+    ]
+
+
+async def test_an_observation_older_than_a_closed_version_is_left_alone(pool: Pool, instruments: Instruments) -> None:
+    """Check a stale observation of an id with no open version, closed by later days' tasks, rewrites no history."""
+    await run(pool, instruments, date(2026, 11, 4), [product("p1", "Lash"), product("p2", "Brow")])
+    await run(pool, instruments, date(2026, 11, 10), [product("p1", "Lash Pro"), product("p2", "Brow")])
+    await run(pool, instruments, date(2026, 11, 12), [product("p2", "Brow")])  # p1 closed on the 11th
+    expected = [
+        ("p1", "Lash", 20261104, 20261109, False),
+        ("p1", "Lash Pro", 20261110, 20261111, False),
+        ("p2", "Brow", 20261104, None, True),
+    ]
+    assert await versions(pool) == expected
+    loaded = await run(pool, instruments, date(2026, 11, 8), [product("p1", "Lash Old"), product("p2", "Brow")])
+    assert loaded.changed == {"t_ver.product": 0}
+    assert await versions(pool) == expected
+    await run(pool, instruments, date(2026, 11, 11), [product("p1", "Lash Pro"), product("p2", "Brow")])  # closed on D
+    assert await versions(pool) == expected
 
 
 async def test_an_empty_response_is_refused_when_pruning(pool: Pool, instruments: Instruments) -> None:

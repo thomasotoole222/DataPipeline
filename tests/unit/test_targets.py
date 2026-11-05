@@ -1,9 +1,12 @@
 """Tests for declaring a model's target table with class keywords."""
 
 from datetime import date
+from decimal import Decimal
 from typing import Annotated, ClassVar
 
 import pytest
+from annotated_types import Ge, Gt, Le, Lt
+from pydantic import Field
 
 from pipeline.checks.record import Int16, Int32, Part, Record
 from pipeline.checks.targets import (
@@ -265,7 +268,9 @@ def _sku_table(**changes: TableColumn | None) -> TableInfo:
         else:
             columns[name] = column
     return TableInfo(
-        table="cipher.dim_sku", columns=columns, unique_keys=frozenset({frozenset({"sku", "valid_from_key"})})
+        table="cipher.dim_sku",
+        columns=columns,
+        unique_keys=frozenset({frozenset({"source_id", "sku", "valid_from_key"})}),
     )
 
 
@@ -338,12 +343,21 @@ def test_versioned_table_mismatches(changes: dict[str, TableColumn | None], mess
     assert any(message in found for found in mismatches(target_of(Sku), _sku_table(**changes)))
 
 
-def test_versioned_table_needs_a_unique_key_on_its_versions() -> None:
-    """Check a table whose only unique key is the id (one row per id) is refused: versions need their first day."""
+@pytest.mark.parametrize(
+    "unique",
+    [
+        frozenset({"source_id", "sku"}),  # one row per id: versions need their first day
+        frozenset({"sku", "valid_from_key"}),  # narrower: refuses two sources' versions of one id on a day
+        frozenset({"valid_from_key"}),  # narrower still: refuses two new ids opened on one day
+        frozenset({"source_id", "sku", "title", "valid_from_key"}),  # wider: lets two versions of a key share a day
+    ],
+)
+def test_versioned_table_needs_a_unique_key_on_exactly_its_versions(unique: frozenset[str]) -> None:
+    """Check a table is refused unless a unique key is on exactly the writer key and valid_from."""
     info = _sku_table()
-    narrow = TableInfo(table=info.table, columns=info.columns, unique_keys=frozenset({frozenset({"sku"})}))
-    assert mismatches(target_of(Sku), narrow) == [
-        "cipher.dim_sku has no unique key on its versions (within sku, source_id, valid_from_key, with valid_from_key)"
+    other = TableInfo(table=info.table, columns=info.columns, unique_keys=frozenset({unique}))
+    assert mismatches(target_of(Sku), other) == [
+        "cipher.dim_sku has no unique key on exactly sku, source_id, valid_from_key"
     ]
 
 
@@ -379,6 +393,52 @@ def test_int32_bounds_hold_an_out_of_range_value() -> None:
     assert Key.model_validate({"day": 2**31 - 1}).day == 2**31 - 1
     with pytest.raises(ValueError, match="less than or equal to 2147483647"):
         Key.model_validate({"day": 2**31})
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("Annotated[str, To('n'), Width(32)]", "a Width mark is for an int field"),
+        ("Annotated[Decimal, Field(max_digits=10, decimal_places=2), Width(32), To('n')]",
+         "a Width mark is for an int field"),
+        ("Annotated[int, Width(16), To('n')]", "Width\\(16\\) needs bounds within -32768 to 32767; use Int16"),
+        ("Annotated[int, Ge(0), Width(16), To('n')]", "Width\\(16\\) needs bounds"),
+        ("Annotated[Int32, Width(16), To('n')]", "a field takes one Width mark, got 2"),
+        ("Annotated[int, Ge(-(2**31)), Le(2**31), Width(32), To('n')]", "Width\\(32\\) needs bounds"),
+        ("Annotated[int, Gt(-(2**15) - 2), Lt(2**15), Width(16), To('n')]", "Width\\(16\\) needs bounds"),
+    ],
+)  # fmt: skip
+def test_width_needs_one_mark_on_an_int_bounded_within_its_width(field: str, message: str) -> None:
+    """Check a Width mark is refused off an int, beside another Width, or with bounds wider than the column's range."""
+    code = (
+        "class Bad(Record, table='cipher.bad', writer=Upsert(('source_id', 'code'))):\n"
+        "    record_key: ClassVar[tuple[str, ...]] = ('id',)\n"
+        "    record_version: ClassVar[int] = 1\n"
+        "    id: Annotated[str, To('code')]\n"
+        f"    n: {field}\n"
+    )
+    names = {
+        "Annotated": Annotated, "ClassVar": ClassVar, "Decimal": Decimal, "Field": Field, "Ge": Ge, "Gt": Gt,
+        "Int32": Int32, "Le": Le, "Lt": Lt, "Record": Record, "To": To, "Upsert": Upsert, "Width": Width,
+    }  # fmt: skip
+    with pytest.raises(TypeError, match=message):
+        exec(code, names)  # noqa: S102
+
+
+def test_width_accepts_bounds_narrower_than_its_width() -> None:
+    """Check an int bounded inside the width's range, such as a non-negative Int16, loads into the narrow column."""
+
+    class Coded(Record, table="cipher.coded", writer=Upsert(("source_id", "code"))):
+        record_key: ClassVar[tuple[str, ...]] = ("id",)
+        record_version: ClassVar[int] = 1
+
+        id: Annotated[str, To("code")]
+        status: Annotated[Int16, Ge(0), To("status")]
+        hour: Annotated[int, Gt(-1), Lt(24), Width(16), To("hour")]
+
+    found = {column.name: column.postgres for column in target_of(Coded).columns}
+    assert found["status"] == "smallint"
+    assert found["hour"] == "smallint"
 
 
 def test_width_mark_refusals() -> None:

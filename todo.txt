@@ -92,3 +92,19 @@ change. Fix one if integration testing or production shows it matters.
     access_token keyword. Stage 11 says an account-wide endpoint also returns 36009004 when sent a shop_cipher, so
     mapping it to TokenRejected for every endpoint would block those.
     Fix: decide a per-endpoint mapping later.
+
+Versioned writer and integer widths
+-----------------------------------
+Found by the Versioned writer review round, 2026-11-05, and left open on purpose. Fix one if integration testing or
+production shows it matters.
+
+16. stages.transform._fitted: a None in a NOT NULL column (a computed field returning None despite a non-optional
+    annotation, or frame_of given such a row) raises Overflow, so the record is quarantined under the Overflow rule
+    rather than one for a missing value. The message ("does not fit bigint NOT NULL") is still accurate.
+    Fix: raise a separate rule for None in a NOT NULL column, if quarantine counts need to tell the two apart.
+
+17. writers.sql.versioned: a late task with prune (observation day D, committed after a later day's task) still
+    closes on D - 1, or drops, the open versions of keys missing from its stage, even when a later day's task saw
+    those keys present. Staleness is decided per staged key, so the writer cannot tell. Retries land within the
+    same day in practice, so this needs a task that sat queued past midnight in the job's zone.
+    Fix: skip the prune when any open version of the source starts after D, and count it as stale.

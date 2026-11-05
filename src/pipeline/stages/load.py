@@ -104,9 +104,12 @@ async def load(
     children are safe without ``prune``, because ``sql.replace_children`` deletes only under parents in the staged
     parent table. Once every write is done, the ``Loaded`` result is built and passed to ``on_loaded`` while the
     transaction is still open, so a success report written in the same transaction can count it. Any error rolls the
-    whole transaction back. The metrics run only after commit: for each written table, ``sent`` is added to
-    ``instruments.rows`` with ``stage="written"`` and ``changed`` with ``stage="changed"``; for each skipped table, its
-    frame height is added with ``stage="skipped"`` and a warning says it was not written because records are held.
+    whole transaction back. A ``Versioned`` target's observation day is ``task.claimed_at``'s date in ``zone``,
+    computed before the transaction opens. The metrics run only after commit: for each written table, ``sent`` is
+    added to ``instruments.rows`` with ``stage="written"`` and ``changed`` with ``stage="changed"``; for each written
+    table whose ``Versioned`` writer left stale keys alone (keys with a version a later day's task wrote), their
+    count is added with ``stage="stale"`` and a warning gives it; for each skipped table, its frame height
+    is added with ``stage="skipped"`` and a warning says it was not written because records are held.
     When records were held, every ``Snapshot`` and ``Update(missing="zero")`` target is left unpruned: for each,
     ``held`` is added with ``stage="prune_skipped"`` and a warning is logged. The records held here are added with
     ``stage="quarantined"``, and a warning per rule gives their count, never their keys.
@@ -145,7 +148,8 @@ async def load(
             ``psycopg.Error`` from the writes instead.
         NothingLoaded: When pruning and a ``Snapshot`` or ``Update(missing="zero")`` target's frame has no rows.
         ValueError: From ``_write``, for a ``ReplacePartition`` target with no usable frame or with a row outside the
-            frame's bounds.
+            frame's bounds, or for a ``Versioned`` target when ``zone`` is ``None``; raised inside the transaction, so
+            the hold and any earlier writes roll back.
         TypeError: From ``_write`` (``TimeFrame.dates``), for a date partition when ``frame.zone`` is not a ``tzinfo``.
         OverflowError: From ``_write`` (``TimeFrame.dates``), for a date partition whose bounds leave the ``datetime``
             range in ``frame.zone``.
@@ -299,9 +303,12 @@ async def _write(
 
     The frame is copied in with each target column's Postgres type. The task's source is passed only when the target
     has a source column. Each writer calls its ``sql`` function: ``Upsert``, ``ReplaceChildren``,
-    ``ReplacePartition``, ``Versioned`` (matched before ``Snapshot``, its base, with ``prune`` and the observation day
-    in the type of its ``valid_from`` column, read from the catalog), ``Snapshot`` (with ``prune``) and ``Update``
-    (with its ``missing`` and ``prune``). For
+    ``ReplacePartition``, ``Versioned``, ``Snapshot`` (with ``prune``) and ``Update`` (with its ``missing`` and
+    ``prune``). ``Versioned`` is matched before ``Snapshot``, its base. Its ``valid_from`` column is not a target
+    column, so its type is read live from the catalog with ``table_info`` on every call (one extra query); ``observed``
+    and the day before it are passed to ``sql.versioned`` in that type (``_day_value``), with ``prune``. When the
+    table or the column is missing from the catalog, the type falls back to ``"date"``; that is reachable only for a
+    table altered after ``_columns_checked`` cached its target, and the ``sql`` writer then fails. For
     ``ReplacePartition``, a ``date`` column is bounded by ``frame.dates`` and a timestamptz column by ``frame.start``
     and ``frame.end``, and no row's partition value may lie outside ``[start, end)``; both are checked before the
     frame is staged. A null partition value is not counted as outside. The column lookup always finds the column,
@@ -311,7 +318,8 @@ async def _write(
         ``conn`` is inside a transaction (``copy_in`` checks this). For ``ReplaceChildren``, ``parents`` has
         ``target`` (``load`` ensures this when the parent is in the frames before the child). For
         ``ReplacePartition``, the partition column has no nulls (``_check_writer`` makes it non-nullable and
-        ``frame_of`` refuses ``None`` in a non-nullable column).
+        ``frame_of`` refuses ``None`` in a non-nullable column). For ``Versioned``, ``valid_from`` is ``integer``,
+        ``bigint`` or ``date`` (``mismatches``, run by ``_columns_checked`` before the writes).
 
     Args:
         conn: Connection inside the load transaction.
@@ -321,7 +329,8 @@ async def _write(
         parents: Staged table of each child target's parent, keyed by the child target.
         frame: The task's time frame, or ``None``; read only for ``ReplacePartition``.
         prune: Passed to ``sql.snapshot`` and ``sql.update``.
-        observed: The task's observation day in the job's zone, for a ``Versioned`` target; None otherwise.
+        observed: The task's observation day in the job's zone, required for a ``Versioned`` target; ``None``, the
+            default, otherwise.
 
     Returns:
         The staged table's name, the count the ``sql`` writer returned, and the stale versions a ``Versioned``
@@ -330,8 +339,10 @@ async def _write(
     Raises:
         ValueError: For ``ReplacePartition`` when ``frame`` is ``None``, when the column is a ``date`` and ``frame`` is
             not whole local days in ``frame.zone``, or when a row's partition value lies outside ``[start, end)``
-            (naming the table, the column, the number of such rows and the bounds); from the ``sql`` writers for a
-            malformed table name (unreachable: ``build_target`` checks ``target.table`` against ``TABLE_PATTERN``).
+            (naming the table, the column, the number of such rows and the bounds); for ``Versioned`` when
+            ``observed`` is ``None``, before any catalog read (the frame is already staged); from the ``sql``
+            writers for a malformed table name (unreachable: ``build_target`` checks ``target.table`` against
+            ``TABLE_PATTERN``).
         TypeError: From ``TimeFrame.dates``, for a date column when ``frame.zone`` is not a ``tzinfo``.
         OverflowError: From ``TimeFrame.dates``, for a date column when a bound in ``frame.zone`` leaves the
             ``datetime`` range.
@@ -339,7 +350,8 @@ async def _write(
         RuntimeError: From ``copy_in``, when ``conn`` is not inside a transaction.
         DatabaseConflict: From ``db_errors`` in the callees, on a serialization failure or deadlock.
         DatabaseUnavailable: From ``db_errors`` in the callees, on a lost or refused connection.
-        psycopg.Error: Any other database error from the callees, unchanged.
+        KeyViolation: From ``db_errors`` in the callees, when a written row violates a unique key of its table.
+        psycopg.Error: Any other database error from the callees (``table_info`` included), unchanged.
 
     """
     table, columns = target.table, [column.name for column in target.columns]
@@ -398,17 +410,20 @@ async def _write(
 
 
 def _day_value(day: date, column_type: str) -> date | int:
-    """Return a day in a ``Versioned`` writer's column type: a ``YYYYMMDD`` integer, or the date itself.
+    """Return a day in the type of a ``Versioned`` table's ``valid_from`` column: a ``YYYYMMDD`` integer or the date.
+
+    Any type other than ``"integer"`` or ``"bigint"`` returns the date unchanged; ``mismatches`` limits
+    ``valid_from`` to those two and ``"date"``. Every ``YYYYMMDD`` value (at most 99991231) fits an ``integer``.
 
     Preconditions:
         None.
 
     Args:
-        day: The day.
-        column_type: The column's type as the catalog gives it; ``"integer"`` or ``"bigint"`` for date keys.
+        day: The day to convert.
+        column_type: The column's type as ``table_info`` gives it (``format_type``), e.g. ``"integer"`` or ``"date"``.
 
     Returns:
-        ``year * 10000 + month * 100 + day`` for ``"integer"`` or ``"bigint"``, else ``day``.
+        ``day.year * 10000 + day.month * 100 + day.day`` for ``"integer"`` or ``"bigint"``, else ``day`` itself.
 
     Raises:
         Nothing.
