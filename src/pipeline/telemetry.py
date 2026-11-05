@@ -105,7 +105,10 @@ class Instruments:
             committed outcome report, and the worker loop once per failure report for a claimed
             task no ``Lease`` could be built for; ``outcome`` is the ``Outcome`` value.
         rows: ``pipeline.rows`` (counter, ``{row}``): rows passing through a stage, with ``job``
-            and ``stage`` attributes. ``stage`` is ``fetched`` (extract); ``waiting``,
+            and ``stage`` attributes. ``stage`` is ``fetched`` (also a ``FromList`` fanned-out
+            job's list records), ``fanout_fetched`` (the records of a fanned-out job's per-id or
+            per-batch calls) or ``fanout_failed`` (the ids, not records, of its calls that failed
+            with a holdable error and landed a marker page) (extract); ``waiting``,
             ``quarantined``, ``warned``, ``deduplicated`` or ``key_unreadable`` (a failed record
             whose key could not be read) (validate); ``written``, ``changed``, ``skipped`` (rows
             of a ``ReplacePartition`` table not written because records are held) or

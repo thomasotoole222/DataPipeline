@@ -4,6 +4,7 @@ Nothing here runs a check: the types only hold and validate declarations for the
 
 Public API:
     SCHEMA_RULE: The name reserved for the schema check, ``"schema"``; no declared check may use it.
+    DETAIL_RULE: The name reserved for a failed fanned-out call, ``"detail_failed"``; no declared check may use it.
     Severity: What a failed check means: ``error``, ``warn`` or ``wait``.
     CheckContext: The job, source, partition and time frame a check runs in.
     Rule: A named predicate over one record, validated on construction.
@@ -25,6 +26,11 @@ from pipeline.timeutil import TimeFrame
 
 #: The rule name a failed parse is held under; no check may use it (``_check_declaration`` rejects it).
 SCHEMA_RULE: Final = "schema"
+#: The rule name an id whose fanned-out call failed is held under; no check may use it (``_check_declaration``
+#: rejects it).
+DETAIL_RULE: Final = "detail_failed"
+#: The rule names the framework holds records under, which no declared check may use.
+_RESERVED: Final = frozenset({SCHEMA_RULE, DETAIL_RULE})
 
 
 class Severity(StrEnum):
@@ -70,7 +76,7 @@ class Rule[R: Record]:
     ``name`` and ``check`` may be positional; the other fields are keyword-only. Frozen.
 
     Invariants, all enforced by ``__post_init__`` through ``_check_declaration``:
-        ``name`` is not empty and is not ``SCHEMA_RULE``.
+        ``name`` is not empty and is neither ``SCHEMA_RULE`` nor ``DETAIL_RULE``.
         ``version`` is 1 or more.
         ``until`` is not ``None`` exactly when ``severity`` is ``Severity.WAIT``, and is then not ``""``.
 
@@ -121,7 +127,7 @@ class Lookup[R: Record]:
     lookup waits for, so the author must name it.
 
     Invariants, all enforced by ``__post_init__``:
-        ``name`` is not empty and is not ``SCHEMA_RULE``.
+        ``name`` is not empty and is neither ``SCHEMA_RULE`` nor ``DETAIL_RULE``.
         ``version`` is 1 or more.
         ``until`` is not ``None`` exactly when ``severity`` is ``Severity.WAIT``, and is then not ``""``.
         ``table`` matches ``TABLE_PATTERN``: a lower-case ``schema.table``.
@@ -185,7 +191,7 @@ def _check_declaration(name: str, version: int, severity: Severity, until: str |
         None.
 
     Args:
-        name: The check's name. Must be non-empty and not ``SCHEMA_RULE``.
+        name: The check's name. Must be non-empty and neither ``SCHEMA_RULE`` nor ``DETAIL_RULE``.
         version: The check's version. Must be 1 or more.
         severity: The check's severity.
         until: The job a ``WAIT`` check waits for. Must be set exactly when ``severity`` is ``Severity.WAIT``, and
@@ -198,8 +204,8 @@ def _check_declaration(name: str, version: int, severity: Severity, until: str |
         ValueError: If any rule above is broken. The first broken rule, in the order listed, is reported.
 
     """
-    if not name or name == SCHEMA_RULE:
-        raise ValueError(f"a check needs a name other than {SCHEMA_RULE!r}, got {name!r}")
+    if not name or name in _RESERVED:
+        raise ValueError(f"a check needs a name other than {sorted(_RESERVED)}, got {name!r}")
     if version < 1:
         raise ValueError(f"check {name!r}: version must be 1 or more, got {version}")
     if (severity is Severity.WAIT) != (until is not None):

@@ -1,4 +1,4 @@
-"""Turn accepted records into one polars frame per target table.
+"""Turn accepted records into one polars frame per target: a table, or a container's staged key.
 
 Public API:
     Transformed: Frozen result of ``transform``: pairs of a target and its frame, each row's record, and the misfits.
@@ -19,7 +19,7 @@ import polars as pl
 from pydantic import BaseModel
 
 from pipeline.checks.record import Keyed, Record
-from pipeline.checks.targets import Column, ReplaceChildren, Target, target_of
+from pipeline.checks.targets import Column, Target, target_of, walk
 from pipeline.db.pool import storable_text
 from pipeline.db.quarantine import Failure
 from pipeline.errors import Overflow
@@ -60,8 +60,8 @@ class Transformed:
     Attributes:
         frames (tuple[tuple[Target, pl.DataFrame], ...]): (target, frame) pairs, no target twice, every child's
             parent present and before it, and every frame's column names, order and types those of its target's
-            ``columns`` (all checked). From ``transform``: one pair per target, the root first, then its children in
-            field order, a frame empty when no record has rows for it.
+            ``columns`` (all checked). From ``transform``: one pair per target, in ``walk`` order (the root first, then
+            each child followed by its own children, in field order), a frame empty when no record has rows for it.
         owners (tuple[tuple[int, ...], ...]): One tuple per frame, in ``frames`` order, holding for each frame row
             the position in the accepted records of the record it came from (lengths checked).
         misfits (tuple[tuple[int, Failure], ...]): The records left out of every frame because a value did not fit
@@ -77,8 +77,8 @@ class Transformed:
     def __post_init__(self) -> None:
         """Refuse a repeated or misplaced target, a frame that misfits its target, or owners that misfit the frames.
 
-        A child target is one whose writer is ``ReplaceChildren``; its parent is the target listing it in
-        ``children``.
+        A child target is one with inherited columns (``Target.inherited`` is never empty for a child and always empty
+        for a top-level target), whatever its writer; its parent is the target listing it in ``children``.
 
         Preconditions:
             None.
@@ -90,7 +90,8 @@ class Transformed:
             ValueError: A target appears more than once; a target in some target's ``children`` comes earlier in
                 ``frames`` than that target; a child target is in no other target's ``children`` in ``frames``; a
                 frame's column names, order or types differ from its target's ``columns``; or ``owners`` does not hold
-                one tuple per frame with one position per row. The message names the tables.
+                one tuple per frame with one position per row. The message names the tables (``_label``: a
+                container as ``the container``).
 
         """
         if len(self.owners) != len(self.frames):
@@ -99,20 +100,18 @@ class Transformed:
         adopted: set[Target] = set()  # children of the targets seen so far
         for target, frame in self.frames:
             if target in seen:
-                raise ValueError(f"Transformed: {target.table} appears more than once")
-            early = [child.table for _, child in target.children if child in seen]
+                raise ValueError(f"Transformed: {_label(target)} appears more than once")
+            early = [_label(child) for _, child in target.children if child in seen]
             if early:
-                raise ValueError(f"Transformed: {', '.join(early)} comes before its parent {target.table}")
+                raise ValueError(f"Transformed: {', '.join(early)} comes before its parent {_label(target)}")
             expected = [(column.name, column.polars) for column in target.columns]
             if list(frame.schema.items()) != expected:
-                raise ValueError(f"Transformed: the frame for {target.table} does not have its target's columns")
+                raise ValueError(f"Transformed: the frame for {_label(target)} does not have its target's columns")
             if len(self.owners[len(seen)]) != frame.height:
-                raise ValueError(f"Transformed: the owners of {target.table} do not give one record per row")
+                raise ValueError(f"Transformed: the owners of {_label(target)} do not give one record per row")
             seen.add(target)
             adopted.update(child for _, child in target.children)
-        orphans = [
-            target.table for target in seen if isinstance(target.writer, ReplaceChildren) and target not in adopted
-        ]
+        orphans = [_label(target) for target in seen if target.inherited and target not in adopted]
         if orphans:
             raise ValueError(f"Transformed: {', '.join(sorted(orphans))} has no parent in frames")
 
@@ -120,15 +119,18 @@ class Transformed:
 def transform[R: Record](model: type[R], accepted: Sequence[Keyed[R]], source_id: UUID) -> Transformed:
     """Build the frames for the accepted records of one model, leaving out each record with a value that misfits.
 
-    Every target gets an empty row list first, in load order (the root, then its children in field order; a child
-    has no children, per ``build_target``). Each record then makes its row and its child rows through ``_rows``, and
-    every one of them is checked and fitted by ``_fitted``. When a value does not fit its column, the record's rows are
-    all left out and it becomes a misfit, with a failure whose rule is ``Overflow``'s ``error_class``, whose version is
-    ``model.record_version`` and whose message is the ``Overflow`` message; otherwise its rows are added to the lists,
-    each with the record's position in ``owners``. Each list is then turned into a frame. The root's key columns (the
+    Every target gets an empty row list first, in load order: ``walk`` order, the root first, then each child followed
+    by its own children, in field order, so every parent comes before its children. Each record then makes its row and
+    its child rows, at every depth, through ``_rows``, and every one of them, a container root's included, is checked
+    and fitted by ``_fitted``. When a value does not fit its column, the record's rows are all left out and it becomes
+    a misfit, with a failure whose rule is ``Overflow``'s ``error_class``, whose version is ``model.record_version``
+    and whose message is the ``Overflow`` message; otherwise its rows are added to the lists, each with the record's
+    position in ``owners``. Each list is then turned into a frame. The root's key columns (the
     columns of the ``record_key`` fields) are written from the record's computed key (``Keyed.key``, the key Validate
-    de-duplicated on), never from its attributes, a ``uuid`` value as text; children inherit them from the root row, so
-    their parent-key columns hold the same values. Every other column comes from the parsed record.
+    de-duplicated on), never from its attributes, a ``uuid`` value as text; each child inherits its inherited columns
+    from its parent's row, so they hold the same values as the parent's. Every other column comes from the parsed
+    record or child part. A container root (``build_container``) has only its source and key columns, so its frame
+    holds just those: Load stages it for its children's scope and writes it nowhere.
 
     Preconditions:
         Every record in ``accepted`` is an instance of ``model`` and its ``key`` is ``key_of`` of ``model`` and its
@@ -141,8 +143,8 @@ def transform[R: Record](model: type[R], accepted: Sequence[Keyed[R]], source_id
         source_id: The source the records belong to, written as text to the root's source column when it has one.
 
     Returns:
-        ``Transformed`` holding one pair per target, the root first, then every child target in field order; for each
-        frame the position in ``accepted`` of each row's record; and every misfit record's position and failure.
+        ``Transformed`` holding one pair per target, in ``walk`` order; for each frame the position in ``accepted`` of
+        each row's record; and every misfit record's position and failure.
 
     Raises:
         TypeError: From ``target_of``, when ``model`` declares no table or loads as child rows.
@@ -153,8 +155,8 @@ def transform[R: Record](model: type[R], accepted: Sequence[Keyed[R]], source_id
 
     """
     root = target_of(model)
-    # every target gets a frame, in load order, even when no record has rows for it; a child has no children
-    rows: dict[Target, list[dict[str, object]]] = {root: [], **{child: [] for _, child in root.children}}
+    # every target gets a frame, in load order (parents first), even when no record has rows for it
+    rows: dict[Target, list[dict[str, object]]] = {target: [] for target in walk(root)}
     owners: dict[Target, list[int]] = {target: [] for target in rows}
     misfits: list[tuple[int, Failure]] = []
     source = {root.source_column: str(source_id)} if root.source_column else {}
@@ -188,23 +190,25 @@ def transform[R: Record](model: type[R], accepted: Sequence[Keyed[R]], source_id
 def _rows(
     target: Target, part: BaseModel, parent: Mapping[str, object], out: Mapping[Target, list[dict[str, object]]]
 ) -> None:
-    """Append the row for ``part`` to ``out[target]``, then the rows of its children.
+    """Append the row for ``part`` to ``out[target]``, then the rows of its children, at every depth.
 
     A column named in ``parent`` takes its value from there, as given; any other column follows its path of attributes
     from ``part``, giving None once an optional part on the way is None. A computed field's property runs when its
-    column is read. A ``uuid`` column's value is turned into text. Each child row then gets the parent row's values for
-    the child's ``inherited`` columns (the parent writer's key, which ``build_target`` makes from this target's columns,
-    so every name is in ``row``). A ``Rows`` field is never None: ``checks.targets._child`` refuses a nullable one.
+    column is read. A ``uuid`` column's value is turned into text. Each child then gets, from this row, the values of
+    its own ``inherited`` columns only (this target's columns, as ``build_target`` and ``build_container`` adopt the
+    child through ``_adopt``, so every name is in ``row``), and its rows are made from the ``Rows`` field's value: one
+    row per item of a list, one row for a single part, and none for None (a one-to-one field that allows None). A list
+    field is never None: ``checks.targets._child`` refuses a nullable one.
 
     Preconditions:
-        ``out`` has a list for ``target`` and for every child target (``transform`` makes one for each). ``part`` is
+        ``out`` has a list for ``target`` and for every target under it (``transform`` makes one for each). ``part`` is
         an instance of the model ``target`` was built from, so every column path and ``Rows`` field resolves.
 
     Args:
-        target: The table the row is for.
+        target: The target the row is for: a table, or a container root, whose row is its source and key columns.
         part: The record or child part to read.
         parent: Values passed down: the source column and the key columns (from the record's computed key) for the
-            root, the inherited key values for a child.
+            root, the inherited values for a child.
         out: Rows collected so far, by target; lists are appended to in place.
 
     Returns:
@@ -217,7 +221,7 @@ def _rows(
     """
     row: dict[str, object] = {}
     for column in target.columns:
-        if column.name in parent:  # the source or a key column of a record, or a key column a child inherits
+        if column.name in parent:  # the source or a key column of a record, or a column a child inherits
             row[column.name] = parent[column.name]
             continue
         value: object = part
@@ -225,9 +229,11 @@ def _rows(
             value = None if value is None else getattr(value, name)  # an absent optional part gives None
         row[column.name] = str(value) if column.postgres == "uuid" and value is not None else value
     out[target].append(row)
-    inherited = {name: row[name] for _, child in target.children for name in child.inherited}
     for field, child in target.children:
-        for item in getattr(part, field):
+        inherited = {name: row[name] for name in child.inherited}  # its own, as siblings may inherit differently
+        found = getattr(part, field)
+        items = found if isinstance(found, list) else () if found is None else (found,)  # a list, one part or None
+        for item in items:
             _rows(child, item, inherited, out)
 
 
@@ -280,8 +286,9 @@ def _fitted(target: Target, row: Mapping[str, object]) -> dict[str, object]:
         KeyError: When the row lacks a column's name.
         Overflow: When a value does not fit its column: ``None`` in a ``NOT NULL`` column, a value of a type the
             column's frame type does not take, an ``int`` outside its column's integer range, or a ``Decimal`` too
-            wide or too fine for its column or whose exponent is near ``MAX_EMAX``. The message names the table, the
-            column and its Postgres type (followed by ``NOT NULL`` when not nullable), never the value.
+            wide or too fine for its column or whose exponent is near ``MAX_EMAX``. The message names the table
+            (``_label``: ``the container`` for a container), the column and its Postgres type (followed by
+            ``NOT NULL`` when not nullable), never the value.
 
     """
     fitted: dict[str, object] = {}
@@ -289,7 +296,7 @@ def _fitted(target: Target, row: Mapping[str, object]) -> dict[str, object]:
         value = row[column.name]
         if not (column.nullable if value is None else _fits(column, value)):
             raise Overflow(
-                f"{target.table}.{column.name}: a value does not fit "
+                f"{_label(target)}.{column.name}: a value does not fit "
                 f"{column.postgres}{'' if column.nullable else ' NOT NULL'}"
             )
         if isinstance(value, Decimal) and isinstance(column.polars, pl.Decimal):  # exact: _fits accepted it
@@ -320,6 +327,25 @@ def _frame(target: Target, rows: Sequence[Mapping[str, object]]) -> pl.DataFrame
 
     """
     return pl.DataFrame(rows, schema={column.name: column.polars for column in target.columns}, strict=True)
+
+
+def _label(target: Target) -> str:
+    """Return a target's table for a message, or ``"the container"`` for a container, which has no table.
+
+    Preconditions:
+        None.
+
+    Args:
+        target: The target to name.
+
+    Returns:
+        ``target.table``, or ``"the container"`` when it is None.
+
+    Raises:
+        Nothing.
+
+    """
+    return target.table if target.table is not None else "the container"
 
 
 def _is_uuid(text: str) -> bool:

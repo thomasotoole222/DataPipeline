@@ -19,12 +19,16 @@ CREATE TABLE raw.page (
     fetched_at   timestamptz NOT NULL,
     envelope     jsonb       NOT NULL,                -- the response without its hashed keys, e.g. code and request_id
     payload_hash bytea       NOT NULL REFERENCES raw.payload (hash),  -- the response's hashed part
-    PRIMARY KEY (task_id, page_no)                    -- a task fetches one endpoint, so the task's pages are its key
+    ids          text[]                               -- the ids a fanned-out call was for; NULL: not per id
+                 CHECK (cardinality(ids) > 0 AND array_ndims(ids) = 1 AND array_position(ids, NULL) IS NULL),
+    error_class  text        CHECK (error_class <> ''),  -- a failed fanned-out call's error class; its page is a marker
+    CHECK (error_class IS NULL OR ids IS NOT NULL),
+    PRIMARY KEY (task_id, page_no)                    -- numbered across the task: list pages, then per-id pages
 );
 CREATE INDEX page_payload ON raw.page (payload_hash);  -- control.purge_raw finds the payloads no page references
 CREATE INDEX page_fetched ON raw.page (fetched_at);    -- control.purge_raw finds the pages past the retention
 COMMENT ON TABLE raw.page IS
-    'Source responses from every endpoint, without their hashed part. Grain: one page per task. Writer: pipeline Extract; control.purge_raw. Layer: raw.';
+    'Source responses from every endpoint, without their hashed part. Grain: one row per page of a task. Writer: pipeline Extract; control.purge_raw. Layer: raw.';
 
 CREATE SCHEMA quarantine;
 COMMENT ON SCHEMA quarantine IS 'Records held back by validation until they are replayed, released or discarded.';

@@ -1,12 +1,13 @@
-"""Find which of a set of values already exist in a warehouse table column.
+"""Read values from warehouse tables: which of a set of values exist in a column, and a job's one-column query.
 
 Public API:
     known_values: Return the subset of the given values that appear in ``schema.table.column``.
+    read_column: Run a one-column query in a read-only transaction and return its values.
 
 """
 
 from collections.abc import Collection, Mapping
-from typing import Final
+from typing import Any, Final, LiteralString
 
 from psycopg import sql
 
@@ -99,3 +100,48 @@ async def known_values(conn: Connection, table: str, column: str, values: Collec
         cursor = await conn.execute(query, (storable, type_name))
         rows = await cursor.fetchall()
     return frozenset(str(found[0]) for found in rows)
+
+
+async def read_column(conn: Connection, query: LiteralString, params: Mapping[str, Any]) -> list[Any]:
+    """Run a query that returns one column in a read-only transaction on ``conn`` and return its values in row order.
+
+    The transaction is opened with ``conn.transaction()`` and made ``READ ONLY`` with ``SET TRANSACTION READ ONLY``
+    before the query runs, so a statement that writes fails; it is committed (nothing to commit) when the rows are
+    read. The query is sent with ``prepare=True``, so it always goes over the extended protocol, where Postgres
+    refuses more than one statement: without it, a query that names no parameter would go over the simple query
+    protocol, which runs ``"SELECT id FROM t; COMMIT; DELETE FROM t"`` statement by statement, its ``DELETE``
+    outside the read-only transaction. Everything runs inside ``db_errors``.
+
+    Preconditions:
+        ``conn`` is open, in autocommit mode with no transaction open, and not used by another coroutine. ``query``
+        takes only named parameters (``%(name)s``) that are keys of ``params``, writes a literal ``%`` as ``%%``,
+        and is one statement.
+
+    Args:
+        conn: Open warehouse connection.
+        query: The query, from a job's declaration.
+        params: The values of its named parameters; keys it does not name are ignored.
+
+    Returns:
+        The first and only column of every row, as psycopg reads it, in the order the query returns them.
+
+    Raises:
+        ValueError: When the query's result has no columns (a statement that returns no rows) or more than one
+            column; the transaction rolls back.
+        DatabaseConflict: From ``db_errors``, on a serialization failure or deadlock.
+        DatabaseUnavailable: From ``db_errors``, when the connection is lost or the warehouse cannot be reached.
+        psycopg.Error: Any other database error unchanged, such as ``ReadOnlySqlTransaction`` for a single statement
+            that writes, ``SyntaxError`` for a query of more than one statement ("cannot insert multiple commands
+            into a prepared statement"), or ``ProgrammingError`` for a parameter missing from ``params`` or a bare
+            ``%`` in ``query``.
+
+    """
+    with db_errors():
+        async with conn.transaction():
+            await conn.execute("SET TRANSACTION READ ONLY")
+            cursor = await conn.execute(query, params, prepare=True)  # one statement only, even with no parameter
+            columns = 0 if cursor.description is None else len(cursor.description)
+            if columns != 1:
+                raise ValueError(f"the query must return one column, not {columns}")
+            rows = await cursor.fetchall()
+    return [row[0] for row in rows]

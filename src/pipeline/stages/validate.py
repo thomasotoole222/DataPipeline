@@ -13,12 +13,23 @@ import logging
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import groupby
 from typing import Any, Final
 
 from pydantic import BaseModel, ValidationError
 
-from pipeline.checks.checks import SCHEMA_RULE, BatchPolicy, CheckContext, Lookup, Rule, Severity, Validation
+from pipeline.checks.checks import (
+    DETAIL_RULE,
+    SCHEMA_RULE,
+    BatchPolicy,
+    CheckContext,
+    Lookup,
+    Rule,
+    Severity,
+    Validation,
+)
 from pipeline.checks.record import Keyed, Record, key_of
+from pipeline.connectors.fanout import FromList, IdSource
 from pipeline.connectors.spec import EndpointSpec
 from pipeline.db import raw
 from pipeline.db.control import ClaimedTask
@@ -34,6 +45,9 @@ from pipeline.timeutil import TimeFrame
 _log: Final = logging.getLogger(__name__)
 #: The most example keys ``_report`` puts in one log line.
 _EXAMPLES: Final = 5
+#: The group key ``_fanned_records`` gives a page with no ``ids``, typed as a call's ids; never reached, since it
+#: groups only pages with ``ids``, but it narrows the key to ``tuple[str, ...]``.
+_NO_IDS: Final[tuple[str, ...]] = ()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -48,11 +62,12 @@ class Validated[R: Record]:
         landed: Where each accepted record landed and its raw value, in ``accepted`` order, so ``held_accepted`` can
             hold it back after Validate.
         held: Rows held back, one per record that failed to parse, parsed with a key that could not be read, shares
-            its key with a record that failed to parse, or failed a non-``WARN`` check.
+            its key with a record that failed to parse, or failed a non-``WARN`` check, and one per id whose
+            fanned-out call failed.
         records: Number of records landed, before deduplication.
         deduplicated: Number of records dropped by ``_dedupe``.
         judged_total: The total ``judge`` was given: records landed, less those ``_dedupe`` dropped and the held
-            copies of a failed key after the first.
+            copies of a failed key after the first, plus the ids whose fanned-out call failed.
         judged: The held rows ``judge`` was given; Load gives them to ``judge`` again with its own held records.
 
     """
@@ -62,7 +77,7 @@ class Validated[R: Record]:
     held: tuple[HeldRow, ...]  # records held back, for Load to write with quarantine.hold
     records: int  # records on the task's pages, duplicates included
     deduplicated: int  # earlier copies dropped because a later page had the same key
-    judged_total: int  # the total judge was given: records landed, less dropped copies and repeats of failed keys
+    judged_total: int  # records landed less dropped copies and repeats of failed keys, plus failed ids
     judged: tuple[HeldRow, ...]  # the held rows judge was given; Load judges them again with its own
 
 
@@ -82,6 +97,26 @@ class _Landed:
     page_no: int
     index: int  # position in the page's records
     payload: Any  # the record as landed
+
+
+@dataclass(frozen=True, slots=True)
+class _Failed:
+    """One id whose fanned-out call failed: where its marker landed and what the held row carries.
+
+    Frozen and slotted. No field is checked.
+
+    Attributes:
+        page_no: ``page_no`` of the marker page.
+        index: The id's position in the marker's ``ids``.
+        payload: The id's list row, or ``{"id": <id>}`` when it has none (a query's id).
+        message: ``"<error class>: <message>"``, from the marker.
+
+    """
+
+    page_no: int
+    index: int  # position in the call's ids
+    payload: dict[str, Any]  # the list row, or {"id": ...}
+    message: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,26 +144,32 @@ async def validate[R: Record](
     frame: TimeFrame | None,  # the task's time window, as Extract was given it
     validation: Validation[R],
     instruments: Instruments,
+    *,
+    id_source: IdSource | None = None,  # set for a fanned-out job: spec is then the per-id endpoint
 ) -> Validated[R]:
     """Parse, deduplicate and check the records a task landed, and split them into accepted and held.
 
     Reads every page of ``task`` from ``raw.page`` on one pooled connection and flattens them into records with
-    ``_records``. ``_parse_records`` parses them, holds every record that failed to parse and every parsed copy of a
-    key that failed to parse, and returns the other parsed records. Then, once: ``_dedupe`` drops earlier copies of a
+    ``_records``, or, for a fanned-out job, with ``_fanned_records``, which also gives the ids whose call failed.
+    ``_parse_records`` parses them, holds every record that failed to parse and every parsed copy of a key that failed
+    to parse, and returns the other parsed records. Then, once: ``_dedupe`` drops earlier copies of a
     key among those records, ``_fetch_lookups`` makes one ``known_values`` call per ``Lookup`` over the kept
     records, and each kept record is checked. Failures with severity ``WARN`` are only reported, with the record's
     key; any other failure (error or wait) holds the record, and a record with no such failure is accepted. Then
-    ``_report`` and ``judge`` run, and the result is returned.
+    each failed id is held, at its marker's page and its position in the marker's ``ids``, with one ``DETAIL_RULE``
+    failure carrying ``model.record_version`` and the marker's error, and with ``_group_key`` of its payload's key as
+    its group key, or none when ``_payload_key`` cannot read that key; every such row is counted for the batch
+    policy. Then ``_report`` and ``judge`` run, and the result is returned.
 
     A record that fails both an error check and a wait check is held with both failures and counts as an error,
     because ``_waiting`` needs every failure to have an ``until`` job. Every ``SCHEMA_RULE`` failure (a parse
-    failure, an unreadable key, or a parsed copy of a key that failed to parse) counts as an ``ERROR`` failure in
-    ``_report``.
+    failure, an unreadable key, or a parsed copy of a key that failed to parse) and every ``DETAIL_RULE`` failure
+    counts as an ``ERROR`` failure in ``_report``.
 
     ``judge`` is given the rows ``_parse_records`` counts (one per failed key and one per record whose key could not
     be read) and every held kept record, and a total of the records landed less those ``_dedupe`` dropped and the held
-    rows it does not count. So a key fetched three times counts as one record and one held row whether it fails to
-    parse or fails an error check.
+    rows it does not count, plus the ids whose call failed. So a key fetched three times counts as one record and one
+    held row whether it fails to parse or fails an error check.
 
     Preconditions:
         None.
@@ -136,23 +177,26 @@ async def validate[R: Record](
     Args:
         pool: Pool the pages and the lookups are read through.
         task: The claimed task whose pages are validated; gives the id, job, source and partition.
-        spec: The endpoint spec that says where the records are in a page body.
+        spec: The endpoint spec that says where the records are in a page body; for a fanned-out job, the per-id
+            endpoint.
         frame: The task's time frame, or ``None``; passed to checks through ``CheckContext``.
         validation: The record model and the checks to run.
         instruments: Telemetry passed to ``_parse_records`` and ``_report``.
+        id_source: The job's id source, or ``None`` for a job that is not fanned out. Defaults to ``None``.
 
     Returns:
         A ``Validated`` with the accepted records and their keys, and where each landed; every held row, parse
         failures and parsed records with an unreadable key first in landed order, then the parsed copies of
-        failed keys in landed order, then check failures in kept order; ``records``, the number of records
-        landed before deduplication; ``deduplicated``, the number of records dropped by ``_dedupe``; and
-        ``judged_total`` and ``judged``, the total and the held rows ``judge`` was given.
+        failed keys in landed order, then check failures in kept order, then the failed ids in page order;
+        ``records``, the number of records landed before deduplication; ``deduplicated``, the number of records
+        dropped by ``_dedupe``; and ``judged_total`` and ``judged``, the total and the held rows ``judge`` was given.
 
     Raises:
         QualityFailed: From ``judge``, when the held rows that are not waiting, each failed key counted once, break
             the batch policy.
-        ClientErrorUnhandled: From ``_records``, when a page other than the last has nothing or ``null`` at the
-            records path, or any page has a non-list there.
+        ClientErrorUnhandled: From ``_records`` or ``_fanned_records``, when a page other than the last has nothing or
+            ``null`` at the records path, or any page has a non-list there; or from ``FromList.id_of`` for a list
+            record with no readable id.
         DatabaseConflict: From ``raw.read_pages`` or ``known_values`` through ``db_errors``.
         DatabaseUnavailable: From ``raw.read_pages`` or ``known_values`` through ``db_errors``.
         psycopg.Error: From ``raw.read_pages`` or ``known_values``, any other database error unchanged (e.g.
@@ -167,7 +211,11 @@ async def validate[R: Record](
     ctx = CheckContext(job=task.job, source_id=task.source_id, partition_key=task.partition_key, frame=frame)
     async with pool.connection() as conn:
         pages = [page async for page in raw.read_pages(conn, task.id)]
-    landed = _records(pages, spec)
+    detail: list[_Failed] = []  # the ids whose fanned-out call failed
+    if id_source is None:
+        landed = _records(pages, spec)
+    else:
+        landed, detail = _fanned_records(pages, spec, id_source)
     clean, held, counted, new_fields = _parse_records(task, validation.model, landed, instruments)
     failed = [(Severity.ERROR, failure) for row in held for failure in row.failures]  # schema failures, held order
     kept, dropped = _dedupe(clean)
@@ -189,9 +237,17 @@ async def validate[R: Record](
             accepted.append(Keyed(entry.record, entry.key))
             origins.append(entry.landed)
             warned_rows += bool(warnings)
+    for item in detail:  # a failed call's ids: each held once and counted, like a record that failed to parse
+        failure = Failure(DETAIL_RULE, validation.model.record_version, item.message)
+        failed.append((Severity.ERROR, failure))
+        key = _payload_key(validation.model, item.payload)
+        origin = _Landed(item.page_no, item.index, item.payload)
+        row = _held(task, origin, None if key is None else _group_key(key), (failure,))
+        held.append(row)
+        counted.append(row)
     _report(task, instruments, held, warned, warned_rows, failed, dropped, new_fields)
     repeats = len(held) - len(counted)  # the other copies of failed keys, counted once like deduplicated ones
-    judged_total = len(landed) - len(dropped) - repeats
+    judged_total = len(landed) - len(dropped) - repeats + len(detail)
     judge(validation.policy, judged_total, counted)
     return Validated(
         accepted=tuple(accepted),
@@ -233,6 +289,92 @@ def _records(pages: Iterable[RawPage], spec: EndpointSpec) -> list[_Landed]:
             continue  # a last page may leave out its empty record list
         landed.extend(_Landed(page.page_no, index, item) for index, item in enumerate(spec.records(page.payload)))
     return landed
+
+
+def _fanned_records(
+    pages: Sequence[RawPage], spec: EndpointSpec, source: IdSource
+) -> tuple[list[_Landed], list[_Failed]]:
+    """Flatten a fanned-out task's pages into landed records, and list the ids whose call failed.
+
+    For a ``FromList`` source, the pages with no ``ids`` are its list pages: their records (as ``_records`` reads them,
+    with ``source.spec``) are not records of the task but the list rows, each under its ``FromList.id_of`` id, the
+    last row of an id winning. For a ``FromQuery`` source, pages with no ``ids`` are ignored. The pages with ``ids``
+    are read in page order, one call at a time (a run of consecutive pages with equal ``ids``). A call with a marker
+    page (``error_class`` set) gives one ``_Failed`` per id, at the marker's ``page_no`` and the id's position, with
+    the id's list row as its payload or ``{"id": <id>}``, and the message ``"<error_class>: <payload['error']>"``;
+    its other pages, if any, are not read. Any other call's pages give their records as ``_records`` reads them with
+    ``spec``. With ``keep_list_row``, a call that gives no record lands the id's list row, at its list page and
+    position, as the record. When ``spec.id_param.inject`` is set, every record a call gives, a kept list row
+    included, is passed through ``_inject`` with the call's one id, so every record carries it.
+
+    Preconditions:
+        ``pages`` are in ``page_no`` order, as ``raw.read_pages`` gives them, and consecutive calls have different
+        ``ids``, as ``fan_out`` guarantees by calling each distinct id once; otherwise two calls would be read as one.
+        With ``inject`` set a call has one id, as ``IdParam`` guarantees; ``keep_list_row`` likewise, as
+        ``BatchJob`` checks.
+
+    Args:
+        pages: The task's pages.
+        spec: The per-id endpoint.
+        source: The job's id source.
+
+    Returns:
+        ``(landed, failed)``: the records in page order, then record order, each kept list row after its call's
+        pages; and the failed ids in page order, then id order. Both are empty when there are no pages with ``ids``.
+
+    Raises:
+        ClientErrorUnhandled: From ``_records``, for a list or call page whose records it cannot read (a page other
+            than its run's last with nothing or ``null`` at the records path, or any page with a non-list there); or
+            from ``FromList.id_of``, for a list row with no readable id.
+
+    """
+    rows: dict[str, _Landed] = {}  # id -> its list row
+    if isinstance(source, FromList):
+        for row in _records([page for page in pages if page.ids is None], source.spec):
+            rows[source.id_of(row.payload)] = row
+    keep = isinstance(source, FromList) and source.keep_list_row
+    inject = None if spec.id_param is None else spec.id_param.inject
+    landed: list[_Landed] = []
+    failed: list[_Failed] = []
+    for ids, group in groupby((page for page in pages if page.ids is not None), key=lambda page: page.ids or _NO_IDS):
+        call = list(group)
+        marker = next((page for page in call if page.error_class is not None), None)
+        if marker is not None:
+            message = f"{marker.error_class}: {marker.payload.get('error')}"
+            for index, one in enumerate(ids):
+                payload = rows[one].payload if one in rows else {"id": one}
+                failed.append(_Failed(marker.page_no, index, payload, message))
+            continue
+        found = _records(call, spec)
+        if keep and not found and ids[0] in rows:
+            found = [rows[ids[0]]]
+        landed.extend(found if inject is None else [_inject(item, inject, ids[0]) for item in found])
+    return landed, failed
+
+
+def _inject(item: _Landed, field: str, value: str) -> _Landed:
+    """Return a landed record with a call's id written at a top-level field, over any value already there.
+
+    Preconditions:
+        None.
+
+    Args:
+        item: The landed record.
+        field: The field ``IdParam.inject`` names.
+        value: The call's one id.
+
+    Returns:
+        A new ``_Landed`` at the same page and position whose payload is a copy of a ``Mapping`` payload with
+        ``field`` set to ``value``; ``item`` itself when its payload is not a ``Mapping``, which then fails to parse.
+        The page's payload is not changed.
+
+    Raises:
+        Nothing.
+
+    """
+    if not isinstance(item.payload, Mapping):
+        return item
+    return _Landed(item.page_no, item.index, {**item.payload, field: value})
 
 
 def _parse_records[R: Record](
@@ -530,8 +672,8 @@ def _held(task: ClaimedTask, item: _Landed, group_key: str | None, failures: tup
 
     Preconditions:
         ``failures`` is not empty, as ``HeldRow`` requires; ``_parse_records`` passes one schema failure and
-        ``validate`` a non-empty ``kept_failures``. ``item.page_no`` and ``item.index`` are 0 or more, as ``RawPage``
-        and ``enumerate`` give them.
+        ``validate`` a non-empty ``kept_failures`` or one ``DETAIL_RULE`` failure. ``item.page_no`` and
+        ``item.index`` are 0 or more, as ``RawPage``, ``enumerate`` and ``_fanned_records`` give them.
 
     Args:
         task: The task that landed the record; gives the id, connector, job, source and partition.
@@ -665,15 +807,17 @@ def judge(policy: BatchPolicy, total: int, held: Sequence[HeldRow]) -> None:
 
     Preconditions:
         ``0 <= len(held) <= total``, as ``BatchPolicy.fails`` expects; ``validate`` guarantees this because every row
-        it passes is the first copy of a failed key, a parse failure with an unreadable key, or a kept record, and
-        ``total`` counts each of them once. ``stages.load`` adds only accepted records, each a kept record that
-        ``total`` counts and ``validate`` did not hold.
+        it passes is the first copy of a failed key, a record with an unreadable key, a kept record, or a failed
+        fanned-out id, and ``total`` counts each of them once. ``stages.load`` adds only accepted records, each a
+        kept record that ``total`` counts and ``validate`` did not hold.
 
     Args:
         policy: The batch policy.
-        total: Records after deduplication, each failed key counted once, parse failures included.
-        held: The task's held rows to judge: one per failed key, every one whose key is unreadable, and every held
-            kept record; ``stages.load`` passes ``Validated.judged`` followed by the records it holds.
+        total: Records after deduplication, each failed key counted once, parse failures included, plus the ids whose
+            fanned-out call failed.
+        held: The task's held rows to judge: one per failed key, every one whose key is unreadable, every held kept
+            record and every failed fanned-out id; ``stages.load`` passes ``Validated.judged`` followed by the records
+            it holds.
 
     Returns:
         None.
@@ -725,7 +869,8 @@ def _report(
         held: Every held row of the task.
         warned: Each ``WARN`` failure with the key of the record it failed on.
         warned_rows: The number of accepted records with at least one ``WARN`` failure.
-        failed: Every failure of the task with its severity: schema failures as ``ERROR``, then each check failure.
+        failed: Every failure of the task with its severity: schema failures as ``ERROR``, then each check failure,
+            then each ``DETAIL_RULE`` failure as ``ERROR``.
         dropped: The records ``_dedupe`` dropped.
         new_fields: Paths of undeclared fields found by ``_new_fields``.
 

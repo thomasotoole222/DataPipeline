@@ -4,6 +4,8 @@ Public API:
     HttpMethod: The HTTP methods a connector request may use, ``"GET"`` or ``"POST"``.
     KeyPath: A tuple of keys naming a location inside nested JSON objects.
     Place: Where a request parameter goes, the query string or the JSON body.
+    IdPlace: Where a fanned-out call puts its ids: a path field, a query parameter or a top-level body key.
+    IdParam: Where an endpoint called once per id, or per batch of ids, takes its ids.
     value_at: Return the value at a key path in a nested mapping.
     check_key_path: Reject an empty key path or one containing an empty key.
     ConnectorRequest: A validated method, path, query and body for one HTTP call to a connector.
@@ -14,14 +16,14 @@ Public API:
 
 import copy
 import string
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, get_args
 from urllib.parse import quote
 
-from pipeline.errors import ClientErrorUnhandled
+from pipeline.errors import ClientErrorUnhandled, IdRefused
 
 if TYPE_CHECKING:
     from pipeline.connectors.paging import Paginator
@@ -63,6 +65,75 @@ class Place(StrEnum):
 
     QUERY = "query"
     BODY = "body"
+
+
+class IdPlace(StrEnum):
+    """Name where a fanned-out call puts the ids it is for.
+
+    Members are strings, so they compare equal to ``"path"``, ``"query"`` and ``"body"``.
+
+    Attributes:
+        PATH: A field of the path template, such as ``{product_id}``; one id per call.
+        QUERY: A query string parameter; one id per call.
+        BODY: A top-level key of the JSON body, holding a list of up to ``IdParam.batch`` ids.
+
+    """
+
+    PATH = "path"
+    QUERY = "query"
+    BODY = "body"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class IdParam:
+    """Say where an endpoint called once per id, or once per batch of ids, takes its ids.
+
+    Frozen, slotted and keyword-only. Construction guarantees that ``place`` is an ``IdPlace``, ``name`` is not empty,
+    ``batch`` is an ``int`` of 1 or more and more than 1 only in the body, and ``inject`` is ``None`` or a non-empty
+    name, set only with one id per call. Whether ``name`` suits the endpoint's path, method and other parameters is
+    checked by ``EndpointSpec``; writing ``inject`` into records is done outside this page.
+
+    Attributes:
+        place (IdPlace): Where the ids go.
+        name (str): The path field, query parameter or top-level body key the ids go in.
+        batch (int): The most ids one call is for: a body key takes a list of 1 to ``batch`` ids; a path field or
+            query parameter takes one id, so ``batch`` is 1 there. Defaults to 1.
+        inject (str | None): A top-level field each returned record gets the call's id written into (over any value
+            already there), for records that do not carry it; ``None`` writes nothing. Defaults to ``None``.
+
+    """
+
+    place: IdPlace
+    name: str  # e.g. "product_id" for /product/202309/products/{product_id}
+    batch: int = 1  # ids per call; more than 1 only in the body
+    inject: str | None = None  # the record field the id is written into; one id per call only
+
+    def __post_init__(self) -> None:
+        """Reject an empty name, a batch below 1 or outside the body, and an injected field with a batch.
+
+        Preconditions:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: When ``place`` is not an ``IdPlace``; ``name`` is empty; ``batch`` is not an ``int`` (a
+                ``bool`` included) of 1 or more; ``batch`` is more than 1 for a path field or query parameter; or
+                ``inject`` is ``""``, or set with ``batch`` more than 1, where a record cannot tell which id it is
+                for.
+
+        """
+        if not isinstance(self.place, IdPlace):
+            raise ValueError(f"an id goes in a path field, a query parameter or the body, not {self.place!r}")
+        if not self.name:
+            raise ValueError("an id parameter needs a name")
+        if not isinstance(self.batch, int) or isinstance(self.batch, bool) or self.batch < 1:
+            raise ValueError(f"an id batch must be an int of 1 or more: {self.batch!r}")
+        if self.batch > 1 and self.place is not IdPlace.BODY:
+            raise ValueError(f"a {self.place} id is one per call, so batch must be 1, not {self.batch}")
+        if self.inject is not None and (not self.inject or self.batch > 1):
+            raise ValueError(f"an injected id field needs a name and one id per call: {self.inject!r}, {self.batch}")
 
 
 def value_at(body: Mapping[str, Any], path: KeyPath) -> Any:
@@ -372,11 +443,12 @@ class EndpointSpec:
     no ``.`` or ``..`` segment and no character a ``ConnectorRequest`` path refuses; the method is GET or POST and a
     GET has no ``fixed_body``; no parameter in the paginator's ``params`` goes in the body of a GET, and none has the
     name of a ``fixed_query`` key (query place) or a top-level ``fixed_body`` key (body place); ``records_at`` and
-    any ``total_at`` are valid key paths; ``max_rows`` is positive when set; ``fixed_query`` and ``windows`` are
-    copied into read-only mappings and ``fixed_body`` is deep-copied, so later changes to the caller's objects do not
-    reach requests. Callers must not change ``fixed_body`` in place; nothing hashes a spec, and ``hash()`` raises
-    ``TypeError``. Not checked: window names, and whether the windows use places and parameter names that suit the
-    method, the paginator and each other.
+    any ``total_at`` are valid key paths; ``max_rows`` is positive when set; an ``id_param`` suits the endpoint (see
+    ``_check_ids``); ``fixed_query`` and ``windows`` are copied into read-only mappings and ``fixed_body`` is
+    deep-copied, so later changes to the caller's objects do not reach requests. Callers must not change ``fixed_body``
+    in place; nothing hashes a spec, and ``hash()`` raises ``TypeError``. Not checked: window names; whether the
+    windows use places and parameter names that suit the method, the paginator, the ``id_param`` and each other; and
+    whether ``one_record`` goes with an ``id_param``.
 
     Attributes:
         name (str): The registry name, ``<connector>.<endpoint>``, for example ``"tiktok_shop.orders_search"``.
@@ -395,6 +467,11 @@ class EndpointSpec:
         total_at (KeyPath | None): Where a total record count is in a response body, or ``None``.
         source_scoped (bool): Whether requests are made on behalf of a source, so the client sends the source's
             identifier. ``False`` for an account-wide endpoint. Defaults to ``True``.
+        id_param (IdParam | None): Where the endpoint takes the ids of a fanned-out call, when it is called once per
+            id or per batch of ids; ``None`` for an endpoint called without ids. Defaults to ``None``.
+        one_record (bool): Whether ``records_at`` holds one record object instead of a list of records, as an
+            endpoint that gets one item by id returns it; nothing or ``null`` there is no record. Defaults to
+            ``False``.
 
     """
 
@@ -410,6 +487,8 @@ class EndpointSpec:
     max_rows: int | None = None  # the connector's row cap for one frame; None: no cap
     total_at: KeyPath | None = None  # where the connector reports the whole frame's row total; None: not reported
     source_scoped: bool = True  # False: an account-wide endpoint, sent without a source identifier
+    id_param: IdParam | None = None  # set: called once per id (or batch of ids) of a fanned-out job
+    one_record: bool = False  # True: records_at holds one record object, or nothing for no record
 
     @property
     def endpoint(self) -> str:
@@ -446,7 +525,8 @@ class EndpointSpec:
                 template; from ``check_key_path`` for a bad ``records_at`` or ``total_at``; when ``max_rows`` is less
                 than 1; from ``ConnectorRequest`` when the method is unsupported, the path does not start with ``/``
                 or holds ``?``, ``#``, a dot segment or a refused character, or a GET has a body; or from
-                ``_check_paging`` when a paging parameter goes in the body of a GET or clashes with a fixed key.
+                ``_check_paging`` when a paging parameter goes in the body of a GET or clashes with a fixed key; or from
+                ``_check_ids`` when ``id_param`` does not suit the endpoint.
             Exception: Whatever ``copy.deepcopy`` raises for a ``fixed_body`` value that cannot be deep-copied.
 
         """
@@ -467,6 +547,7 @@ class EndpointSpec:
         filled = self.path.format_map(dict.fromkeys(fields, "x"))
         ConnectorRequest(self.method, filled, self.fixed_query, self.fixed_body, self.source_scoped)
         self._check_paging()
+        self._check_ids(fields)
 
     def _check_paging(self) -> None:
         """Reject a paginator whose parameters cannot be added to this endpoint's requests on some page.
@@ -494,6 +575,91 @@ class EndpointSpec:
             else:
                 continue
             raise ValueError(f"{self.name}: the paginator cannot page this endpoint: {problem}")
+
+    def _check_ids(self, fields: frozenset[str]) -> None:
+        """Reject an ``id_param`` the endpoint's path, method or other parameters cannot take.
+
+        Preconditions:
+            ``fields`` is ``_template_fields(self.path)``.
+
+        Args:
+            fields: The path template's fields.
+
+        Returns:
+            None, also when ``id_param`` is ``None``.
+
+        Raises:
+            ValueError: Naming the spec, when ``id_param`` is not an ``IdParam``; when the path template has a field
+                other than a path id's own (a fanned-out call fills no other); when a path id's name is not a field;
+                when a query id's name is a ``fixed_query`` key or a query paging parameter; or when a body id goes
+                in a GET, or its name is a top-level ``fixed_body`` key or a body paging parameter.
+
+        """
+        ids = self.id_param
+        if ids is None:
+            return
+        if not isinstance(ids, IdParam):
+            raise ValueError(f"{self.name}: id_param must be an IdParam, not {type(ids).__name__}")
+        paging = {(place, name) for place, name in self.paginator.params}
+        if fields != ({ids.name} if ids.place is IdPlace.PATH else frozenset()):
+            problem = f"the path fields {sorted(fields)} are not just a path id's own"
+        elif ids.place is IdPlace.QUERY and (ids.name in self.fixed_query or (Place.QUERY, ids.name) in paging):
+            problem = f"query id {ids.name!r} is already a fixed or paging query parameter"
+        elif ids.place is IdPlace.BODY and self.method == "GET":
+            problem = f"body id {ids.name!r} goes in the body of a GET request"
+        elif ids.place is IdPlace.BODY and (
+            (self.fixed_body is not None and ids.name in self.fixed_body) or (Place.BODY, ids.name) in paging
+        ):
+            problem = f"body id {ids.name!r} is already a fixed or paging body key"
+        else:
+            return
+        raise ValueError(f"{self.name}: cannot take its ids: {problem}")
+
+    def request_for(self, ids: Sequence[str]) -> ConnectorRequest:
+        """Return the first request of a fanned-out call for some ids, with the ids where ``id_param`` puts them.
+
+        A path id is percent-encoded and checked as ``request`` does a path parameter; a query id is added with
+        ``with_query``; body ids are set as a list at the body key with ``with_body_at``. ``_check_ids`` guarantees the
+        path template's only field is a path id's name, and that a query or body id clashes with no fixed or paging
+        parameter and a body id is never in a GET, so neither builder can refuse the id. Only a path id is checked for
+        being empty: a query id of ``""`` is sent as ``name=`` and body ids of ``""`` are sent as they are. The ids are
+        not checked for duplicates.
+
+        Nor is a bare ``str`` refused, though it is a ``Sequence[str]``: ``request_for("12")`` on a body id would send
+        ``["1", "2"]`` (todo.txt 19).
+
+        Preconditions:
+            None checked beyond the count; callers pass non-empty ids (``fanout`` ids are, by ``id_text``).
+
+        Args:
+            ids: The ids the call is for, 1 to ``id_param.batch`` of them, each meant to be a non-empty string.
+
+        Returns:
+            A new ``ConnectorRequest`` carrying the fixed query, fixed body, scope and the ids.
+
+        Raises:
+            ValueError: Naming the spec, when ``id_param`` is ``None`` or ``ids`` holds fewer than 1 or more than
+                ``id_param.batch`` ids: errors of the caller, not of an id.
+            IdRefused: Naming the spec and field but not the id, for a path id that ``request`` refuses: empty,
+                ``"."`` or ``".."``, or holding a lone surrogate. ``_check_ids`` leaves the value as the only thing
+                ``request`` can refuse there; its ``ValueError`` is not chained.
+            Exception: Whatever ``copy.deepcopy`` raises, from ``with_body_at``, for a fixed body that cannot be
+                deep-copied.
+
+        """
+        where = self.id_param
+        if where is None:
+            raise ValueError(f"{self.name}: takes no ids")
+        if not 1 <= len(ids) <= where.batch:
+            raise ValueError(f"{self.name}: a call is for 1 to {where.batch} ids, not {len(ids)}")
+        if where.place is IdPlace.PATH:
+            try:
+                return self.request({where.name: ids[0]})
+            except ValueError as err:  # the template's only field is the id's, so only its value can be refused
+                raise IdRefused(str(err)) from None
+        if where.place is IdPlace.QUERY:
+            return self.request().with_query({where.name: ids[0]})
+        return self.request().with_body_at((where.name,), list(ids))
 
     def request(self, path_params: Mapping[str, str] = _NO_PATH_PARAMS) -> ConnectorRequest:
         """Return the first request for this endpoint, with path parameters substituted.
@@ -534,7 +700,8 @@ class EndpointSpec:
     def records(self, body: Mapping[str, Any]) -> list[Any]:
         """Return the records list from a response body.
 
-        The list returned is the body's own object, not a copy.
+        The list returned is the body's own object, not a copy. For a ``one_record`` endpoint it is a new list of the
+        one record object at ``records_at``, or an empty one when nothing or ``null`` is there.
 
         Preconditions:
             None.
@@ -543,13 +710,24 @@ class EndpointSpec:
             body: A decoded response body.
 
         Returns:
-            The list at ``records_at``.
+            The list at ``records_at``; for a ``one_record`` endpoint, ``[record]`` or ``[]``.
 
         Raises:
             ClientErrorUnhandled: From ``unhandled`` when nothing is at ``records_at`` or the value there is not a list,
-                including ``None``.
+                including ``None``; for a ``one_record`` endpoint, only when the value there is neither an object nor
+                ``null``.
 
         """
+        if self.one_record:
+            try:
+                one = value_at(body, self.records_at)
+            except KeyError:
+                return []  # an item endpoint leaves out an item it does not return
+            if one is None:
+                return []
+            if not isinstance(one, Mapping):
+                raise self.unhandled(f"record at {'.'.join(self.records_at)} is a {type(one).__name__}, not an object")
+            return [one]
         try:
             found = value_at(body, self.records_at)
         except KeyError:
@@ -562,7 +740,8 @@ class EndpointSpec:
         """Return the number of records in a response body.
 
         On the last page, nothing at ``records_at`` (missing as ``value_at`` defines it) or a ``None`` value there
-        counts as 0. Any other value that is not a list still raises, even on the last page.
+        counts as 0. Any other value that is not a list still raises, even on the last page. For a ``one_record``
+        endpoint the count is 1 for an object and 0 for nothing or ``null``, on any page.
 
         Preconditions:
             None.
@@ -572,11 +751,13 @@ class EndpointSpec:
             last_page: Whether this body is the final page.
 
         Returns:
-            The length of the records list, or 0 on a last page with nothing or ``null`` at ``records_at``.
+            The length of the records list, or 0 on a last page with nothing or ``null`` at ``records_at``; for a
+            ``one_record`` endpoint, 1 or 0.
 
         Raises:
             ClientErrorUnhandled: From ``records`` when the records are missing or ``null`` on a page that is not the
-                last, or the value is something other than a list.
+                last, or the value is something other than a list; for a ``one_record`` endpoint, only when the value
+                is neither an object nor ``null``.
 
         """
         if last_page:

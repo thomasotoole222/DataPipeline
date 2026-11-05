@@ -14,13 +14,14 @@ from zoneinfo import ZoneInfo
 
 from pipeline.checks.checks import Validation
 from pipeline.checks.record import Record
-from pipeline.checks.targets import ReplacePartition, target_of
+from pipeline.checks.targets import ReplacePartition, target_of, walk
 from pipeline.connectors.client import ConnectorClient
+from pipeline.connectors.fanout import DEFAULT_CONCURRENCY, FromList, FromQuery, IdSource
 from pipeline.connectors.spec import EndpointSpec
 from pipeline.db.control import ClaimedTask, Fence, TaskReport
 from pipeline.db.pool import Connection, Pool
 from pipeline.errors import Outcome
-from pipeline.stages.extract import extract
+from pipeline.stages.extract import extract, fan_out
 from pipeline.stages.load import Loaded, load
 from pipeline.stages.transform import transform
 from pipeline.stages.validate import validate
@@ -39,8 +40,8 @@ _ROWS_FETCHED: Final = "rows_fetched"
 class TaskLease(Fence, Protocol):
     """Define the lease a job runs a task under: it fences writes, gives the pool and reports the outcome.
 
-    The worker's ``Lease`` satisfies it structurally. ``BatchJob.__call__`` uses ``fenced`` (through ``extract`` and
-    ``_Completing``), ``pool`` and ``complete``.
+    The worker's ``Lease`` satisfies it structurally. ``BatchJob.__call__`` uses ``fenced`` (through ``extract`` or
+    ``fan_out``, and ``_Completing``), ``pool`` and ``complete``.
 
     """
 
@@ -151,18 +152,29 @@ class _Completing:
 class BatchJob[R: Record]:
     """Run one claimed task of a job: Extract, Validate, Transform and Load, then report success inside Load.
 
-    A subclass sets ``name``, ``spec``, ``window``, ``partition`` and ``validation`` as class attributes and nothing
-    else; the lifecycle, ``__call__``, is final. An instance is the job's ``TaskRunner``. ``__init__`` checks that the
-    attributes are set and agree with each other, with the client and with the record model's root target (see
-    ``__init__``).
+    A subclass sets ``name``, ``spec``, ``window``, ``partition`` and ``validation`` as class attributes, and
+    ``id_source`` and ``concurrency`` for a fanned-out job, and nothing else; the lifecycle, ``__call__``, is final. An
+    instance is the job's ``TaskRunner``. ``__init__`` checks that the attributes are set and agree with each other,
+    with the client and with the record model's root target (see ``__init__``).
+
+    A fanned-out job calls ``spec`` once per id, or per batch of ids, where ``spec.id_param`` puts them, and its
+    ``id_source`` says where the ids come from: the records of a list endpoint (``FromList``) or a warehouse query
+    (``FromQuery``). ``spec`` is always the endpoint whose records are the task's records. A job is fanned out when
+    ``id_source`` or ``spec.id_param`` is set; ``__init__`` refuses one set without the other.
 
     Attributes:
         name (str): The job's name, as tasks name it in ``control.task.job``.
-        spec (EndpointSpec): The one endpoint the job fetches.
-        window (str | None): The name in ``spec.windows`` the time frame is applied with; ``None`` exactly when
-            ``partition`` is ``"none"``.
+        spec (EndpointSpec): The endpoint whose records the job loads; for a fanned-out job, the one called per id.
+        window (str | None): The name the time frame is applied with: a name in ``spec.windows``; for a fanned-out
+            job, a name in the windows of each of ``spec`` and a list endpoint that has windows (one with none is
+            fetched without the frame), so a fanned-out ``"none"`` job is refused when either endpoint has windows.
+            ``None`` exactly when ``partition`` is ``"none"``.
         partition (Partition): How a task's ``partition_key`` becomes its time frame.
         validation (Validation[R]): The record model, its checks and the batch policy.
+        id_source (IdSource | None): Where a fanned-out job's ids come from; ``None``, the default, for a job that is
+            not fanned out.
+        concurrency (int): The most fanned-out calls a task has in flight at once: an ``int`` of 1 or more, checked
+            only for a fanned-out job and unused otherwise. Defaults to ``DEFAULT_CONCURRENCY``, 5.
 
     """
 
@@ -171,6 +183,8 @@ class BatchJob[R: Record]:
     window: str | None
     partition: Partition
     validation: Validation[R]
+    id_source: IdSource | None = None  # set: a fanned-out job, spec called per id
+    concurrency: int = DEFAULT_CONCURRENCY  # fanned-out calls in flight per task
 
     def __init__(self, *, client: ConnectorClient[Any], zone: ZoneInfo, instruments: Instruments) -> None:
         """Check the job's declaration against itself and the client, then store the client, zone and instruments.
@@ -178,8 +192,10 @@ class BatchJob[R: Record]:
         The record model's root target is built with ``target_of``, so a model that would fail every run after
         Extract is refused here instead: one that declares no table or loads as child rows, and one whose root
         target writes with ``ReplacePartition`` under a ``"none"`` partition, which has no frame to replace. A child
-        target always writes with ``ReplaceChildren`` (the ``Rows`` mark in ``pipeline.checks.targets`` refuses any
-        other; not among this page's contracts), so only the root is checked.
+        target always writes with ``Upsert``, ``Versioned`` or ``ReplaceChildren`` (the ``Rows`` mark in
+        ``pipeline.checks.targets`` refuses any other; not among this page's contracts), so only the root is checked.
+        A job with ``id_source`` or ``spec.id_param`` set is checked as a fan-out by ``_check_fan_out``, in place of
+        the ``spec.windows`` check; any other job's ``concurrency`` is not checked.
 
         Preconditions:
             None.
@@ -196,9 +212,9 @@ class BatchJob[R: Record]:
             AttributeError: A class attribute is not set.
             TypeError: From ``target_of``: ``validation.model`` declares no table, or loads as child rows.
             ValueError: ``client.connector`` is not ``spec.connector``; ``partition`` is neither ``"day"`` nor
-                ``"none"``; ``window`` is ``None`` for a ``"day"`` partition, set for a ``"none"`` one, or not a name
-                in ``spec.windows``; or the model's root target writes with ``ReplacePartition`` under a ``"none"``
-                partition.
+                ``"none"``; ``window`` is ``None`` for a ``"day"`` partition, set for a ``"none"`` one, or, for a job
+                that is not fanned out, not a name in ``spec.windows``; for a fan-out, anything ``_check_fan_out``
+                refuses; or the model's root target writes with ``ReplacePartition`` under a ``"none"`` partition.
 
         """
         for attribute in ("name", "spec", "window", "partition", "validation"):
@@ -209,14 +225,76 @@ class BatchJob[R: Record]:
             raise ValueError(f"job {self.name}: unknown partition {self.partition!r}")
         if (self.window is None) != (self.partition == "none"):
             raise ValueError(f"job {self.name}: a {self.partition} partition needs window None exactly when 'none'")
-        if self.window is not None and self.window not in self.spec.windows:
-            raise ValueError(f"job {self.name}: {self.spec.name} has no window {self.window!r}")
+        if self.id_source is None and self.spec.id_param is None:
+            if self.window is not None and self.window not in self.spec.windows:
+                raise ValueError(f"job {self.name}: {self.spec.name} has no window {self.window!r}")
+        else:
+            self._check_fan_out()
         root = target_of(self.validation.model)
         if self.partition == "none" and isinstance(root.writer, ReplacePartition):
             raise ValueError(f"job {self.name}: {root.table} replaces a partition, but a none partition has no frame")
         self._client = client
         self._zone = zone
         self._instruments = instruments
+
+    def _check_fan_out(self) -> None:
+        """Check a fanned-out job's declaration: its id source, its per-id endpoint, its windows and concurrency.
+
+        ``spec``, and a ``FromList``'s endpoint, are each checked only when they have windows, as ``fan_out`` fetches
+        an endpoint with none without the frame. ``window`` is ``None`` for a ``"none"`` partition, so a ``"none"``
+        fan-out with a windowed endpoint is refused: ``fetch_pages`` would raise "needs a window" for it on every run,
+        as it does for a job that is not fanned out.
+
+        No target of the record model, the root or any under it, may write with ``ReplacePartition``. An empty id
+        source skips Validate and Load and leaves every target as it is, which is right for every other writer: a load
+        of no records writes nothing to an ``Upsert`` target, and ``stages.load`` refuses one that would prune every
+        row of a ``Snapshot``, ``Versioned`` or ``Update(missing="zero")`` target (``NothingLoaded``). A
+        ``ReplacePartition`` target is the one a load of no rows would clear, so skipping would keep rows a re-run of
+        the day should remove.
+
+        Preconditions:
+            ``id_source`` or ``spec.id_param`` is set; ``window`` agrees with ``partition`` (``__init__`` checks it
+            first).
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: Naming the job, when only one of ``id_source`` and ``spec.id_param`` is set; when
+                ``id_source`` is neither a ``FromList`` nor a ``FromQuery``; when a ``FromList``'s endpoint is of
+                another connector; when ``keep_list_row`` is set with more than one id per call, where a missing
+                record cannot be told apart; when ``concurrency`` is not an ``int`` (a ``bool`` included) of 1 or
+                more; when ``spec`` or a list endpoint has windows and ``window`` is not one of them, or is ``None``
+                under a ``"none"`` partition; or when a target of the record model writes with ``ReplacePartition``.
+
+        """
+        source = self.id_source
+        if source is None or self.spec.id_param is None:
+            raise ValueError(f"job {self.name}: a fan-out needs both an id_source and a spec with an id_param")
+        if not isinstance(source, FromList | FromQuery):
+            raise ValueError(f"job {self.name}: id_source must be a FromList or a FromQuery")
+        specs = [self.spec]
+        if isinstance(source, FromList):
+            if source.spec.connector != self.spec.connector:
+                raise ValueError(f"job {self.name}: the list {source.spec.name} is of another connector")
+            if source.keep_list_row and self.spec.id_param.batch > 1:
+                raise ValueError(
+                    f"job {self.name}: keep_list_row needs one id per call, not {self.spec.id_param.batch}"
+                )
+            specs.append(source.spec)
+        if not isinstance(self.concurrency, int) or isinstance(self.concurrency, bool) or self.concurrency < 1:
+            raise ValueError(f"job {self.name}: concurrency must be an int of 1 or more, not {self.concurrency!r}")
+        for spec in specs:
+            if spec.windows and self.window is None:
+                raise ValueError(f"job {self.name}: {spec.name} has windows, so it needs a day partition, not none")
+            if spec.windows and self.window not in spec.windows:
+                raise ValueError(f"job {self.name}: {spec.name} has no window {self.window!r}")
+        for target in walk(target_of(self.validation.model)):
+            if isinstance(target.writer, ReplacePartition):
+                raise ValueError(
+                    f"job {self.name}: {target.table} replaces a partition, which a fan-out cannot: an empty id "
+                    "source loads nothing, so the partition would keep rows a load of no records removes"
+                )
 
     def frame(self, partition_key: str) -> TimeFrame | None:
         """Return the time frame a task's partition key covers.
@@ -256,8 +334,14 @@ class BatchJob[R: Record]:
 
         Steps:
             1. ``frame`` turns the task's partition key into its time frame.
-            2. ``extract`` lands every page of ``spec`` in ``raw.page``, each write fenced on the lease.
-            3. ``validate`` splits the landed records into accepted and held.
+            2. ``extract`` lands every page of ``spec`` in ``raw.page``, each write fenced on the lease; for a
+               fanned-out job, ``fan_out`` reads the ids and lands the list's pages and every call's. When the id
+               source gave no ids, the task succeeds there: the report, with no rows written or held, is written in
+               its own fenced transaction on a pooled connection, with nothing validated, loaded or pruned, so every
+               target keeps its rows. ``_check_fan_out`` refuses ``ReplacePartition``, the one writer whose load of no
+               rows would clear rows, so this holds for every writer a fan-out can use.
+            3. ``validate`` splits the landed records into accepted and held; for a fanned-out job it is given
+               ``id_source``.
             4. ``transform`` turns the accepted records into one frame per target table.
             5. ``load`` writes the held rows and the frames in one transaction fenced on the lease; its last write
                is ``lease.complete`` with a ``SUCCEEDED`` report, so the rows and the outcome commit together. It
@@ -268,8 +352,9 @@ class BatchJob[R: Record]:
         hands over through ``on_loaded`` before the report is built) and the rows held (``Loaded.held``), and its
         duration runs from ``task.claimed_at`` until Load's writes are done, floored at zero when the wall clock is
         behind the claim time. The text ``lease.complete`` returns is discarded. An ``Exception`` from Validate,
-        Transform or Load escapes with ``rows_fetched`` set to the records Extract fetched; one from Extract carries
-        Extract's own count.
+        Transform or Load, or from the empty fan-out's report, escapes with ``rows_fetched`` set to the records Extract
+        fetched; one from ``extract`` or ``fan_out`` carries that stage's own count. For a fanned-out job, the records
+        fetched are the list's and every call's.
 
         Preconditions:
             ``lease`` is the lease this worker holds on ``task``.
@@ -287,13 +372,29 @@ class BatchJob[R: Record]:
             OverflowError: From ``frame``, for a ``"day"`` key of ``"9999-12-30"`` or ``"9999-12-31"``, or one whose
                 local midnight leaves the ``datetime`` range in UTC, before anything is written.
             Exception: Anything a stage, ``lease.complete`` or ``TaskReport`` raises, unchanged but for its
-                ``rows_fetched``; the worker reports it as the task's outcome. Pages landed by ``extract`` stay
-                committed when a later stage raises.
+                ``rows_fetched``; the worker reports it as the task's outcome. Pages landed by ``extract`` or
+                ``fan_out`` stay committed when a later stage raises.
 
         """
         frame = self.frame(task.partition_key)
         pool = lease.pool
-        fetched = await extract(pool, task, lease, self._client, self.spec, self.window, frame, self._instruments)
+        ids: int | None = None  # the distinct ids a fanned-out task called; None: not fanned out
+        if self.id_source is None:
+            fetched = await extract(pool, task, lease, self._client, self.spec, self.window, frame, self._instruments)
+        else:
+            fanned = await fan_out(
+                pool,
+                task,
+                lease,
+                self._client,
+                self.spec,
+                self.window,
+                frame,
+                self._instruments,
+                source=self.id_source,
+                concurrency=self.concurrency,
+            )
+            fetched, ids = fanned.rows, fanned.ids
         loaded: list[Loaded] = []  # load hands its result over inside its transaction, before the report is built
 
         def report() -> TaskReport:
@@ -310,7 +411,13 @@ class BatchJob[R: Record]:
             )
 
         try:
-            validated = await validate(pool, task, self.spec, frame, self.validation, self._instruments)
+            if ids == 0:  # an empty id source is a normal day: nothing to validate, load or prune
+                loaded.append(Loaded(sent={}, changed={}, held=0))
+                async with pool.connection() as conn, _Completing(lease, report).fenced(conn):
+                    return
+            validated = await validate(
+                pool, task, self.spec, frame, self.validation, self._instruments, id_source=self.id_source
+            )
             transformed = transform(self.validation.model, validated.accepted, task.source_id)
             completing = _Completing(lease, report)
             await load(

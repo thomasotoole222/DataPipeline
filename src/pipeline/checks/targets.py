@@ -4,7 +4,7 @@ Public API:
     TABLE_PATTERN: The pattern a ``schema.table`` name matches, used with ``fullmatch``.
     COLUMN_PATTERN: The pattern a bare column name matches, used with ``fullmatch``.
     To: Field mark that loads a single value into the named column.
-    Rows: Field mark that loads a ``list`` of child parts as rows of the child's own table.
+    Rows: Field mark that loads a child part, or a ``list`` of them, as rows of the child's own table.
     Width: Field mark that loads an ``int`` field into a narrower integer column: ``integer`` or ``smallint``.
     Upsert: Writer that inserts rows or updates them on a conflict over ``key``.
     ReplaceChildren: Writer for a child table whose rows are replaced under each parent's key, matched on ``key``.
@@ -14,9 +14,11 @@ Public API:
     Versioned: A ``Snapshot`` that keeps history: a change closes the open version and opens a new one.
     Writer: The union of the writer classes.
     Column: One target column: its name, frame and Postgres types, nullability and path on the record.
-    Target: A table, its writer, source column, columns and child targets.
+    Target: A table, its writer, source column, columns and child targets; or a container's key columns and children.
     target_of: Return a model's top-level target.
+    walk: Yield a target and every target under it, parents first.
     build_target: Build and check a model's target from its table, writer, source column and field marks.
+    build_container: Build and check a container record's target: no table, only its key columns and ``Rows`` children.
     row_key: Return the columns that identify one row of a target's table, or None for a writer without them.
     mismatches: List the ways a table in the catalog does not fit a target.
     alias_value: Return a ``type`` alias's value, with a subscripted generic alias's arguments substituted.
@@ -25,7 +27,9 @@ Private units:
     _columns: Collect the columns of a model's marked fields and computed fields, nested parts included.
     _unwrap: Strip type aliases, ``Annotated`` and ``Optional`` from an annotation.
     _mark: Return the one ``To`` or ``Rows`` in a field's metadata, or None.
-    _child: Return the target of a ``Rows`` field's child part.
+    _child: Return the target of a ``Rows`` field's child part, or of its list's item part.
+    _adopt: Rebuild a child target, and every target under it, with the columns it inherits from its parent.
+    _check_tables: Check that no two targets in a tree load into one table.
     _column: Build the ``Column`` for a ``To`` field.
     _column_type: Map an annotation to its frame type and Postgres type.
     _check_names: Check that no column name appears more than once.
@@ -38,7 +42,7 @@ Private units:
 
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -139,10 +143,15 @@ class Width:
 
 @dataclass(frozen=True, slots=True)
 class Rows:
-    """Field mark that loads a ``list`` of child parts as rows of the child's own table.
+    """Field mark that loads a child part, or a ``list`` of them, as rows of the child's own table.
 
-    Only a ``list[SomePart]`` field of the class that declares the table may carry it, and ``SomePart`` must declare a
-    table with ``ReplaceChildren``; ``_columns`` and ``_child`` check this.
+    Only a field of the class that declares the table (or of a container record, ``build_container``) may carry it,
+    never a field of a nested part without a table. The field is either ``list[SomePart]`` (one row per item; neither
+    the field nor an item may be None) or a single ``SomePart`` (one-to-one: one row, or none when the field is
+    ``SomePart | None`` and holds None). ``SomePart`` must declare a table with no source column and an ``Upsert``,
+    ``Versioned`` or ``ReplaceChildren`` writer; an ``Upsert`` or ``Versioned`` item of a list needs a key of its own.
+    ``_columns`` and ``_child`` check this. A child may carry ``Rows`` fields of its own, so children nest;
+    ``build_target`` gives each child the columns it inherits from its parent (see ``Target``).
 
     """
 
@@ -154,11 +163,14 @@ class Upsert:
     """Writer that inserts rows or updates them on a conflict over ``key``.
 
     ``__post_init__`` is not defined, so ``key`` is not validated here; ``_check_writer`` checks it when the target is
-    built.
+    built. As a child's writer, ``key`` names the child's own columns, and the parent's columns it inherits are plain
+    columns outside it; a one-to-one child may leave ``key`` empty, and is then keyed by its inherited columns
+    (``row_key``). An ``Upsert`` child never deletes: a row its parent no longer lists stays as it is.
 
     Attributes:
-        key: Target column names: non-empty, distinct, not nullable, and including the source column when the table has
-            one.
+        key: Target column names: distinct, not nullable, and including the source column when the table has one;
+            non-empty except for a one-to-one child's (``_child`` refuses an empty key for a list's items, and
+            ``pipeline.checks.record`` refuses one for a ``Record``).
 
     """
 
@@ -169,11 +181,11 @@ class Upsert:
 class ReplaceChildren:
     """Writer for a child table whose rows are replaced under each parent's key, matched on ``key``.
 
-    The child target inherits the parent writer's key columns; ``key`` names the child's own columns that, after the
-    inherited ones, identify one row (``row_key``). ``__post_init__`` is not defined, so ``key`` is not validated here;
-    ``_check_writer`` checks it when the target is built. ``_key`` gives ``None`` for this writer, so a child cannot
-    have children of its own. A target with this writer has no source column (``build_target`` refuses one) and is
-    reached only through its parent's ``children``.
+    The child target inherits its parent's row key columns (a top-level parent's whole writer key, the source column
+    included); ``key`` names the child's own columns that, after the inherited ones, identify one row (``row_key``).
+    ``__post_init__`` is not defined, so ``key`` is not validated here; ``_check_writer`` checks it when the target is
+    built. A target with this writer has no source column (``build_target`` refuses one) and is reached only through
+    its parent's ``children``; its own children inherit its row key.
 
     Attributes:
         key: The child's own column names: non-empty, distinct, not nullable, none of them inherited.
@@ -251,18 +263,27 @@ class Versioned(Snapshot):
     is closed on D - 1, or deleted when it started on D (the day's last observation wins). Nothing else is deleted.
 
     As a ``Snapshot`` subclass it shares ``Snapshot``'s rules wherever they test for ``Snapshot``: ``key`` is checked
-    as a writer key (non-empty, distinct, not nullable, the source column included), no missing id is closed while
-    records are held, and an empty frame is refused when pruning. ``_check_writer`` and ``mismatches`` give it checks
-    of its own in place of ``Snapshot``'s ``removed_at`` ones, and ``build_target`` refuses ``Rows`` children.
+    as a writer key (distinct, not nullable, the source column included), and for a top-level target no missing id is
+    closed while records are held, and an empty frame is refused when pruning. ``_check_writer`` and ``mismatches``
+    give it checks of its own in place of ``Snapshot``'s ``removed_at`` ones.
+
+    As a child's writer, the id is the child's row key (``row_key``): its own ``key``, or, for a one-to-one child that
+    leaves ``key`` empty, the columns it inherits from its parent, which are otherwise plain columns. A child is always
+    pruned, but only under its parents staged in the same load: an open version whose inherited columns match a staged
+    parent and whose id is not staged is closed on D - 1, or deleted when it started on D, even while records are held
+    (a held record's parent is not staged). An empty child frame is valid. Closing a parent closes none of its
+    children.
 
     Attributes:
-        key: As for ``Snapshot``: the columns that identify an id, the source column included when the table has one.
+        key: As for ``Snapshot``: the columns that identify an id, the source column included when the table has one;
+            for a child, its own columns, empty only for a one-to-one child.
         valid_from: The table column holding a version's first day; ``integer`` or ``bigint`` (``YYYYMMDD`` date keys)
             or ``date``, not nullable, set by the writer only.
         valid_to: The table column holding a version's last day, of ``valid_from``'s kind (a date key of either
             width, or a date), nullable (None while the version is open), set by the writer only.
         opens_from: A target column of an ``int`` field without a 16-bit ``Width``, or of a ``date`` field, of
-            ``valid_from``'s kind, dating a new id's first version; or None to open it on D.
+            ``valid_from``'s kind, dating a new id's first version; or None to open it on D. For a child, one of its
+            own columns, never an inherited one (``_check_writer`` sees only the child's own columns).
 
     """
 
@@ -288,8 +309,10 @@ class Column:
         postgres: The column's type exactly as ``format_type`` prints it.
         nullable: True when the field allows None, or lies inside a part that does.
         path: Field names from the record to the value, nested parts included; ``()`` for the source column. In a child
-            target, an inherited column's path is on the parent record and the child's own columns' paths are on the
-            child part.
+            target, the child's own columns' paths are on the child part, and an inherited column is the ``Column`` of
+            the target that first defined it, so its path is on that target's model: the parent, or, for a column
+            inherited through several levels (a ``ReplaceChildren`` child passes on what it inherited), an ancestor
+            further up.
 
     """
 
@@ -304,67 +327,117 @@ class Column:
 
 @dataclass(frozen=True, slots=True)
 class Target:
-    """A table, its writer, source column, columns and child targets.
+    """A table, its writer, source column, columns and child targets; or a container's key columns and children.
 
-    ``__post_init__`` is not defined, so nothing is validated here; every instance comes from ``build_target``, which
-    checks the names, the writer against the columns, and that column names are distinct.
+    ``__post_init__`` is not defined, so nothing is validated here; every instance comes from ``build_target`` or
+    ``build_container`` (or ``_adopt``, which both call), which check the names, the writer against the columns, and
+    that column names are distinct.
+
+    A container (``build_container``) is a top-level target with no table and no writer: ``table`` and ``writer`` are
+    both None, and for no other target is either None. Its columns are its source column, when it has one, and its
+    ``record_key`` fields' columns: its key, which Load stages for its children but writes nowhere.
+
+    A child target (one in some target's ``children``) has a non-empty ``inherited``; a top-level target has none. What
+    a child inherits, under the parent's own column names: from a top-level parent with a table, its writer key,
+    without the source column for an ``Upsert`` or ``Versioned`` child, with it for a ``ReplaceChildren`` child; from
+    a container, every one of its columns (the source column included), whatever the child's writer; from a child
+    parent, that parent's row key (``row_key``), which never holds a source column.
 
     Attributes:
-        table: The table as ``schema.table``, matching ``TABLE_PATTERN``.
-        writer: How the frame is written to ``table``.
-        source_column: The column the task's source id is written to, or None; always None for ``ReplaceChildren``.
+        table: The table as ``schema.table``, matching ``TABLE_PATTERN``; None for a container.
+        writer: How the frame is written to ``table``; None for a container.
+        source_column: The column the task's source id is written to, or None; always None for a child.
         columns: Every column the frame has, in frame order: the source column first, then inherited, then own.
-        inherited: The column names copied from the parent row (the parent writer's key); ``()`` for a top-level
-            target.
-        children: ``(Rows field name, child target)`` pairs in field order; a child target has no children.
+        inherited: The column names copied from the parent row (see above); ``()`` for a top-level target.
+        children: ``(Rows field name, child target)`` pairs in field order; children may have children of their own.
 
     """
 
-    table: str  # "schema.table"
-    writer: Writer
+    table: str | None  # "schema.table"; None for a container
+    writer: Writer | None  # None for a container
     source_column: str | None
     columns: tuple[
         Column, ...
     ]  # every column the frame has, in frame order: source column first, then inherited, then own
-    inherited: tuple[str, ...]  # columns copied from the parent row; () for a top-level target
+    inherited: tuple[str, ...]  # columns copied from the parent row; () for a top-level target, never () for a child
     children: tuple[tuple[str, Target], ...]  # (the Rows field name, the child's target), in field order
 
 
 def target_of(model: type[BaseModel]) -> Target:
     """Return a model's top-level target.
 
+    Only a ``Record`` loads at the top level, as a target with a table or as a container (``build_container``).
+    ``pipeline.checks.record`` imports this module, so a ``Record`` is told by its ``record_key``, which every
+    ``Record`` subclass must set (and which a ``Part`` does not have), rather than by ``issubclass``. A ``Part`` with a
+    table loads only as a child, whatever its writer, so its target here is not the full one: that is in its parent's
+    ``children``, with its inherited columns.
+
     Preconditions:
         None.
 
     Args:
-        model: The record model; its ``__target__`` attribute is read, and a missing attribute counts as None.
+        model: The record model; its ``__target__`` and ``record_key`` attributes are read, and a missing attribute
+            counts as None.
 
     Returns:
         ``model.__target__``.
 
     Raises:
-        TypeError: ``model`` declares no table, or its writer is ``ReplaceChildren`` (its full target is in its
-            parent's ``children``).
+        TypeError: ``model`` has no target (it declares no table and is not a container), has no ``record_key`` (a
+            ``Part`` rather than a ``Record``), or its writer is ``ReplaceChildren``; in the last two cases it loads as
+            child rows.
 
     """
     target: Target | None = getattr(model, "__target__", None)
     if target is None:
         raise TypeError(f"{model.__name__} declares no table")
-    if isinstance(target.writer, ReplaceChildren):
+    if getattr(model, "record_key", None) is None or isinstance(target.writer, ReplaceChildren):
         raise TypeError(f"{model.__name__} loads as child rows; its target is in its parent's children")
     return target
+
+
+def walk(target: Target) -> Iterator[Target]:
+    """Yield a target and every target under it, parents first.
+
+    The order is pre-order: ``target``, then for each child in field order the child and everything under it, so a
+    target always comes before its children and a parent's whole subtree before its next sibling.
+
+    Preconditions:
+        None.
+
+    Args:
+        target: The target to start from.
+
+    Yields:
+        ``target``, then each target under it, in the order above.
+
+    Raises:
+        Nothing.
+
+    """
+    yield target
+    for _, child in target.children:
+        yield from walk(child)
 
 
 def build_target(model: type[BaseModel], table: str, writer: Writer, source_column: str | None) -> Target:
     """Build and check a model's target from its table, writer, source column and field marks.
 
     The columns are the source column (``uuid``, not nullable, path ``()``) when given, then the columns ``_columns``
-    collects. Each ``Rows`` field gives a child whose target is rebuilt with the writer key's columns (inherited)
-    before its own and ``inherited`` set to the key names. A child cannot have children of its own: its writer is
-    ``ReplaceChildren``, for which ``_key`` gives no key, so its own build refused any ``Rows``. An ``Update`` parent
-    cannot have children: the row it updates may not exist, so its child rows would have no parent. A ``Versioned``
-    parent cannot either: its rows are versions, not one row per parent. The model's table and its children's tables
-    must all differ.
+    collects. Each ``Rows`` field gives a child, whose target (as its own class built it, with its own children) is
+    adopted by ``_adopt``: rebuilt with the columns it inherits before its own, and so on down its children. What a
+    child inherits is this target's row key (``row_key``: the writer key for a top-level target), less the source
+    column for an ``Upsert`` or ``Versioned`` child; a ``ReplaceChildren`` child inherits it whole. So a target needs
+    a non-empty row key to have children: a ``ReplacePartition`` target cannot have any, and nor can a one-to-one
+    child that leaves its key empty (its row key is known only once its parent adopts it). An ``Update`` parent
+    cannot have children either: the row it updates may not exist, so its child rows would have no parent. Every
+    table in the finished tree (this target's and every child's, at any depth) must differ.
+
+    What each child is passed is also checked to be non-empty: with a writer key of the source column alone, an
+    ``Upsert`` or ``Versioned`` child would be passed nothing once the source column is left out, and so could not
+    tell which parent row it belongs to, so ``Rows`` is refused there too. A ``Record`` cannot reach this
+    (``pipeline.checks.record`` refuses a writer key that lacks its ``record_key`` columns), but a ``Part`` declaring
+    a table with a source column, or a direct call, can.
 
     Preconditions:
         None.
@@ -376,19 +449,23 @@ def build_target(model: type[BaseModel], table: str, writer: Writer, source_colu
         source_column: The column the task's source id is written to, or None.
 
     Returns:
-        The target, with ``inherited=()`` and one child per ``Rows`` field in field order.
+        The target, with ``inherited=()`` and one child per ``Rows`` field in field order, each adopted with its
+        inherited columns.
 
     Raises:
         ValueError: ``table`` or ``source_column`` is not a lower-case name of the right form (an identifier over 63
             characters included); from ``_columns``, for a malformed ``To`` column or a ``Decimal`` precision or scale
             out of range; from ``_check_writer``, for a writer that does not fit the columns.
         TypeError: ``source_column`` is given with ``ReplaceChildren``; ``model`` is not complete; ``Rows`` is used with
-            a writer that has no key, with ``Versioned`` or with ``Update``; two targets load into one table; from
-            ``_columns``, for a misused mark (``Rows`` on a ``list`` without exactly one argument included, a
-            ``Width`` on a ``To`` field that is not an ``int``, is one of several or is unbounded for its width), a
-            type with no column type, a part that contains itself, an unmarked union with a part among its members or
-            a generic type alias whose arguments cannot be substituted; from ``_check_names``, for a repeated column
-            name in the model or in a child; from ``_check_writer``, for a ``ReplaceChildren`` model with no column of
+            a target whose row key is empty or None, or that passes a child no column (a writer key of the source
+            column alone, for an ``Upsert`` or ``Versioned`` child), or with ``Update``; two targets in the tree load
+            into one table;
+            from ``_columns``, for a misused mark (``Rows`` on a ``list`` without exactly one argument, or on a part
+            whose table does not fit a child, included; a ``Width`` on a ``To`` field that is not an ``int``, is one
+            of several or is unbounded for its width), a type with no column type, a part that contains itself, an
+            unmarked union with a part among its members or a generic type alias whose arguments cannot be
+            substituted; from ``_check_names`` (directly or through ``_adopt``), for a repeated column name in the
+            model or in a child at any depth; from ``_check_writer``, for a ``ReplaceChildren`` model with no column of
             its own.
 
     """
@@ -406,25 +483,147 @@ def build_target(model: type[BaseModel], table: str, writer: Writer, source_colu
     columns = (*source, *_columns(model, (), False, rows, (model,)))
     _check_names(name, columns)
     _check_writer(name, writer, columns, source_column)
-    key = _key(writer)
-    if rows and key is None:
-        raise TypeError(f"{name}: Rows needs a writer with a key (Upsert or Snapshot)")
-    if rows and isinstance(writer, Versioned):
-        raise TypeError(f"{name}: Rows is not for a Versioned table; its rows are versions, not one row per parent")
+    key = row_key(Target(table, writer, source_column, columns, (), ()))  # the row key, as a child would see it
+    if rows and not key:
+        raise TypeError(f"{name}: Rows needs a writer with a key of its own, such as Upsert or ReplaceChildren")
     if rows and isinstance(writer, Update):
         raise TypeError(f"{name}: Rows is not for an Update table; its rows may not exist to own the children")
     by_name = {column.name: column for column in columns}
-    inherited = tuple(by_name[column] for column in key or ())  # Rows implies a key, checked above
-    tables = [table, *(child.table for _, child in rows)]
+    children: list[tuple[str, Target]] = []
+    for field, child in rows:  # a keyed child is per parent id, not per source: it leaves the source column out
+        whole = isinstance(child.writer, ReplaceChildren)
+        passed = tuple(by_name[column] for column in key or () if whole or column != source_column)
+        if not passed:
+            raise TypeError(
+                f"{name}.{field}: Rows needs its parent's key to hold a column besides the source column "
+                f"{source_column!r}, for the child rows to name their parent"
+            )
+        children.append((field, _adopt(f"{name}.{field}", child, passed)))
+    target = Target(table, writer, source_column, columns, (), tuple(children))
+    _check_tables(name, target)
+    return target
+
+
+def build_container(model: type[BaseModel], key: Sequence[str], source_column: str | None) -> Target:
+    """Build and check a container record's target: no table, only its key columns and ``Rows`` children.
+
+    A container is a record that fills only its children's tables. Its columns are the source column (``uuid``, not
+    nullable, path ``()``) when given, then the columns ``_columns`` collects, which must be exactly one ``To``
+    column for each ``key`` field: those are what its children inherit, so any other ``To`` (a computed field's
+    included) would load nowhere and is refused. It needs at least one ``Rows`` field. Each child is adopted by
+    ``_adopt`` with every container column, the source column included, whatever its writer, and is then keyed by the
+    usual child rules (``row_key``). Every table in the tree must differ.
+
+    Preconditions:
+        ``key`` is the model's checked ``record_key`` (``pipeline.checks.record`` calls this after checking it).
+
+    Args:
+        model: The container record model.
+        key: Its ``record_key``: the fields whose columns its children inherit.
+        source_column: The column the task's source id is written to, or None.
+
+    Returns:
+        The container's target: ``table`` and ``writer`` None, ``inherited=()``, and one child per ``Rows`` field in
+        field order, each adopted with the container's columns.
+
+    Raises:
+        ValueError: ``source_column`` is not a lower-case name of the right form; from ``_columns``, for a malformed
+            ``To`` column or a ``Decimal`` precision or scale out of range.
+        TypeError: ``model`` is not complete; a ``key`` field has no ``To``; a field other than a ``key`` field has a
+            ``To``; there is no ``Rows`` field; two targets in the tree load into one table; from ``_columns``, for a
+            misused mark or field type as for ``build_target``; from ``_check_names`` (directly or through
+            ``_adopt``), for a repeated column name in the model or in a child at any depth.
+
+    """
+    name = model.__name__
+    if source_column is not None and not COLUMN_PATTERN.fullmatch(source_column):
+        raise ValueError(f"{name}: source_column must be a lower-case name, got {source_column!r}")
+    if not model.__pydantic_complete__:
+        raise TypeError(f"{name} is a container, so its field types must be defined first")
+    source = (Column(source_column, pl.String(), "uuid", False, ()),) if source_column is not None else ()
+    rows: list[tuple[str, Target]] = []
+    columns = (*source, *_columns(model, (), False, rows, (model,)))
+    _check_names(name, columns)
+    loaded = {column.path for column in columns if column.path}  # every column but the source column
+    for field in key:
+        if (field,) not in loaded:
+            raise TypeError(f"{name}.{field} is in record_key, so it needs a To")
+    loose = sorted(column.name for column in columns if column.path and column.path not in {(f,) for f in key})
+    if loose:
+        raise TypeError(f"{name}: a container loads no table, so only record_key fields take a To: {', '.join(loose)}")
+    if not rows:
+        raise TypeError(f"{name}: a container loads only its Rows children, so it needs one")
+    children = tuple((field, _adopt(f"{name}.{field}", child, columns)) for field, child in rows)
+    target = Target(None, None, source_column, columns, (), children)
+    _check_tables(name, target)
+    return target
+
+
+def _check_tables(name: str, target: Target) -> None:
+    """Check that no two targets in a tree load into one table.
+
+    A container has no table, so it is left out of the comparison.
+
+    Preconditions:
+        None.
+
+    Args:
+        name: The model name, used in the error message.
+        target: The top of the tree; every target ``walk`` yields from it is compared.
+
+    Returns:
+        None.
+
+    Raises:
+        TypeError: Two targets load into one table; the message lists each such table once, sorted.
+
+    """
+    tables = [found.table for found in walk(target) if found.table is not None]
     shared = sorted({t for t in tables if tables.count(t) > 1})
     if shared:
         raise TypeError(f"{name}: more than one target loads into {', '.join(shared)}")
-    children: list[tuple[str, Target]] = []
-    for field, child in rows:
-        child_columns = (*inherited, *child.columns)
-        _check_names(f"{name}.{field}", child_columns)
-        children.append((field, Target(child.table, child.writer, child.source_column, child_columns, key or (), ())))
-    return Target(table, writer, source_column, columns, (), tuple(children))
+
+
+def _adopt(where: str, child: Target, inherited: tuple[Column, ...]) -> Target:
+    """Rebuild a child target, and every target under it, with the columns it inherits from its parent.
+
+    The child's own columns are its columns less those it inherited before (``child.inherited``: ``()`` as its own
+    class built it, or the columns of an earlier parent's adoption); the new columns are ``inherited`` followed by
+    them. Each of the child's own children is then adopted in turn, inheriting the rebuilt child's row key
+    (``row_key``), whose columns keep their names. So a whole subtree takes its inherited columns from the top
+    parent that adopts it last.
+
+    Preconditions:
+        ``child`` came from ``build_target`` (directly or through an earlier ``_adopt``) and has no source column
+        (``_child`` refuses one); ``inherited`` is non-empty (``build_target`` refuses ``Rows`` otherwise, a container
+        passes its key columns, and a child parent's row key is never empty), and its columns are what the parent
+        passes: a top-level parent's row key, less the source column for an ``Upsert`` or ``Versioned`` child
+        (``build_target``); every container column (``build_container``); or a child parent's row key (this
+        function, one level up).
+
+    Args:
+        where: ``Model.field`` (``Model.field.field`` and so on below), used in error messages.
+        child: The child target to rebuild.
+        inherited: The parent's columns the child inherits, in the parent's column or row key order.
+
+    Returns:
+        The rebuilt target: ``columns`` the inherited columns then the child's own, ``inherited`` their names, and
+        every child adopted the same way.
+
+    Raises:
+        TypeError: From ``_check_names``, when an inherited column has the name of one of the child's own columns, at
+            this depth or below.
+
+    """
+    names = tuple(column.name for column in inherited)
+    own = tuple(column for column in child.columns if column.name not in child.inherited)
+    columns = (*inherited, *own)
+    _check_names(where, columns)
+    adopted = Target(child.table, child.writer, None, columns, names, ())
+    by_name = {column.name: column for column in columns}
+    passed = tuple(by_name[column] for column in row_key(adopted) or ())  # never empty: own key or the inherited
+    grandchildren = tuple((field, _adopt(f"{where}.{field}", grand, passed)) for field, grand in child.children)
+    return Target(child.table, child.writer, None, columns, names, grandchildren)
 
 
 def _columns(
@@ -439,8 +638,9 @@ def _columns(
     Fields come first, in field order, then computed fields. A ``To`` field gives one column. An unmarked field whose
     type is a part gives the part's columns in its place; a computed field that returns a part does not. An unmarked
     field whose type is a union with a part among its members (``A | B``, ``A | B | None``, ``A | int``) is refused,
-    since no one part gives its columns; ``A | None`` is a single optional part. A ``Rows`` field appends ``(field
-    name, child target)`` to ``rows`` and gives no column. Other unmarked fields, unmarked lists included, are skipped.
+    since no one part gives its columns; ``A | None`` is a single optional part. A ``Rows`` field, on a list of parts
+    or on a single part (``A`` or ``A | None``, one-to-one), appends ``(field name, child target)`` to ``rows`` and
+    gives no column. Other unmarked fields, unmarked lists included, are skipped.
 
     Preconditions:
         None.
@@ -456,10 +656,10 @@ def _columns(
         The columns, in the order above.
 
     Raises:
-        TypeError: ``To`` on a list; ``Rows`` on a nested part's field, a non-list or a computed field; a mark on a
-            part field; a part field whose part has its own table; a part field whose part contains itself (its
-            part is in ``inside``); an unmarked field whose type is a union with a part among its members; from
-            ``_unwrap``, ``_mark``, ``_child`` and ``_column``.
+        TypeError: ``To`` on a list; ``Rows`` on a nested part's field, on a field that is neither a list nor a part,
+            or on a computed field; a ``To`` on a part field; an unmarked part field whose part has its own table; an
+            unmarked part field whose part contains itself (its part is in ``inside``); an unmarked field whose type
+            is a union with a part among its members; from ``_unwrap``, ``_mark``, ``_child`` and ``_column``.
         ValueError: From ``_column``, for a malformed ``To`` column or a ``Decimal`` precision or scale out of range.
 
     """
@@ -477,12 +677,15 @@ def _columns(
                     raise TypeError(f"{where}: Rows is only for a field of the class that declares the table")
                 rows.append((field_name, _child(where, annotation, nullable)))
         elif isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            if isinstance(mark, Rows):  # a one-to-one child
+                if rows is None:
+                    raise TypeError(f"{where}: Rows is only for a field of the class that declares the table")
+                rows.append((field_name, _child(where, annotation, nullable)))
+                continue
             if mark is not None:
                 raise TypeError(f"{where}: {type(mark).__name__} is not for a part; mark the part's own fields")
             if getattr(annotation, "__target__", None) is not None:
-                raise TypeError(
-                    f"{where}: {annotation.__name__} has its own table, so only a list of it loads, with Rows"
-                )
+                raise TypeError(f"{where}: {annotation.__name__} has its own table, so it loads only with Rows")
             if annotation in inside:
                 raise TypeError(
                     f"{where}: {annotation.__name__} contains itself, so it cannot be flattened into columns"
@@ -498,7 +701,7 @@ def _columns(
         ):
             raise TypeError(f"{where}: a union of parts cannot be flattened into columns")
         elif isinstance(mark, Rows):
-            raise TypeError(f"{where}: Rows is only for a list of parts")
+            raise TypeError(f"{where}: Rows is only for a part or a list of parts")
         elif isinstance(mark, To):
             columns.append(_column(where, mark, annotation, metadata, optional or nullable, here))
     for field_name, computed in model.model_computed_fields.items():
@@ -620,37 +823,55 @@ def _mark(where: str, metadata: Sequence[object]) -> To | Rows | None:
 
 
 def _child(where: str, annotation: Any, nullable: bool) -> Target:
-    """Return the target of a ``Rows`` field's child part.
+    """Return the target of a ``Rows`` field's child part, or of its list's item part.
 
-    The list's item type ``X`` is passed through ``_unwrap`` first, as every other annotation is, so an item given as
-    a ``type`` alias (``list[ChildAlias]`` for ``type ChildAlias = Child``) or wrapped in ``Annotated`` is read as the
-    part it names; an item that allows None (``list[Child | None]``) is refused.
+    For a list, its item type ``X`` is passed through ``_unwrap`` first, as every other annotation is, so an item
+    given as a ``type`` alias (``list[ChildAlias]`` for ``type ChildAlias = Child``) or wrapped in ``Annotated`` is
+    read as the part it names; an item that allows None (``list[Child | None]``), and a list field that allows None,
+    are refused. A single part ``X`` (already stripped by ``_columns``) is one-to-one and may allow None. Either way
+    ``X`` must declare a table with no source column and an ``Upsert``, ``Versioned`` or ``ReplaceChildren`` writer
+    (``Versioned`` is told apart from the ``Snapshot`` it subclasses, which is refused, as are ``Update`` and
+    ``ReplacePartition``). A list's ``Upsert`` or ``Versioned`` item needs a non-empty key of its own: with none,
+    every item of a parent would have the same key.
 
     Preconditions:
-        ``get_origin(annotation)`` is ``list`` (``_columns`` calls this only then); it may have any number of
-        arguments, since pydantic accepts ``list[X, Y]`` as a field type.
+        ``annotation`` is a stripped annotation whose ``get_origin`` is ``list`` or that is a ``BaseModel`` subclass
+        (``_columns`` calls this only then); a list may have any number of arguments, since pydantic accepts
+        ``list[X, Y]`` as a field type.
 
     Args:
         where: ``Model.field``, used in the error message.
-        annotation: The field's stripped annotation.
+        annotation: The field's stripped annotation: ``list[X]`` or ``X``.
         nullable: Whether the field allows None.
 
     Returns:
-        ``X.__target__``, whose writer is ``ReplaceChildren``.
+        ``X.__target__``, whose writer is ``Upsert``, ``Versioned`` or ``ReplaceChildren`` and whose source column is
+        None.
 
     Raises:
-        TypeError: The field or its item allows None, ``annotation`` does not have exactly one argument
-            (``list[X, Y]``), ``X`` declares no table, or ``X``'s writer is not ``ReplaceChildren``; also from
-            ``_unwrap``, for an item that is a subscripted generic alias whose arguments cannot be substituted.
+        TypeError: A list field or its item allows None, a list does not have exactly one argument (``list[X, Y]``),
+            ``X`` declares no table, ``X`` has a source column, ``X``'s writer is not one of the three above, or a
+            list's ``X`` has an ``Upsert`` or ``Versioned`` writer with an empty key; also from ``_unwrap``, for an
+            item that is a subscripted generic alias whose arguments cannot be substituted.
 
     """
-    args = get_args(annotation)
     target: Target | None = None
-    if len(args) == 1:  # list[X] only
-        item, _, item_nullable = _unwrap(args[0], ())  # an alias or Annotated around the part
+    many = get_origin(annotation) is list
+    if not many:  # a single part: one-to-one, None allowed
+        target = getattr(annotation, "__target__", None)
+    elif len(get_args(annotation)) == 1 and not nullable:  # list[X] only
+        item, _, item_nullable = _unwrap(get_args(annotation)[0], ())  # an alias or Annotated around the part
         target = None if item_nullable else getattr(item, "__target__", None)
-    if nullable or target is None or not isinstance(target.writer, ReplaceChildren):
-        raise TypeError(f"{where}: Rows needs list[SomePart], where SomePart declares a table with ReplaceChildren()")
+    shape = "list[SomePart]" if many else "SomePart or SomePart | None"
+    if target is None:
+        raise TypeError(f"{where}: Rows needs {shape}, where SomePart declares a table")
+    writer = target.writer
+    if not isinstance(writer, Versioned | Upsert | ReplaceChildren):
+        raise TypeError(f"{where}: a Rows child's writer must be Upsert, Versioned or ReplaceChildren")
+    if target.source_column is not None:
+        raise TypeError(f"{where}: a Rows child has no source_column; it inherits its parent's key")
+    if many and isinstance(writer, Versioned | Upsert) and not writer.key:
+        raise TypeError(f"{where}: a list's items need a key of their own; only a one-to-one child may have none")
     return target
 
 
@@ -783,18 +1004,23 @@ def _check_names(where: str, columns: Sequence[Column]) -> None:
 def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_column: str | None) -> None:
     """Check that a writer fits the columns.
 
-    A writer key must be non-empty, name distinct target columns that do not allow None, and include the source column
-    when there is one. ``ReplacePartition`` needs its column to be a target column of type ``timestamptz`` or
-    ``date`` that does not allow None. ``Versioned`` needs distinct ``valid_from`` and ``valid_to`` names that no field
-    loads into, and an ``opens_from`` that is a target column whose type is in ``_VERSION_TYPES`` (``bigint``,
-    ``integer`` or ``date``: an ``int`` field with no 16-bit ``Width``, or a ``date`` field); it is matched before
-    ``Snapshot``, whose check it does not take. ``Snapshot`` refuses a column named ``removed_at``. ``Update`` needs a
-    column outside its key, and with ``missing="zero"`` every such column must match ``_NUMERIC`` (``bigint``,
-    ``integer``, ``smallint`` or ``numeric(p,s)``).
+    A writer key must name distinct target columns that do not allow None, and include the source column when there is
+    one. It must be non-empty, except an ``Upsert`` or ``Versioned`` key, which may be empty for a one-to-one child (so
+    keyed by the columns it inherits): the model's own class cannot tell how a parent will use it, so ``_child``
+    refuses an empty key for a list's items, ``pipeline.checks.record`` refuses one for a ``Record``, and the source
+    column check refuses one for a target with a source column. ``ReplacePartition`` needs its column to be a target
+    column of type ``timestamptz`` or ``date`` that does not allow None. ``Versioned`` needs distinct ``valid_from``
+    and ``valid_to`` names that no field loads into, and an ``opens_from`` that is a target column whose type is in
+    ``_VERSION_TYPES`` (``bigint``, ``integer`` or ``date``: an ``int`` field with no 16-bit ``Width``, or a ``date``
+    field); it is matched before ``Snapshot``, whose check it does not take. ``Snapshot`` refuses a column named
+    ``removed_at``. ``Update`` needs a column outside its key, and with ``missing="zero"`` every such column must match
+    ``_NUMERIC`` (``bigint``, ``integer``, ``smallint`` or ``numeric(p,s)``).
     ``ReplaceChildren`` needs at least one column: ``columns`` are the child's own, as ``build_target`` adds the
     inherited key columns only when it rebuilds the child target, and without one every list item would load as the
-    same key-only row; its ``key`` is then checked as a writer key is, against those own columns. ``Upsert`` has no
-    check beyond the key's.
+    same key-only row; its ``key`` is then checked as a writer key is, against those own columns (``_adopt`` adds the
+    inherited columns later). An ``Upsert`` or
+    ``Versioned`` child's key, and a ``Versioned`` child's ``opens_from``, are likewise checked against its own
+    columns only, never the inherited ones. ``Upsert`` has no check beyond the key's.
 
     Preconditions:
         Column names in ``columns`` are distinct (``build_target`` calls ``_check_names`` first).
@@ -818,7 +1044,8 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
         raise TypeError(f"{name}: a ReplaceChildren table needs a column of its own besides the parent's key")
     key = writer.key if isinstance(writer, ReplaceChildren) else _key(writer)  # a child's own key columns
     if key is not None:
-        if not key or len(set(key)) != len(key):
+        one_to_one = isinstance(writer, Upsert | Versioned)  # may be empty: a one-to-one child keyed by its parent's
+        if (not key and not one_to_one) or len(set(key)) != len(key):
             raise ValueError(f"{name}: the writer's key must name distinct columns, got {key!r}")
         for column in key:
             if column not in by_name:
@@ -885,23 +1112,35 @@ def _key(writer: Writer) -> tuple[str, ...] | None:
 def row_key(target: Target) -> tuple[str, ...] | None:
     """Return the columns that identify one row of a target's table, or None for a writer without them.
 
+    A top-level target's row key is its writer's key; a container's is all its columns (its source column, then its
+    ``record_key`` fields' columns). A child's depends on its writer (see ``Target`` for what it inherits): a
+    ``ReplaceChildren`` child's is its inherited columns followed by its own ``key``; an ``Upsert`` or ``Versioned``
+    child's is its own ``key``, with its inherited columns outside it as plain columns, unless that ``key`` is empty
+    (a one-to-one child), when its row key is its inherited columns.
+
     Preconditions:
         None.
 
     Args:
-        target: The target, as ``build_target`` built it.
+        target: The target, as ``build_target`` or ``build_container`` built it (a child as ``_adopt`` rebuilt it),
+            or a provisional one those functions build to read a row key.
 
     Returns:
-        The writer's ``key`` for ``Upsert``, ``Snapshot`` and ``Update``; for ``ReplaceChildren``, the inherited
-        columns followed by the writer's ``key``; None for ``ReplacePartition``.
+        The writer's ``key`` for ``Upsert``, ``Snapshot``, ``Versioned`` and ``Update``, except ``target.inherited``
+        when that key is empty; for ``ReplaceChildren``, the inherited columns followed by the writer's ``key``; None
+        for ``ReplacePartition``; every column name, in order, for a container. ``()`` only for an ``Upsert`` or
+        ``Versioned`` part with an empty key read on its own, before a parent adopts it.
 
     Raises:
         Nothing.
 
     """
+    if target.writer is None:  # a container: its columns are its key
+        return tuple(column.name for column in target.columns)
     if isinstance(target.writer, ReplaceChildren):
         return (*target.inherited, *target.writer.key)
-    return _key(target.writer)
+    key = _key(target.writer)
+    return target.inherited if key == () else key  # a one-to-one child with no key of its own
 
 
 def _day_kind(postgres: str) -> str:
@@ -929,6 +1168,13 @@ def _day_kind(postgres: str) -> str:
 def _version_mismatches(target: Target, writer: Versioned, info: TableInfo) -> list[str]:
     """List the ways a table does not fit a ``Versioned`` writer's day columns and version key.
 
+    Each day column gets at most one of: missing, not in ``_VERSION_TYPES``, not writable. When both exist, the two
+    are compared by ``_day_kind`` (an ``integer`` and a ``bigint`` match), ``valid_from`` must be ``NOT NULL`` and
+    ``valid_to`` nullable, and ``opens_from``, when set, must be of their kind. Last, a unique key must be on exactly
+    the target's row key (``row_key``: ``writer.key``, or a one-to-one child's inherited columns when that is empty)
+    and ``valid_from``, as ``mismatches`` requires for a row key: a narrower one would refuse versions the writer may
+    write, a wider one would let two versions of a key share a day.
+
     Preconditions:
         ``info`` describes ``target.table``.
 
@@ -936,12 +1182,6 @@ def _version_mismatches(target: Target, writer: Versioned, info: TableInfo) -> l
         target: A target whose writer is ``writer``.
         writer: The target's ``Versioned`` writer.
         info: The table as the catalog describes it.
-
-    Each day column gets at most one of: missing, not in ``_VERSION_TYPES``, not writable. When both exist, the two
-    are compared by ``_day_kind`` (an ``integer`` and a ``bigint`` match), ``valid_from`` must be ``NOT NULL`` and
-    ``valid_to`` nullable, and ``opens_from``, when set, must be of their kind. Last, a unique key must be on exactly
-    ``writer.key`` and ``valid_from``, as ``mismatches`` requires for a row key: a narrower one would refuse versions
-    the writer may write, a wider one would let two versions of a key share a day.
 
     Returns:
         One message per mismatch, in the order above; ``[]`` when it fits.
@@ -969,7 +1209,7 @@ def _version_mismatches(target: Target, writer: Versioned, info: TableInfo) -> l
         opens = next((c for c in target.columns if c.name == writer.opens_from), None)
         if opens is not None and _day_kind(opens.postgres) != _day_kind(first.type):
             found.append(f"{table}.{writer.opens_from} must be a date key or a date as {writer.valid_from} is")
-    versions = frozenset((*writer.key, writer.valid_from))
+    versions = frozenset((*(row_key(target) or ()), writer.valid_from))  # never None for a Versioned target
     if versions not in info.unique_keys:
         found.append(f"{table} has no unique key on exactly {', '.join(sorted(versions))}")
     return found
@@ -988,25 +1228,28 @@ def mismatches(target: Target, info: TableInfo | None) -> list[str]:
     it. A ``Versioned`` table instead holds several versions per key, so ``_version_mismatches`` gives its checks:
     ``valid_from`` and ``valid_to`` of one kind (``integer`` or ``bigint`` date keys, mixed widths allowed, or both
     ``date``), writable, ``valid_from`` ``NOT NULL`` and ``valid_to`` nullable; ``opens_from``, when set, of that kind;
-    and a unique key on exactly the key and ``valid_from``. Only ``target.table`` is
-    compared; ``target.children`` are not visited, so each child target is checked by its own call.
+    and a unique key on exactly the row key and ``valid_from``. Only ``target.table`` is
+    compared; ``target.children`` are not visited, so each child target is checked by its own call. A container has no
+    table, so nothing is compared and ``info`` is not read.
 
     Preconditions:
-        ``info`` is ``table_info``'s result for ``target.table``.
+        ``info`` is ``table_info``'s result for ``target.table`` (any value for a container).
 
     Args:
         target: The target to check.
         info: The table as the catalog describes it, or None when ``table_info`` found no table.
 
     Returns:
-        One message per mismatch, in the order above; ``[]`` when the table fits. A single message when ``info`` is
-        None.
+        One message per mismatch, in the order above; ``[]`` when the table fits, and always for a container. A
+        single message when ``info`` is None.
 
     Raises:
         Nothing.
 
     """
     table = target.table
+    if table is None or target.writer is None:  # a container: no table to compare
+        return []
     if info is None:
         return [f"{table} does not exist or has 0 columns"]
     found: list[str] = []

@@ -17,6 +17,7 @@ Public API:
     MAX_RETRY_AFTER: The longest retry delay the pipeline honours or stores: six hours.
     retry_after_from: Return the delay requested by a ``Retry-After`` header, at most ``MAX_RETRY_AFTER``.
     translates_errors: Return a decorator that converts connector and network errors into pipeline errors.
+    RETRY_CAP: The default cap of ``retries``, in seconds: the longest ``retry_after`` it waits out, 60.
     retries: Build a decorator that retries an async function when it raises ``TransientError``.
     DatabaseUnavailable: A ``TransientError`` raised when the warehouse cannot be reached.
     DatabaseConflict: A ``TransientError`` raised when the warehouse aborted a transaction because of a conflict.
@@ -31,6 +32,7 @@ Public API:
     KeyViolation: A ``PermanentError`` raised when rows to be written share a key, in a batch or with the warehouse.
     Overflow: A ``PermanentError`` raised when a value does not fit its warehouse column.
     TooDeep: A ``PermanentError`` raised when a response body is nested too deeply to parse or store.
+    IdRefused: A ``PermanentError`` raised when an id from outside data cannot be placed in a fanned-out request.
     db_errors: Context manager that converts warehouse connection and conflict errors into pipeline errors.
 
 """
@@ -517,6 +519,13 @@ class TableMismatch(RuntimeError):  # not a PipelineError, like SchemaMismatch: 
 #: longer ``retry_after`` and ``control.report_outcome`` clamps the wait to it too.
 MAX_RETRY_AFTER: Final = timedelta(hours=6)
 
+#: The default ``cap`` of ``retries``, in seconds: the cap on the exponential part of each wait (jitter can add up to
+#: ``jitter`` more) and the longest ``retry_after`` waited out rather than re-raised. ``HttpConnectorClient`` retries
+#: with the default, so a ``RateLimited`` that escapes ``send`` with a longer ``retry_after`` was re-raised as soon as
+#: it arrived, not waited out, though earlier failures of the same send may have been retried (``stages.extract``
+#: reads it so).
+RETRY_CAP: Final = 60.0
+
 
 def retry_after_from(headers: Mapping[str, str], *, now: datetime) -> timedelta | None:
     """Return the delay requested by a ``Retry-After`` header.
@@ -635,7 +644,7 @@ def retries[**P, R](
     *,
     max_retries: int = 5,
     base: float = 1.0,
-    cap: float = 60.0,
+    cap: float = RETRY_CAP,
     jitter: float = 0.5,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
@@ -1036,6 +1045,22 @@ class TooDeep(PermanentError):
     Adds no constructor or attributes of its own; the raiser supplies the message. ``stages.extract.extract`` raises it
     in place of the ``RecursionError`` a connector client lets through, so the task fails as permanent: the same
     response always reproduces it, so it is not retried.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.FAILED``, inherited from ``PermanentError``.
+
+    """
+
+    pass
+
+
+class IdRefused(PermanentError):
+    """Signal that an id cannot be placed in a fanned-out request, such as ``".."`` for a path field.
+
+    Adds no constructor or attributes of its own; the raiser supplies the message, which names the field but not the
+    id. ``EndpointSpec.request_for`` raises it for a value its request builder refuses; a configuration error there
+    stays a ``ValueError``. As a ``PermanentError``, ``stages.extract`` holds the call's ids as ``detail_failed``
+    instead of failing the task, since one bad id from outside data would otherwise fail every attempt.
 
     Attributes:
         outcome (Outcome): ``Outcome.FAILED``, inherited from ``PermanentError``.

@@ -15,7 +15,8 @@ Public API:
 
 A model may declare its target table, writer and source column as class keywords
 (``class Order(Record, table="sales.order", writer=Upsert(...))``); the target is built by ``build_target``
-(checks.targets) when the class is defined.
+(checks.targets) when the class is defined. A Record may instead declare ``container=True``: it has no table and
+fills only its ``Rows`` children's tables, and its target is built by ``build_container`` (checks.targets).
 
 Private units:
     _to_bool: Return the ``bool`` that ``BOOL_VALUES`` maps a boolean field's input to, or the input unchanged.
@@ -54,7 +55,18 @@ from pydantic import (
 )
 from pydantic.fields import FieldInfo
 
-from pipeline.checks.targets import Snapshot, Target, To, Update, Upsert, Width, Writer, alias_value, build_target
+from pipeline.checks.targets import (
+    Snapshot,
+    Target,
+    To,
+    Update,
+    Upsert,
+    Width,
+    Writer,
+    alias_value,
+    build_container,
+    build_target,
+)
 
 #: The classes a key field's type may be, besides a ``StrEnum`` or ``IntEnum`` subclass; ``float`` is not one, nor a
 #: plain ``datetime``, which accepts naive values: only Pydantic's ``AwareDatetime``, which refuses them.
@@ -145,11 +157,12 @@ class Part(BaseModel):
     raises ``TypeError``. The target is built by ``build_target`` when the class is defined, stored in
     ``__target__`` and read with ``target_of``. A subclass does not inherit a table: one that gives no keywords has
     ``__target__`` set to ``None``. A Part has no source column by default; a child gets the source with its parent's
-    key. A subclass must be concrete: one with type parameters is refused with ``TypeError``.
+    key. A subclass must be concrete: one with type parameters is refused with ``TypeError``. The ``container``
+    keyword is only for a ``Record`` (see there); a Part that gives it is refused with ``TypeError``.
 
     Attributes:
         __target__ (ClassVar[Target | None]): The target built from the class keywords, or ``None`` when the class
-            declares no table.
+            declares no table and is not a container ``Record``.
 
     """
 
@@ -162,6 +175,7 @@ class Part(BaseModel):
         table: str | None = None,
         writer: Writer | None = None,
         source_column: str | None = None,
+        container: bool = False,
         **kwargs: Any,
     ) -> None:
         """Keep the target keywords from ``BaseModel``.
@@ -175,6 +189,7 @@ class Part(BaseModel):
             table: The target table; used by ``__pydantic_init_subclass__``.
             writer: The target writer; used by ``__pydantic_init_subclass__``.
             source_column: The source column; used by ``__pydantic_init_subclass__``.
+            container: Whether the class is a container; used by ``__pydantic_init_subclass__``.
             **kwargs: Other class keyword arguments, passed on to ``BaseModel.__init_subclass__``.
 
         Returns:
@@ -193,6 +208,7 @@ class Part(BaseModel):
         table: str | None = None,
         writer: Writer | None = None,
         source_column: str | None = None,  # a Record defaults to source_id; a child inherits it with its parent's key
+        container: bool = False,  # only a Record may be one; Record takes it before calling this
         **kwargs: Any,
     ) -> None:
         """Build the new subclass's target from its class keywords and store it in ``__target__``.
@@ -202,6 +218,8 @@ class Part(BaseModel):
         ``build_target(cls, table, writer, source_column)``. A generic subclass (one with type parameters, e.g.
         ``class R[T](Record)`` or ``class R(Record, Generic[T])``) is refused, so a parametrised one (``R[int]``),
         which Pydantic would create with no class keywords and so without its origin's target, is never created.
+        ``container`` reaches this as True only for a ``Part`` that is not a ``Record`` (``Record`` takes the keyword
+        and builds its container itself), so it is refused.
 
         Preconditions:
             None.
@@ -210,21 +228,24 @@ class Part(BaseModel):
             table: The target table, ``"schema.table"`` in lower case, or ``None``.
             writer: How rows are written to ``table``, or ``None``.
             source_column: The column the source id is written to, or ``None`` for none.
+            container: True to declare a container; refused here.
             **kwargs: Other class keyword arguments, passed on to ``BaseModel.__pydantic_init_subclass__``.
 
         Returns:
             None.
 
         Raises:
-            TypeError: The subclass is generic (has type parameters or is parametrised); only one of ``table`` and
-                ``writer`` is given; or from ``build_target``, for a bad
-                declaration (e.g. a field type that is not defined yet, a field without a ``To``, a writer that does
-                not fit the columns).
+            TypeError: ``container`` is True (a Part cannot be a container); the subclass is generic (has type
+                parameters or is parametrised); only one of ``table`` and ``writer`` is given; or from
+                ``build_target``, for a bad declaration (e.g. a field type that is not defined yet, a field without a
+                ``To``, a writer that does not fit the columns). The checks run in that order.
             ValueError: From ``build_target``, for a bad declaration (e.g. a malformed table or column name, a
                 writer key that names a column the table does not have).
 
         """
         super().__pydantic_init_subclass__(**kwargs)
+        if container:
+            raise TypeError(f"{cls.__name__}: only a Record can be a container; a Part loads with a table")
         generic = cls.__pydantic_generic_metadata__
         if generic["parameters"] or generic["origin"] is not None:  # R[int] would lose R's target
             raise TypeError(f"{cls.__name__}: a Record or Part must be concrete, not generic")
@@ -244,7 +265,15 @@ class Record(Part):
     has neither attribute.
 
     A Record takes the same class keywords as ``Part``, but ``source_column`` defaults to ``"source_id"``. A Record with
-    a target also has its writer key checked against ``record_key`` by ``_check_table_key``.
+    a table also has its writer key checked against ``record_key`` by ``_check_table_key``.
+
+    A Record declared with ``container=True`` (``class ProductDay(Record, container=True)``) is a container: it has
+    no ``table`` and no ``writer`` (giving either raises ``TypeError``) and fills only its ``Rows`` children's tables,
+    of which it needs at least one. Its ``source_column`` keyword works as for any Record (``"source_id"`` by default,
+    ``None`` for none). Its ``record_key`` fields, each with a ``To``, are the columns its children inherit, with the
+    source column; no other field may have a ``To``. Its target is built by ``checks.targets.build_container`` once
+    ``record_key`` is checked, which enforces these rules; ``_check_table_key`` is not run for it. A subclass that does
+    not repeat ``container=True`` is not a container, as a subclass does not inherit a table.
 
     A key is read one way only, by ``key_of`` from the landed payload with ``_key_model``, never from a parsed record's
     attributes: Validate de-duplicates on it and Transform writes the target's key columns from it. Its validators,
@@ -270,22 +299,27 @@ class Record(Part):
     record_version: ClassVar[int]  # bumped when the model's meaning changes; stored with a schema failure
 
     @classmethod
-    def __pydantic_init_subclass__(cls, *, source_column: str | None = "source_id", **kwargs: Any) -> None:
+    def __pydantic_init_subclass__(
+        cls, *, source_column: str | None = "source_id", container: bool = False, **kwargs: Any
+    ) -> None:
         """Build the target, then check that the new subclass declares a usable ``record_key`` and ``record_version``.
 
-        Pydantic calls this after it has built ``model_fields`` for the subclass. ``Part.__pydantic_init_subclass__``
-        builds the target first. Checks then run in order: ``model_config`` does not set ``strict=True``; ``record_key``
-        is non-empty, ``record_version`` is 1 or more, then for each key name in turn: it is a declared field, the field
-        has no default, every item of its own metadata is allowed by ``_declarative``, no ``field_validator`` (any mode)
-        or deprecated ``validator``, inherited ones included, names it or ``"*"``, its type can be resolved, it does not
-        accept ``None`` as judged by ``_allows_none``, and its type, with the field's metadata, is allowed by
-        ``_key_refusal`` (an allow-list of types and declarative metadata; ``float`` and every validator in metadata are
-        refused, and so is ``strict``). A key field whose type Pydantic has no schema for without the model's config (a
-        plain class under ``arbitrary_types_allowed=True``) is refused with ``_key_refusal``'s reason, which every such
-        type has since every allowed form has a schema. Extra (undeclared) fields cannot be key fields. Last, a Record
-        with a target has its writer key checked by ``_check_table_key``. Other decorator validators
-        (``model_validator``, ``root_validator``, a field validator on non-key fields), mixins and ``BaseModel``
-        overrides are not checked: the key is read by ``key_of`` alone, which none of them reaches.
+        Pydantic calls this after it has built ``model_fields`` for the subclass. A container given a ``table`` or
+        ``writer`` is refused before anything else. ``Part.__pydantic_init_subclass__`` then builds the target (``None``
+        for a container, since it is given neither, and ``container`` is not passed on). Checks then run in order:
+        ``model_config`` does not set ``strict=True``; ``record_key`` is non-empty, ``record_version`` is 1 or more,
+        then for each key name in turn: it is a declared field, the field has no default, every item of its own metadata
+        is allowed by ``_declarative``, no ``field_validator`` (any mode) or deprecated ``validator``, inherited ones
+        included, names it or ``"*"``, its type can be resolved, it does not accept ``None`` as judged by
+        ``_allows_none``, and its type, with the field's metadata, is allowed by ``_key_refusal`` (an allow-list of
+        types and declarative metadata; ``float`` and every validator in metadata are refused, and so is ``strict``). A
+        key field whose type Pydantic has no schema for without the model's config (a plain class under
+        ``arbitrary_types_allowed=True``) is refused with ``_key_refusal``'s reason, which every such type has since
+        every allowed form has a schema. Extra (undeclared) fields cannot be key fields. Last, a container's target is
+        built by ``build_container`` and stored in ``__target__``, or else a Record with a target has its writer key
+        checked by ``_check_table_key``. Other decorator validators (``model_validator``, ``root_validator``, a field
+        validator on non-key fields), mixins and ``BaseModel`` overrides are not checked: the key is read by ``key_of``
+        alone, which none of them reaches.
 
         A key field's own metadata is checked with ``_declarative`` before ``_allows_none`` runs, so a validator there
         is refused by name and never called with ``None``. The form given to ``_key_refusal`` comes from ``_annotated``.
@@ -297,7 +331,8 @@ class Record(Part):
 
         Args:
             source_column: The column the source id is written to, or ``None`` for none; passed on to
-                ``Part.__pydantic_init_subclass__``.
+                ``Part.__pydantic_init_subclass__``, and to ``build_container`` for a container.
+            container: True to declare a container (no table or writer, only ``Rows`` children); not passed on.
             **kwargs: Other class keyword arguments (``table``, ``writer``), passed on to
                 ``Part.__pydantic_init_subclass__``.
 
@@ -316,14 +351,20 @@ class Record(Part):
                 ``AfterValidator`` or ``BeforeValidator`` (refused before it can run), ``Field(strict=True)``, or a
                 ``Decimal`` that accepts ``NaN``). Also raised by the ``<`` comparison when ``record_version`` is not
                 comparable with ``int``; from ``_allows_none``, when Pydantic cannot build a key field's schema from its
-                metadata; from ``_check_table_key``, when the writer key does not match ``record_key``; and from
-                ``Part.__pydantic_init_subclass__``, for a generic subclass or a bad target declaration.
-            ValueError: From ``Part.__pydantic_init_subclass__``, for a bad target declaration.
+                metadata; from ``_check_table_key``, when the writer key does not match ``record_key``; when a
+                container is given a ``table`` or ``writer``; from ``build_container``, for a bad container
+                declaration; and from ``Part.__pydantic_init_subclass__``, for a generic subclass or a bad target
+                declaration.
+            ValueError: From ``Part.__pydantic_init_subclass__``, for a bad target declaration; from
+                ``build_container``, for a malformed source or ``To`` column or a ``Decimal`` precision or scale out
+                of range.
             Exception: From ``_allows_none``, whatever a validator inside a key field's type (a ``type`` alias of an
                 ``Annotated`` form, say), not in its own metadata, raises on ``None`` other than ``ValueError`` or
                 ``AssertionError``.
 
         """
+        if container and (kwargs.get("table") is not None or kwargs.get("writer") is not None):
+            raise TypeError(f"{cls.__name__}: a container has no table or writer; only its Rows children load")
         super().__pydantic_init_subclass__(source_column=source_column, **kwargs)
         if cls.model_config.get("strict"):  # Python-mode strict refuses the JSON string forms of dates, UUIDs, ...
             raise TypeError(f"{cls.__name__}: a Record cannot set strict=True, since its payloads are decoded JSON")
@@ -363,7 +404,9 @@ class Record(Part):
             reason = _key_refusal(form, (), cls.model_config)
             if reason is not None:
                 raise TypeError(f"{cls.__name__}.{name} is in record_key, so {reason}")
-        if cls.__target__ is not None:
+        if container:  # its key fields are what its children inherit, so it is built once they are checked
+            cls.__target__ = build_container(cls, key, source_column)
+        elif cls.__target__ is not None:
             _check_table_key(cls.__name__, cls.__target__, key)
 
 

@@ -8,7 +8,7 @@ Public API:
 """
 
 import json
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import pairwise
@@ -458,6 +458,7 @@ async def fetch_pages[C](
     *,
     resume_from: str | None = None,  # cursor_next of the last saved page; None: from the start
     path_params: Mapping[str, str] = _NO_PATH_PARAMS,
+    ids: Sequence[str] | None = None,  # the ids of a fanned-out call; None for an endpoint called without ids
     clock: Callable[[], datetime] = utc_now,
 ) -> AsyncIterator[Page]:
     """Fetch an endpoint's pages in order for a source, splitting the frame when a reported total exceeds the limit.
@@ -470,10 +471,14 @@ async def fetch_pages[C](
     page, because a paginator's cursors (page numbers, offsets) legitimately repeat across sub-frames; a cycle that
     spans sub-frames is not one, and a resumed fetch knows only the cursors sent since it resumed.
 
+    The first request is ``spec.request(path_params)``, or ``spec.request_for(ids)`` for a fanned-out call, which a
+    spec with an ``id_param`` needs and any other refuses. Every page of the call carries the same ids.
+
     Preconditions:
         ``resume_from``, when given, is a ``cursor_in`` or ``cursor_next`` from a fetch with the same ``spec``,
-        ``window``, ``frame``, ``source_id`` and ``path_params``. Only the frame's edges are checked, and only when the
-        cursor holds sub-frames; a cursor from another frame without them is used as if it belonged to this one.
+        ``window``, ``frame``, ``source_id``, ``path_params`` and ``ids``. Only the frame's edges are checked, and only
+        when the cursor holds sub-frames; a cursor from another frame without them is used as if it belonged to this
+        one.
 
     Args:
         client: The client that sends each request.
@@ -483,6 +488,8 @@ async def fetch_pages[C](
         source_id: The source the requests are made for.
         resume_from: A cursor to resume at, or ``None`` to start at page 0.
         path_params: Values for the fields in ``spec.path``. Defaults to none.
+        ids: The ids a fanned-out call is for, placed by ``spec.id_param``; ``None`` for a spec without one.
+            Defaults to ``None``.
         clock: Returns the time recorded as each page's ``fetched_at``. Defaults to ``utc_now``.
 
     Yields:
@@ -490,7 +497,9 @@ async def fetch_pages[C](
 
     Raises:
         ValueError: From ``_window`` for a window name and frame that do not match the spec; from
-            ``EndpointSpec.request`` for wrong path parameters; from ``_Position.decode`` for a bad ``resume_from``;
+            ``EndpointSpec.request`` for wrong path parameters; when ``ids`` is given for a spec without an
+            ``id_param``, left out for one with it, or given with ``path_params``; from ``EndpointSpec.request_for``
+            for a number of ids it cannot take; from ``_Position.decode`` for a bad ``resume_from``;
             from ``Window.apply`` or ``Paginator.apply`` for a request they cannot build; or from ``Page`` when
             ``clock`` returns a naive datetime.
         OverflowError: From ``_Position.decode`` for a cursor edge, from ``Window.apply`` for a bound near the
@@ -498,6 +507,7 @@ async def fetch_pages[C](
         TypeError: From ``Window.apply`` or ``_split_up_front`` when a whole-day window or split meets a zone that is
             not a ``tzinfo``.
         RowLimitReached: From ``_split_up_front`` or ``_following`` when the endpoint's row limit is reached.
+        IdRefused: From ``EndpointSpec.request_for``, before anything is sent, for an id it cannot place.
         ClientErrorUnhandled: From ``EndpointSpec.total``, ``EndpointSpec.record_count`` or
             ``Paginator.next_cursor`` for a body they cannot read; or from ``EndpointSpec.unhandled`` when the
             paginator returns a cursor already sent in the current sub-frame.
@@ -506,7 +516,10 @@ async def fetch_pages[C](
 
     """
     win = _window(spec, window, frame)
-    base = spec.request(path_params)
+    if (ids is None) != (spec.id_param is None) or (ids is not None and path_params):
+        given = "no" if ids is None else len(ids)
+        raise ValueError(f"{spec.name}: ids go with an id_param and without path parameters; got {given} ids")
+    base = spec.request(path_params) if ids is None else spec.request_for(ids)
     at = _Position.start(frame) if resume_from is None else _Position.decode(resume_from, frame)
     cursor_in = resume_from
     sent: set[str] = set()  # paging cursors sent in the current sub-frame

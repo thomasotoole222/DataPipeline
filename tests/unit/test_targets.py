@@ -15,6 +15,7 @@ from pipeline.checks.targets import (
     Rows,
     Snapshot,
     To,
+    Update,
     Upsert,
     Versioned,
     Width,
@@ -22,6 +23,7 @@ from pipeline.checks.targets import (
     mismatches,
     row_key,
     target_of,
+    walk,
 )
 from pipeline.db.catalog import TableColumn, TableInfo
 
@@ -309,16 +311,19 @@ def test_versioned_declarations_refused(writer: str, field: str, message: str) -
         exec(code, names)  # noqa: S102
 
 
-def test_versioned_refuses_rows_children() -> None:
-    """Check a Versioned table cannot own Rows children: its rows are versions, not one row per parent."""
-    with pytest.raises(TypeError, match="Rows is not for a Versioned table"):
+def test_versioned_accepts_rows_children() -> None:
+    """Check a Versioned table may own Rows children, which inherit its key without the source column."""
 
-        class Kit(Record, table="cipher.kit", writer=Versioned(("source_id", "kit"), valid_from="f", valid_to="t")):
-            record_key: ClassVar[tuple[str, ...]] = ("id",)
-            record_version: ClassVar[int] = 1
+    class Kit(Record, table="cipher.kit", writer=Versioned(("source_id", "kit"), valid_from="f", valid_to="t")):
+        record_key: ClassVar[tuple[str, ...]] = ("id",)
+        record_version: ClassVar[int] = 1
 
-            id: Annotated[str, To("kit")]
-            lines: Annotated[list[Line], Rows()]
+        id: Annotated[str, To("kit")]
+        lines: Annotated[list[Line], Rows()]
+
+    line = dict(target_of(Kit).children)["lines"]
+    assert line.inherited == ("source_id", "kit")  # a ReplaceChildren child inherits the whole writer key
+    assert row_key(line) == ("source_id", "kit", "sku_id")
 
 
 def test_versioned_table_that_fits() -> None:
@@ -452,3 +457,384 @@ def test_width_mark_refusals() -> None:
             record_version: ClassVar[int] = 1
 
             id: Annotated[str, To("code"), Width(32)]
+
+
+DAYS = {"valid_from": "valid_from_key", "valid_to": "valid_to_key"}
+
+
+class Bundle(Part, table="cipher.link_sku_bundle", writer=ReplaceChildren(("component_sku_id",))):
+    """A bundle component, replaced under its SKU."""
+
+    component: Annotated[str, To("component_sku_id")]
+    quantity: Annotated[int, To("quantity")]
+
+
+class SkuPrice(Part, table="cipher.dim_sku_price", writer=Versioned((), **DAYS)):
+    """A SKU's price: a one-to-one Versioned child keyed by the SKU it inherits."""
+
+    price: Annotated[int, To("retail_price")]
+
+
+class ProductSku(Part, table="cipher.dim_sku", writer=Versioned(("tiktok_sku_id",), **DAYS)):
+    """A versioned SKU under its product, keyed by its own id."""
+
+    id: Annotated[str, To("tiktok_sku_id")]
+    price: Annotated[SkuPrice | None, Rows()] = None
+    bundle: Annotated[list[Bundle], Rows()] = Field(default_factory=list)
+
+
+class Product(
+    Record,
+    table="cipher.dim_product",
+    writer=Versioned(("shop_id", "tiktok_product_id"), **DAYS),
+    source_column="shop_id",
+):
+    """A versioned product with its SKUs."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("id",)
+    record_version: ClassVar[int] = 1
+
+    id: Annotated[str, To("tiktok_product_id")]
+    skus: Annotated[list[ProductSku], Rows()] = Field(default_factory=list)
+
+
+def test_children_nest_under_a_versioned_product_with_their_inherited_columns() -> None:
+    """Check each kind of child gets its inherited columns first and its row key by rule, at every depth."""
+    found = {
+        target.table: ([c.name for c in target.columns], target.inherited, row_key(target))
+        for target in walk(target_of(Product))
+    }
+    assert list(found) == ["cipher.dim_product", "cipher.dim_sku", "cipher.dim_sku_price", "cipher.link_sku_bundle"]
+    assert found == {
+        "cipher.dim_product": (["shop_id", "tiktok_product_id"], (), ("shop_id", "tiktok_product_id")),
+        # a keyed child: the parent's key without the source column, as a plain column; keyed by its own key
+        "cipher.dim_sku": (["tiktok_product_id", "tiktok_sku_id"], ("tiktok_product_id",), ("tiktok_sku_id",)),
+        # a one-to-one child with no key of its own: keyed by what it inherits, the SKU's row key
+        "cipher.dim_sku_price": (["tiktok_sku_id", "retail_price"], ("tiktok_sku_id",), ("tiktok_sku_id",)),
+        # a ReplaceChildren child of a child: the SKU's row key, then its own key
+        "cipher.link_sku_bundle": (
+            ["tiktok_sku_id", "component_sku_id", "quantity"],
+            ("tiktok_sku_id",),
+            ("tiktok_sku_id", "component_sku_id"),
+        ),
+    }
+
+
+def test_a_replace_children_child_inherits_its_parents_whole_row_key() -> None:
+    """Check a ReplaceChildren child of a ReplaceChildren child inherits the child's row key, source column included."""
+
+    class Note(Part, table="sales.note", writer=ReplaceChildren(("note_id",))):
+        note_id: Annotated[str, To("note_id")]
+
+    class Noted(Part, table="sales.noted", writer=ReplaceChildren(("sku_id",))):
+        sku_id: Annotated[str, To("sku_id")]
+        notes: Annotated[list[Note], Rows()]
+
+    class Sale(Record, table="sales.sale", writer=Upsert(("source_id", "order_id"))):
+        record_key: ClassVar[tuple[str, ...]] = ("order_id",)
+        record_version: ClassVar[int] = 1
+
+        order_id: Annotated[str, To("order_id")]
+        lines: Annotated[list[Noted], Rows()]
+
+    note = dict(dict(target_of(Sale).children)["lines"].children)["notes"]
+    assert row_key(note) == ("source_id", "order_id", "sku_id", "note_id")
+
+
+def test_an_upsert_child_may_be_one_to_one_with_no_key() -> None:
+    """Check a single-part Upsert child with an empty key is keyed by its inherited columns, and None is allowed."""
+
+    class Address(Part, table="sales.address", writer=Upsert(())):
+        city: Annotated[str, To("city")]
+
+    class Customer(Record, table="sales.customer", writer=Upsert(("source_id", "customer_id"))):
+        record_key: ClassVar[tuple[str, ...]] = ("customer_id",)
+        record_version: ClassVar[int] = 1
+
+        customer_id: Annotated[str, To("customer_id")]
+        address: Annotated[Address | None, Rows()] = None
+
+    address = dict(target_of(Customer).children)["address"]
+    assert [c.name for c in address.columns] == ["customer_id", "city"]
+    assert row_key(address) == ("customer_id",)
+
+
+@pytest.mark.parametrize(
+    ("child", "field", "message"),
+    [
+        ("class C(Part, table='t.c', writer=Snapshot(('k',))):\n    k: Annotated[str, To('k')]",
+         "Annotated[list[C], Rows()]", "writer must be Upsert, Versioned or ReplaceChildren"),
+        ("class C(Part, table='t.c', writer=Update(('k',))):\n    k: Annotated[str, To('k')]\n"
+         "    n: Annotated[int, To('n')]", "Annotated[list[C], Rows()]", "writer must be Upsert, Versioned or"),
+        ("class C(Part, table='t.c', writer=ReplacePartition('d')):\n    d: Annotated[date, To('d')]",
+         "Annotated[C, Rows()]", "writer must be Upsert, Versioned or ReplaceChildren"),
+        ("class C(Part, table='t.c', writer=Upsert(('source_id', 'k')), source_column='source_id'):\n"
+         "    k: Annotated[str, To('k')]", "Annotated[list[C], Rows()]", "a Rows child has no source_column"),
+        ("class C(Part, table='t.c', writer=Upsert(())):\n    k: Annotated[str, To('k')]",
+         "Annotated[list[C], Rows()]", "a list's items need a key of their own"),
+        ("class C(Part, table='t.c', writer=Versioned((), valid_from='f', valid_to='t')):\n"
+         "    k: Annotated[str, To('k')]", "Annotated[list[C], Rows()]", "a list's items need a key of their own"),
+        ("class C(Part):\n    k: Annotated[str, To('k')]", "Annotated[C, Rows()]",
+         "Rows needs SomePart or SomePart \\| None, where SomePart declares a table"),
+        ("class C(Part, table='t.c', writer=Upsert(('k',))):\n    k: Annotated[str, To('k')]",
+         "Annotated[list[C] | None, Rows()] = None", "Rows needs list\\[SomePart\\]"),
+        ("class C(Part, table='t.c', writer=Upsert(('k',))):\n    k: Annotated[str, To('k')]",
+         "Annotated[int, Rows()] = 0", "Rows is only for a part or a list of parts"),
+        ("class C(Part, table='t.c', writer=Upsert(('order_id',))):\n    k: Annotated[str, To('order_id')]",
+         "Annotated[C, Rows()]", "columns named more than once: order_id"),
+        ("class C(Part, table='t.order', writer=Upsert(('k',))):\n    k: Annotated[str, To('k')]",
+         "Annotated[list[C], Rows()]", "more than one target loads into t.order"),
+    ],
+    ids=[
+        "snapshot child", "update child", "replace partition child", "child with a source column",
+        "list of keyless upserts", "list of keyless versions", "part without a table", "nullable list",
+        "rows on a scalar", "inherited name clashes", "table clash",
+    ],
+)  # fmt: skip
+def test_rows_child_refused(child: str, field: str, message: str) -> None:
+    """Check a Rows child must be a keyed or ReplaceChildren part with no source column, fitting its parent."""
+    code = (
+        f"{child}\n"
+        "class Parent(Record, table='t.order', writer=Upsert(('source_id', 'order_id'))):\n"
+        "    record_key: ClassVar[tuple[str, ...]] = ('order_id',)\n"
+        "    record_version: ClassVar[int] = 1\n"
+        "    order_id: Annotated[str, To('order_id')]\n"
+        f"    child: {field}\n"
+    )
+    names = {
+        "Annotated": Annotated, "ClassVar": ClassVar, "date": date, "Part": Part, "Record": Record,
+        "ReplaceChildren": ReplaceChildren, "ReplacePartition": ReplacePartition, "Rows": Rows, "Snapshot": Snapshot,
+        "To": To, "Update": Update, "Upsert": Upsert, "Versioned": Versioned,
+    }  # fmt: skip
+    with pytest.raises(TypeError, match=message):
+        exec(code, names)  # noqa: S102
+
+
+def test_a_table_clash_deep_in_the_tree_is_refused() -> None:
+    """Check a grandchild that loads into its grandparent's table is refused when the grandparent is built."""
+
+    class Deep(Part, table="t.top", writer=ReplaceChildren(("d",))):
+        d: Annotated[str, To("d")]
+
+    class Middle(Part, table="t.middle", writer=Upsert(("m",))):
+        m: Annotated[str, To("m")]
+        deep: Annotated[list[Deep], Rows()]
+
+    with pytest.raises(TypeError, match=r"more than one target loads into t\.top"):
+
+        class Top(Record, table="t.top", writer=Upsert(("source_id", "k"))):
+            record_key: ClassVar[tuple[str, ...]] = ("k",)
+            record_version: ClassVar[int] = 1
+
+            k: Annotated[str, To("k")]
+            middles: Annotated[list[Middle], Rows()]
+
+
+def test_rows_refused_under_update_in_a_nested_part_and_under_a_keyless_child() -> None:
+    """Check Rows stays refused under an Update table, inside a nested part, and under a one-to-one keyless child."""
+    with pytest.raises(TypeError, match="Rows is not for an Update table"):
+
+        class Patch(Record, table="t.patch", writer=Update(("source_id", "k"))):
+            record_key: ClassVar[tuple[str, ...]] = ("k",)
+            record_version: ClassVar[int] = 1
+
+            k: Annotated[str, To("k")]
+            n: Annotated[int, To("n")]
+            price: Annotated[SkuPrice | None, Rows()] = None
+
+    with pytest.raises(TypeError, match="Rows is only for a field of the class that declares the table"):
+
+        class Inner(Part):
+            price: Annotated[SkuPrice | None, Rows()] = None
+
+        class Outer(Record, table="t.outer", writer=Upsert(("source_id", "k"))):
+            record_key: ClassVar[tuple[str, ...]] = ("k",)
+            record_version: ClassVar[int] = 1
+
+            k: Annotated[str, To("k")]
+            inner: Inner
+
+    with pytest.raises(TypeError, match="Rows needs a writer with a key of its own"):
+
+        class Keyless(Part, table="t.keyless", writer=Upsert(())):
+            n: Annotated[int, To("n")]
+            lines: Annotated[list[Line], Rows()]
+
+
+def test_a_part_with_a_keyed_writer_is_not_a_top_level_target() -> None:
+    """Check target_of refuses a Part, whatever its writer, since it loads only as a child."""
+    with pytest.raises(TypeError, match="ProductSku loads as child rows"):
+        target_of(ProductSku)
+
+
+def test_an_empty_key_is_refused_outside_a_one_to_one_child() -> None:
+    """Check only Upsert and Versioned allow an empty key, and a Record never does."""
+    with pytest.raises(ValueError, match="the writer's key must name distinct columns"):
+
+        class Gone(Part, table="t.gone", writer=Snapshot(())):
+            n: Annotated[int, To("n")]
+
+    with pytest.raises(TypeError, match="the writer's key must be the columns k"):
+
+        class Root(Record, table="t.root", writer=Upsert(()), source_column=None):
+            record_key: ClassVar[tuple[str, ...]] = ("k",)
+            record_version: ClassVar[int] = 1
+
+            k: Annotated[str, To("k")]
+
+
+def test_a_one_to_one_versioned_child_needs_a_unique_key_on_its_inherited_columns() -> None:
+    """Check mismatches wants a one-to-one Versioned child's unique key on its inherited columns and valid_from."""
+    price = dict(dict(target_of(Product).children)["skus"].children)["price"]
+
+    def col(name: str, kind: str, nullable: bool) -> TableColumn:
+        return TableColumn(name=name, type=kind, nullable=nullable, has_default=False, writable=True)
+
+    columns = {
+        "tiktok_sku_id": col("tiktok_sku_id", "text", False),
+        "retail_price": col("retail_price", "bigint", False),
+        "valid_from_key": col("valid_from_key", "integer", False),
+        "valid_to_key": col("valid_to_key", "integer", True),
+    }
+    fits = TableInfo(
+        table="cipher.dim_sku_price",
+        columns=columns,
+        unique_keys=frozenset({frozenset({"tiktok_sku_id", "valid_from_key"})}),
+    )
+    assert mismatches(price, fits) == []
+    narrow = TableInfo(
+        table="cipher.dim_sku_price", columns=columns, unique_keys=frozenset({frozenset({"valid_from_key"})})
+    )
+    assert mismatches(price, narrow) == [
+        "cipher.dim_sku_price has no unique key on exactly tiktok_sku_id, valid_from_key"
+    ]
+
+
+class DaySales(Part, table="cipher.fact_product_sales", writer=ReplaceChildren(("source_key",))):
+    """A product-day's sales by traffic source, replaced under its product-day."""
+
+    source_key: Annotated[int, To("source_key")]
+    gmv: Annotated[int, To("gmv")]
+
+
+class DayRating(Part, table="cipher.fact_product_ratings", writer=Upsert(())):
+    """A product-day's rating: one-to-one, keyed by the product-day it inherits."""
+
+    stars: Annotated[int, To("stars")]
+
+
+class ProductDay(Record, container=True):
+    """One product's day of performance: no table of its own, only its facts."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("product", "day")
+    record_version: ClassVar[int] = 1
+
+    product: Annotated[str, To("tiktok_product_id")]
+    day: Annotated[Int32, To("date_key")]
+    sales: Annotated[list[DaySales], Rows()] = Field(default_factory=list)
+    rating: Annotated[DayRating | None, Rows()] = None
+
+
+def test_a_container_has_no_table_and_its_children_inherit_its_key_and_source() -> None:
+    """Check a container's target has no table or writer, and every child inherits its source and key columns."""
+    found = {
+        target.table: ([c.name for c in target.columns], target.inherited, row_key(target))
+        for target in walk(target_of(ProductDay))
+    }
+    key = ("source_id", "tiktok_product_id", "date_key")
+    assert found == {
+        None: (list(key), (), key),
+        "cipher.fact_product_sales": ([*key, "source_key", "gmv"], key, (*key, "source_key")),
+        "cipher.fact_product_ratings": ([*key, "stars"], key, key),
+    }
+    assert target_of(ProductDay).writer is None
+    assert mismatches(target_of(ProductDay), None) == []  # nothing to compare
+
+
+def test_a_container_without_a_source_column() -> None:
+    """Check a container may opt out of the source column, so its children are not per source."""
+
+    class ShopDay(Record, container=True, source_column=None):
+        record_key: ClassVar[tuple[str, ...]] = ("day",)
+        record_version: ClassVar[int] = 1
+
+        day: Annotated[Int32, To("date_key")]
+        rating: Annotated[DayRating | None, Rows()] = None
+
+    rating = dict(target_of(ShopDay).children)["rating"]
+    assert rating.inherited == ("date_key",)
+    assert row_key(rating) == ("date_key",)
+
+
+def test_a_subclass_of_a_container_is_not_one() -> None:
+    """Check a subclass that does not repeat container=True declares no target, as with a table."""
+
+    class Copy(ProductDay): ...
+
+    assert Copy.__target__ is None
+
+
+@pytest.mark.parametrize(
+    ("keywords", "fields", "message"),
+    [
+        ("container=True, table='t.x', writer=Upsert(('source_id', 'k'))", "sales: Annotated[list[DaySales], Rows()]",
+         "a container has no table or writer"),
+        ("container=True", "sales: Annotated[list[DaySales], Rows()]\n    extra: Annotated[int, To('extra')] = 0",
+         "only record_key fields take a To: extra"),
+        ("container=True", "", "a container loads only its Rows children, so it needs one"),
+        ("container=True", "sales: Annotated[list[Gone], Rows()]", "writer must be Upsert, Versioned or"),
+        ("container=True", "sales: Annotated[list[DaySales], Rows()]\n"
+         "    more: Annotated[list[DaySales], Rows()] = Field(default_factory=list)",
+         "more than one target loads into cipher.fact_product_sales"),
+    ],
+    ids=["table and writer", "non-key To", "no Rows", "snapshot child", "table clash"],
+)  # fmt: skip
+def test_container_refused(keywords: str, fields: str, message: str) -> None:
+    """Check a container takes no table or writer, loads only key fields, needs Rows, and keeps the child rules."""
+    code = (
+        f"class Refused(Record, {keywords}):\n"
+        "    record_key: ClassVar[tuple[str, ...]] = ('k',)\n"
+        "    record_version: ClassVar[int] = 1\n"
+        "    k: Annotated[str, To('k')]\n"
+        f"    {fields}\n"
+    )
+
+    class Gone(Part, table="cipher.gone", writer=Snapshot(("n",))):
+        n: Annotated[int, To("n")]
+
+    names = {
+        "Annotated": Annotated, "ClassVar": ClassVar, "DaySales": DaySales, "Field": Field, "Gone": Gone,
+        "Record": Record, "Rows": Rows, "To": To, "Upsert": Upsert,
+    }  # fmt: skip
+    with pytest.raises(TypeError, match=message):
+        exec(code, names)  # noqa: S102
+
+
+def test_a_container_key_field_needs_a_to_and_a_part_cannot_be_one() -> None:
+    """Check a container's record_key field needs a To, and only a Record can be a container."""
+    with pytest.raises(TypeError, match=r"^Untold\.k is in record_key, so it needs a To$"):
+
+        class Untold(Record, container=True):
+            record_key: ClassVar[tuple[str, ...]] = ("k",)
+            record_version: ClassVar[int] = 1
+
+            k: str
+            rating: Annotated[DayRating | None, Rows()] = None
+
+    with pytest.raises(TypeError, match="only a Record can be a container"):
+
+        class Holder(Part, container=True):
+            rating: Annotated[DayRating | None, Rows()] = None
+
+
+def test_rows_is_refused_when_the_child_would_inherit_no_column() -> None:
+    """Check Rows needs the parent's key to pass its child a column besides the source column."""
+
+    class Note(Part, table="t.note", writer=Upsert(("k",))):
+        k: Annotated[str, To("k")]
+
+    with pytest.raises(TypeError, match=r"Shop\.notes: Rows needs its parent's key to hold a column besides"):
+
+        class Shop(Part, table="t.shop", writer=Upsert(("source_id",)), source_column="source_id"):
+            name: Annotated[str, To("name")]
+            notes: Annotated[list[Note], Rows()]

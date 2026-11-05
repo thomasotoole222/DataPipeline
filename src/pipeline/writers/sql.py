@@ -100,14 +100,8 @@ async def replace_children(
         psycopg.Error: Any other database error, unchanged.
 
     """
-    delete = sql.SQL(
-        "DELETE FROM {table} AS t WHERE ROW({t_key}) IN (SELECT {p_key} FROM {parents} AS p) AND {missing}"
-    ).format(
-        table=_table(table),
-        t_key=_names(inherited, "t"),
-        p_key=_names(inherited, "p"),  # qualified, so a key column missing from parents is an error
-        parents=sql.Identifier(parents),
-        missing=_missing(staged, key),
+    delete = sql.SQL("DELETE FROM {table} AS t WHERE {under} AND {missing}").format(
+        table=_table(table), under=_under(inherited, parents), missing=_missing(staged, key)
     )
     deleted = await _changed(conn, delete)
     return deleted + await _changed(conn, _upsert(table, staged, columns, key, clear_removed=False))
@@ -233,6 +227,8 @@ async def versioned(
     day: date | int,
     previous: date | int,
     prune: bool,
+    inherited: Sequence[str] = (),
+    parents: str | None = None,
 ) -> tuple[int, int]:
     """Make each staged key's open version equal its staged row; only versions opened on the day change in place.
 
@@ -254,7 +250,9 @@ async def versioned(
     3. Close on ``previous`` the open versions that started before D and differ from their staged row.
     4. With ``prune``, for the source's open versions whose key is not staged: delete those that started on D (the
        day's last observation is that the key is gone, so the day keeps no version of it) and close on ``previous``
-       those that started before D.
+       those that started before D. With ``parents`` (a child table), only the open versions whose ``inherited``
+       columns match a row of ``parents`` are pruned, as ``replace_children`` scopes its delete: a key under a parent
+       that is not staged is left as it is.
     5. Insert a version for every staged key that is not stale and has no open version left: from D when the key
        has any version at all, else from its ``opens_from`` value (D when ``opens_from`` is None or the value is
        null), but never after D. Every version of a non-stale key ends on or before ``previous``, so the new one
@@ -263,20 +261,31 @@ async def versioned(
     Closing runs before inserting, so a non-deferrable exclusion constraint on a key's version ranges never sees
     two open versions.
 
+    Step 4 does not check for later days: an unstaged key's open version that started before D is closed on
+    ``previous`` even when a later day's task has already run and seen the key (an unchanged key leaves no row dated
+    after D), so a late or retried task for an earlier day ends a version that is still current, in a child table
+    too (todo.txt 17).
+
     Preconditions:
         As for ``snapshot``, except that the table has no ``removed_at`` and several rows per key: ``valid_from`` and
         ``valid_to`` are its day columns and ``columns`` includes neither. ``staged`` has no two rows with one key
         (Load holds key violations first). ``day`` and ``previous`` match ``valid_from``'s type, and ``opens_from``,
         when set, is in ``columns`` and of that type (``checks.targets`` checks the table with ``mismatches``). With
-        ``prune``, ``staged`` is not empty (Load raises ``NothingLoaded`` first, as ``Versioned`` is a ``Snapshot``).
+        ``prune`` and no ``parents``, ``staged`` is not empty (Load raises ``NothingLoaded`` first, as ``Versioned`` is
+        a ``Snapshot``); with ``parents``, ``staged`` may be empty, so every open version under a listed parent is
+        closed or dropped. With ``parents``, ``inherited`` is non-empty and names columns of ``table`` and of
+        ``parents``. A staged row need not belong to a parent in ``parents``: it is still versioned by steps 2, 3 and
+        5, but the keys missing under its parent are not pruned.
 
     Args:
         conn: Connection the statements run on; the caller owns the transaction.
         table: Target table as ``"schema.name"``.
         staged: Unqualified name of the staged table.
         columns: Columns copied from the stage to the table.
-        key: Columns that identify a key's versions, the source column included when the table has one.
-        source_column: Column holding the source, or ``None`` to prune across the whole table.
+        key: Columns that identify a key's versions, the source column included when the table has one (a child
+            table's row key, ``checks.targets.row_key``).
+        source_column: Column holding the source, or ``None`` to prune across the whole table (or, with ``parents``,
+            across the listed parents' rows).
         source_id: Source to prune; ignored when ``source_column`` is ``None``.
         valid_from: Column holding a version's first day.
         valid_to: Column holding a version's last day, null while it is open.
@@ -284,6 +293,10 @@ async def versioned(
         day: The observation day.
         previous: The day before ``day``.
         prune: Whether to close the open versions of keys missing from the stage.
+        inherited: Parent-key columns, matched by name in ``table`` and ``parents``; read only with ``parents``.
+            Defaults to none.
+        parents: Unqualified name of the table listing the parents whose versions may be pruned, or ``None``, the
+            default, to prune by source alone.
 
     Returns:
         The rows changed (overwritten, closed, deleted and inserted, so a changed key counts twice) and the number of
@@ -339,6 +352,8 @@ async def versioned(
         changed += await _changed(conn, close, (previous, day))
     if prune:
         source, params = _source(source_column, source_id)
+        if parents is not None:  # a child: only under the parents staged with it
+            source = sql.SQL("{source} AND {under}").format(source=source, under=_under(inherited, parents))
         missing = _missing(staged, key)
         drop_today = sql.SQL(
             "DELETE FROM {table} AS t WHERE {source} AND t.{last} IS NULL AND t.{first} = %s AND {missing}"
@@ -548,6 +563,33 @@ def _source(source_column: str | None, source_id: UUID | None) -> tuple[sql.Comp
     if source_column is None:  # a table not per source: the whole table is the scope
         return sql.SQL("TRUE"), ()
     return sql.SQL("{} = %s").format(sql.Identifier("t", source_column)), (source_id,)
+
+
+def _under(inherited: Sequence[str], parents: str) -> sql.Composed:
+    """Build the condition that a row of the table aliased ``t`` belongs to a parent listed in ``parents``.
+
+    The parent key is read from ``parents`` qualified, so a key column missing from ``parents`` raises
+    ``psycopg.errors.UndefinedColumn`` when the statement runs, rather than matching the table's own column.
+
+    Preconditions:
+        ``inherited`` is non-empty and names columns of the table and of ``parents``.
+
+    Args:
+        inherited: Parent-key columns, matched by name.
+        parents: Unqualified name of the table listing the parents.
+
+    Returns:
+        The composed ``ROW(...) IN (SELECT ...)`` condition, without parameters.
+
+    Raises:
+        Nothing.
+
+    """
+    return sql.SQL("ROW({t_key}) IN (SELECT {p_key} FROM {parents} AS p)").format(
+        t_key=_names(inherited, "t"),
+        p_key=_names(inherited, "p"),  # qualified, so a key column missing from parents is an error
+        parents=sql.Identifier(parents),
+    )
 
 
 def _missing(staged: str, key: Sequence[str]) -> sql.Composed:

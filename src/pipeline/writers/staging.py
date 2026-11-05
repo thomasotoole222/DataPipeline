@@ -27,12 +27,14 @@ async def copy_in(conn: Connection, frame: pl.DataFrame, columns: Sequence[tuple
     Preconditions:
         ``conn`` is inside a transaction that has not failed (checked: ``RuntimeError`` otherwise). ``frame``'s
         columns are ``columns``' names in the same order: ``load._write`` passes both from the same ``Target`` --
-        ``columns`` from ``target.columns`` and the frame from ``frame_of``, which builds it from ``target.columns``.
+        ``columns`` from ``target.columns`` and the frame from ``frame_of``, which builds it from ``target.columns``
+        -- and so does ``load`` itself when it stages a container's key frame directly, a container being written
+        nowhere.
         Each type string comes from ``checks.targets._column_type`` (a ``_SCALARS`` type name or ``numeric(p,s)``
         built from the model's integer constraints), never from data, so it is inserted as SQL while names are quoted
         as identifiers. ``columns`` is non-empty: every ``Target`` has at least its writer's key or partition column,
-        which ``_check_writer`` requires when the model is defined, or for ``ReplaceChildren`` the parent's key
-        columns it inherits. Every frame value can be dumped by psycopg as text for its column's type; a
+        which ``_check_writer`` requires when the model is defined, or for a child the parent's key columns it
+        inherits. Every frame value can be dumped by psycopg as text for its column's type; a
         ``timestamptz`` column holds aware datetimes (``build_target`` maps ``AwareDatetime`` to
         ``pl.Datetime("us", "UTC")``, and Transform checks values are aware).
 

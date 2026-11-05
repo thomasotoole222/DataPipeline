@@ -31,10 +31,14 @@ from pipeline.timeutil import ensure_utc
 class RawPage:
     """One page of results fetched for a task, as stored in ``raw.page``.
 
-    Instances are frozen, use slots, and take every field as a required keyword argument in the generated
-    ``__init__``. ``__post_init__`` checks that ``page_no`` is 0 or more and that ``payload`` is a ``dict``, and
-    replaces ``fetched_at`` with ``ensure_utc(fetched_at)``, so every instance holds an aware UTC ``fetched_at``.
-    ``last_page`` and ``read_pages`` build instances from ``raw.page`` rows, so those rows pass the same checks.
+    Instances are frozen, use slots, and take every field as a keyword argument in the generated ``__init__``, required
+    but for ``ids`` and ``error_class``. ``__post_init__`` checks that ``page_no`` is 0 or more, that ``payload`` is a
+    ``dict``, that ``ids`` is ``None`` or not empty and holds no ``None``, and that ``error_class`` is not ``""`` and
+    comes with ``ids``; it replaces ``ids``
+    with a tuple and ``fetched_at`` with ``ensure_utc(fetched_at)``, so every instance holds an aware UTC
+    ``fetched_at``.
+    ``last_page`` and ``read_pages`` build instances from ``raw.page`` rows, so those rows pass the same checks; the
+    table's own CHECKs match the ``ids`` and ``error_class`` ones, so a row ``save_page`` wrote always passes.
     The generated ``__eq__`` compares all fields. The generated ``__hash__`` hashes all fields, so it always raises
     ``TypeError`` because ``payload`` is a ``dict``: instances cannot go in a set or be dict keys.
 
@@ -47,7 +51,14 @@ class RawPage:
         cursor_next (str | None): Cursor returned for the next page, or ``None``. Not validated.
         fetched_at (datetime): Time the response arrived, aware and in UTC.
         payload (dict[str, Any]): The whole decoded response body, envelope included. Must be a ``dict``; its
-            contents are not checked, and the dict passed in is stored as is, not copied.
+            contents are not checked, and the dict passed in is stored as is, not copied. Extract builds a failed
+            call's marker with ``{"error": <message>}``; nothing here checks that shape.
+        ids (tuple[str, ...] | None): The ids a fanned-out call was for, in the order sent; ``None`` for a page not
+            fetched per id. Not empty when set, and holds no ``None``; its elements are not otherwise checked. Any
+            sequence passed in is stored as a tuple. Defaults to ``None``.
+        error_class (str | None): The error class of a fanned-out call that failed with a holdable error, whose page
+            Extract then lands as a marker with no records; ``None`` for a fetched page. Set only with ``ids``, and
+            never ``""``; whether ``payload`` is a marker is not checked. Defaults to ``None``.
 
     """
 
@@ -59,16 +70,19 @@ class RawPage:
     cursor_next: str | None  # cursor for the next page; None on the last page
     fetched_at: datetime  # when the response arrived, converted to UTC
     payload: dict[str, Any]  # the whole response body, envelope included
+    ids: tuple[str, ...] | None = None  # the ids a fanned-out call was for; None: not fetched per id
+    error_class: str | None = None  # set: a failed call's marker page, with no records
 
     def __post_init__(self) -> None:
-        """Validate ``page_no`` and ``payload`` and normalise ``fetched_at`` to UTC.
+        """Validate ``page_no``, ``payload``, ``ids`` and ``error_class`` and normalise ``ids`` and ``fetched_at``.
 
-        Checks run in order: ``page_no``, then ``payload``, then ``fetched_at`` is replaced with
-        ``ensure_utc(fetched_at)``.
+        Checks run in order: ``page_no``, then ``payload``, then ``ids`` and ``error_class``; then ``ids`` is replaced
+        with a tuple (a row from ``raw.page`` gives a list) and ``fetched_at`` with ``ensure_utc(fetched_at)``.
 
         Preconditions:
             The fields hold their annotated types (mypy checks callers; rows from ``raw.page`` match by its column
-            types and ``NOT NULL`` constraints).
+            types and ``NOT NULL`` constraints), except that ``ids`` may be any sequence of ``str``: a row gives a
+            ``list``; the table's CHECK keeps a row's ``ids`` one-dimensional and free of ``NULL``.
 
         Args:
             None.
@@ -77,7 +91,8 @@ class RawPage:
             None.
 
         Raises:
-            ValueError: If ``page_no`` is less than ``0``, or, from ``ensure_utc``, if ``fetched_at`` is naive.
+            ValueError: If ``page_no`` is less than ``0``; if ``ids`` is empty or holds ``None``; if ``error_class``
+                is ``""`` or is set without ``ids``; or, from ``ensure_utc``, if ``fetched_at`` is naive.
             TypeError: If ``payload`` is not a ``dict``, or, from ``ensure_utc``, if ``fetched_at`` is not a
                 ``datetime``.
             OverflowError: From ``ensure_utc``, if converting ``fetched_at`` to UTC leaves the ``datetime`` range.
@@ -87,6 +102,14 @@ class RawPage:
             raise ValueError(f"page_no must be 0 or more, got {self.page_no}")
         if not isinstance(self.payload, dict):
             raise TypeError(f"payload must be a JSON object, got {type(self.payload).__name__}")
+        if self.ids is not None and (not self.ids or any(one is None for one in self.ids)):
+            raise ValueError("ids must be None or hold at least one id and no None")
+        if self.error_class == "":
+            raise ValueError("a failed call's error_class must not be empty")
+        if self.error_class is not None and self.ids is None:
+            raise ValueError("a failed call's error_class needs the ids it was for")
+        if self.ids is not None:
+            object.__setattr__(self, "ids", tuple(self.ids))
         object.__setattr__(self, "fetched_at", ensure_utc(self.fetched_at))
 
 
@@ -94,16 +117,19 @@ class RawPage:
 #: same hash already holds the same body, so a conflict leaves it as it is.
 _SAVE_PAYLOAD: Final = "INSERT INTO raw.payload (hash, body) VALUES (%s, %s) ON CONFLICT (hash) DO NOTHING"
 
-#: Upsert statement for one ``raw.page`` row. The nine ``%s`` parameters are, in order, ``task_id``, ``page_no``,
-#: ``connector``, ``endpoint``, ``cursor_in``, ``cursor_next``, ``fetched_at``, ``envelope`` and ``payload_hash``. On a
-#: conflict on ``(task_id, page_no)`` it overwrites every other column with the incoming values.
+#: Upsert statement for one ``raw.page`` row. The eleven ``%s`` parameters are, in order, ``task_id``, ``page_no``,
+#: ``connector``, ``endpoint``, ``cursor_in``, ``cursor_next``, ``fetched_at``, ``envelope``, ``payload_hash``, ``ids``
+#: and ``error_class``. On a conflict on ``(task_id, page_no)`` it overwrites every other column with the incoming
+#: values.
 _SAVE: Final = (
     "INSERT INTO raw.page "
-    "(task_id, page_no, connector, endpoint, cursor_in, cursor_next, fetched_at, envelope, payload_hash) "
-    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+    "(task_id, page_no, connector, endpoint, cursor_in, cursor_next, fetched_at, envelope, payload_hash, ids, "
+    "error_class) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
     "ON CONFLICT (task_id, page_no) DO UPDATE SET connector = EXCLUDED.connector, endpoint = EXCLUDED.endpoint, "
     "cursor_in = EXCLUDED.cursor_in, cursor_next = EXCLUDED.cursor_next, fetched_at = EXCLUDED.fetched_at, "
-    "envelope = EXCLUDED.envelope, payload_hash = EXCLUDED.payload_hash"
+    "envelope = EXCLUDED.envelope, payload_hash = EXCLUDED.payload_hash, ids = EXCLUDED.ids, "
+    "error_class = EXCLUDED.error_class"
 )
 
 
@@ -170,7 +196,8 @@ async def save_page(conn: Connection, page: RawPage, hashed_keys: frozenset[str]
     ``jsonb`` rejects a string holding NUL (U+0000) or a lone surrogate, and ``_canonical`` and ``jsonb`` reject a
     ``NaN``/``Infinity`` number. A page fetched through ``HttpConnectorClient`` holds none of them: the client
     replaces NUL and lone surrogates with U+FFFD and refuses a 2xx body holding a non-standard constant, so only a
-    payload built some other way can fail here.
+    payload built some other way can fail here, such as a failed call's marker, whose ``{"error": <message>}`` is
+    built from an exception message; ``ids`` holding NUL fails the same way as ``text[]`` input.
 
     Preconditions:
         ``conn`` is an open asynchronous connection that is not running another statement. ``raw.payload`` and
@@ -181,7 +208,7 @@ async def save_page(conn: Connection, page: RawPage, hashed_keys: frozenset[str]
     Args:
         conn: Connection the statements run on.
         page: Page whose ``task_id``, ``page_no``, ``connector``, ``endpoint``, ``cursor_in``, ``cursor_next``,
-            ``fetched_at`` and ``payload`` are written.
+            ``fetched_at``, ``payload``, ``ids`` (as a ``text[]``) and ``error_class`` are written.
         hashed_keys: The top-level keys of the payload stored in ``raw.payload``: the connector's ``hashed_keys``.
 
     Returns:
@@ -209,6 +236,8 @@ async def save_page(conn: Connection, page: RawPage, hashed_keys: frozenset[str]
         page.fetched_at,
         Jsonb(envelope),
         digest,
+        None if page.ids is None else list(page.ids),
+        page.error_class,
     )
     with db_errors():
         await conn.execute(_SAVE_PAYLOAD, (digest, Jsonb(hashed)))
@@ -219,7 +248,7 @@ async def save_page(conn: Connection, page: RawPage, hashed_keys: frozenset[str]
 #: its ``raw.payload`` body back into the whole payload. ``%s`` is the ``task_id`` parameter, bound at execution.
 _LAST: Final = (
     "SELECT p.task_id, p.page_no, p.connector, p.endpoint, p.cursor_in, p.cursor_next, p.fetched_at, "
-    "p.envelope || y.body AS payload "
+    "p.envelope || y.body AS payload, p.ids, p.error_class "
     "FROM raw.page AS p JOIN raw.payload AS y ON y.hash = p.payload_hash "
     "WHERE p.task_id = %s ORDER BY p.page_no DESC LIMIT 1"
 )
@@ -260,7 +289,7 @@ async def last_page(conn: Connection, task_id: int) -> RawPage | None:
 #: ``raw.payload`` body back into the whole payload. The ``%s`` placeholder takes the task id.
 _READ: Final = (
     "SELECT p.task_id, p.page_no, p.connector, p.endpoint, p.cursor_in, p.cursor_next, p.fetched_at, "
-    "p.envelope || y.body AS payload "
+    "p.envelope || y.body AS payload, p.ids, p.error_class "
     "FROM raw.page AS p JOIN raw.payload AS y ON y.hash = p.payload_hash "
     "WHERE p.task_id = %s ORDER BY p.page_no"
 )

@@ -4,9 +4,10 @@ from typing import Annotated, ClassVar
 from uuid import UUID
 
 import pytest
+from pydantic import Field
 
 from pipeline.checks.record import Int16, Int32, Keyed, Part, Record
-from pipeline.checks.targets import ReplaceChildren, Rows, To, Upsert, target_of
+from pipeline.checks.targets import ReplaceChildren, Rows, To, Upsert, Versioned, target_of
 from pipeline.db.quarantine import Failure
 from pipeline.errors import Overflow
 from pipeline.stages.transform import Transformed, frame_of, transform
@@ -89,3 +90,101 @@ def test_frame_of_keeps_ints_in_their_columns_width(day: int, code: int, refused
     else:
         with pytest.raises(Overflow, match=rf"^cipher\.stat\.{refused}$"):
             frame_of(target_of(Stat), [row])
+
+
+class Component(Part, table="cipher.bundle", writer=ReplaceChildren(("component",))):
+    """A bundle component under its SKU."""
+
+    component: Annotated[str, To("component")]
+
+
+class Price(Part, table="cipher.price", writer=Versioned((), valid_from="f", valid_to="t")):
+    """A SKU's one-to-one price."""
+
+    price: Annotated[int, To("price")]
+
+
+class Sku(Part, table="cipher.sku", writer=Upsert(("sku_id",))):
+    """A SKU under its product."""
+
+    sku_id: Annotated[str, To("sku_id")]
+    price: Annotated[Price | None, Rows()] = None
+    parts: Annotated[list[Component], Rows()] = Field(default_factory=list)
+
+
+class Product(Record, table="cipher.product", writer=Upsert(("source_id", "product_id"))):
+    """A product with its SKUs."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("product_id",)
+    record_version: ClassVar[int] = 1
+
+    product_id: Annotated[str, To("product_id")]
+    skus: Annotated[list[Sku], Rows()] = Field(default_factory=list)
+
+
+def test_nested_children_load_parents_first_with_one_to_one_and_none() -> None:
+    """Check frames come parents first at every depth, a single part gives one row, and None gives none."""
+    accepted = [
+        Keyed(
+            Product(
+                product_id="p1",
+                skus=[
+                    Sku(
+                        sku_id="s1", price=Price(price=5), parts=[Component(component="c1"), Component(component="c2")]
+                    ),
+                    Sku(sku_id="s2"),
+                ],
+            ),
+            ("p1",),
+        ),
+        Keyed(Product(product_id="p2"), ("p2",)),
+    ]
+    built = transform(Product, accepted, SHOP)
+    tables = [target.table for target, _ in built.frames]
+    assert tables == ["cipher.product", "cipher.sku", "cipher.price", "cipher.bundle"]
+    rows = {target.table: frame.rows() for target, frame in built.frames}
+    assert rows == {
+        "cipher.product": [(str(SHOP), "p1"), (str(SHOP), "p2")],
+        "cipher.sku": [("p1", "s1"), ("p1", "s2")],  # the product's key, without the source column
+        "cipher.price": [("s1", 5)],  # s2 has no price
+        "cipher.bundle": [("s1", "c1"), ("s1", "c2")],
+    }
+    assert built.owners == ((0, 1), (0, 0), (0,), (0, 0))
+
+
+def test_a_child_without_its_parent_is_an_orphan() -> None:
+    """Check Transformed refuses a keyed child whose parent is not in the frames."""
+    built = transform(Product, [], SHOP)
+    with pytest.raises(ValueError, match=r"cipher\.sku has no parent in frames"):
+        Transformed(frames=built.frames[1:2], owners=((),))
+
+
+class Traffic(Part, table="cipher.traffic", writer=ReplaceChildren(("channel",))):
+    """A product-day's views by channel."""
+
+    channel: Annotated[str, To("channel")]
+    views: Annotated[int, To("views")]
+
+
+class ProductDay(Record, container=True):
+    """A product-day with no table of its own."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("product_id", "day")
+    record_version: ClassVar[int] = 1
+
+    product_id: Annotated[str, To("product_id")]
+    day: Annotated[Int32, To("date_key")]
+    traffic: Annotated[list[Traffic], Rows()] = Field(default_factory=list)
+
+
+def test_a_container_frame_holds_only_its_key_and_comes_first() -> None:
+    """Check a container's frame is its source and key columns, before its children's frames."""
+    accepted = [
+        Keyed(ProductDay(product_id="p1", day=20261104, traffic=[Traffic(channel="live", views=9)]), ("p1", 20261104))
+    ]
+    built = transform(ProductDay, accepted, SHOP)
+    (container, keys), (traffic, rows) = built.frames
+    assert container.table is None
+    assert keys.rows() == [(str(SHOP), "p1", 20261104)]
+    assert traffic.table == "cipher.traffic"
+    assert rows.rows() == [(str(SHOP), "p1", 20261104, "live", 9)]

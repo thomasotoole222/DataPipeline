@@ -107,4 +107,23 @@ production shows it matters.
     closes on D - 1, or drops, the open versions of keys missing from its stage, even when a later day's task saw
     those keys present. Staleness is decided per staged key, so the writer cannot tell. Retries land within the
     same day in practice, so this needs a task that sat queued past midnight in the job's zone.
+    Versioned children are now always pruned under their staged parents, so the same holds for a child table: a late
+    task can also close, on D - 1, a child key that a later day's task saw under the same parent (step 4 of
+    writers.sql.versioned).
     Fix: skip the prune when any open version of the source starts after D, and count it as stale.
+
+Children and fan-out
+--------------------
+Found by the fan-out review round, 2026-11-05, and left open on purpose. Fix one if integration testing or
+production shows it matters.
+
+18. stages.extract._calls: the next call starts only when the oldest call has finished, so a slow oldest call (one
+    the client is retrying with backoff: 31 s or more over five retries, up to 60 s a retry for a RateLimited) keeps
+    the other slots idle once their calls finish, and the fan-out runs one call at a time behind it. The yield order
+    (batch order) and the memory bound (at most concurrency + 1 calls' pages) are correct.
+    Fix: start the next call when any call finishes, keeping the yield in batch order and the buffered calls bounded.
+
+19. connectors.spec.EndpointSpec.request_for: an empty id is refused only for a path id; a query id of "" is sent
+    as "name=" and body ids of "" as they are. A bare str is a Sequence[str] to mypy, so request_for("12") on a body
+    id sends ["1", "2"]. Every caller passes a tuple of non-empty ids (fanout ids are, by id_text).
+    Fix: refuse an empty id in every place, and a str as ids.
