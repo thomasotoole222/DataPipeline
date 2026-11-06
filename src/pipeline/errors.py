@@ -33,6 +33,7 @@ Public API:
     Overflow: A ``PermanentError`` raised when a value does not fit its warehouse column.
     TooDeep: A ``PermanentError`` raised when a response body is nested too deeply to parse or store.
     IdRefused: A ``PermanentError`` raised when an id from outside data cannot be placed in a fanned-out request.
+    NoRecord: A ``PermanentError`` a connector client raises for an error response a rule says means "no record".
     db_errors: Context manager that converts warehouse connection and conflict errors into pipeline errors.
 
 """
@@ -1061,6 +1062,24 @@ class IdRefused(PermanentError):
     id. ``EndpointSpec.request_for`` raises it for a value its request builder refuses; a configuration error there
     stays a ``ValueError``. As a ``PermanentError``, ``stages.extract`` holds the call's ids as ``detail_failed``
     instead of failing the task, since one bad id from outside data would otherwise fail every attempt.
+
+    Attributes:
+        outcome (Outcome): ``Outcome.FAILED``, inherited from ``PermanentError``.
+
+    """
+
+    pass
+
+
+class NoRecord(PermanentError):
+    """Signal that a connector answered a request with an error that, by an ``ErrorRule``, means there is no record.
+
+    Adds no constructor or attributes of its own; ``connectors.client.map_error`` builds it, with the connector error
+    as its message, for a rule whose outcome is ``ErrorOutcome.NO_RECORD`` (TikTok Get Product's answer for a frozen
+    or deleted product, a LIVE that is not ready yet). ``connectors.fetch.fetch_pages`` turns it, on a sub-frame's
+    first request, into an empty page, so the call lands no record. Raised on a later page, it would cut the
+    sub-frame short, so it propagates: as a ``PermanentError`` it fails a task, or holds a fanned-out call's ids as
+    ``detail_failed``. Not retried.
 
     Attributes:
         outcome (Outcome): ``Outcome.FAILED``, inherited from ``PermanentError``.

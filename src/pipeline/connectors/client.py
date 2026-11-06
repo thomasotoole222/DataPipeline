@@ -31,6 +31,7 @@ from pipeline.errors import (
     AuthBlocked,
     ClientErrorUnhandled,
     ConnectorResponseError,
+    NoRecord,
     PermanentError,
     PipelineError,
     RateLimited,
@@ -145,6 +146,8 @@ class ErrorOutcome(StrEnum):
         TOKEN_REJECTED: ``TokenRejected``; the client reports the credential to its ``CredentialProvider``.
         BLOCKED: ``AuthBlocked``.
         PERMANENT: ``PermanentError``.
+        NO_RECORD: ``NoRecord``: the response means there is no record, so ``fetch_pages`` lands the call as an
+            empty page.
 
     """
 
@@ -153,6 +156,7 @@ class ErrorOutcome(StrEnum):
     TOKEN_REJECTED = "token_rejected"  # noqa: S105 - an outcome name, not a secret
     BLOCKED = "blocked"
     PERMANENT = "permanent"
+    NO_RECORD = "no_record"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -246,8 +250,8 @@ def map_error(rules: Sequence[ErrorRule], err: ConnectorResponseError, *, now: d
     path, status, code, message and request id; its headers are dropped. With a match, the result depends on the
     rule's outcome: ``RateLimited(str(err))`` with ``retry_after`` read from the error's ``Retry-After`` header and
     measured from ``now`` (``utc_now()`` when ``now`` is ``None``), ``TransientError(str(err))``,
-    ``TokenRejected`` or ``AuthBlocked`` with the error's connector and its message as the reason, or
-    ``PermanentError(str(err))``. The returned error's ``__cause__`` is not set.
+    ``TokenRejected`` or ``AuthBlocked`` with the error's connector and its message as the reason,
+    ``PermanentError(str(err))``, or ``NoRecord(str(err))``. The returned error's ``__cause__`` is not set.
 
     Preconditions:
         ``now``, if given, is timezone-aware.
@@ -286,6 +290,8 @@ def map_error(rules: Sequence[ErrorRule], err: ConnectorResponseError, *, now: d
             return AuthBlocked(connector=err.connector, reason=err.message)
         case ErrorOutcome.PERMANENT:
             return PermanentError(str(err))
+        case ErrorOutcome.NO_RECORD:
+            return NoRecord(str(err))
         case _:
             assert_never(rule.outcome)
 
@@ -399,6 +405,7 @@ class HttpConnectorClient[C](ABC):
             TokenRejected: After the credential is reported to ``tokens``. Not retried.
             AuthBlocked: From a ``BLOCKED`` rule. Not retried.
             PermanentError: From a ``PERMANENT`` rule. Not retried.
+            NoRecord: From a ``NO_RECORD`` rule. Not retried.
             ClientErrorUnhandled: When no rule matches an error, a 2xx body holds the literal ``NaN``, ``Infinity``
                 or ``-Infinity`` or a number too large for a float, such as ``1e400``, or a 2xx body is not a JSON
                 object. Not retried.
@@ -635,8 +642,8 @@ def _status(err: Exception) -> int:
 def _result(err: Exception) -> str:
     """Return the result label to record for an error raised by an attempt.
 
-    Subclasses are tested before their bases: ``RateLimited`` before ``TransientError`` and ``TokenRejected`` before
-    ``AuthBlocked``.
+    Subclasses are tested before their bases: ``RateLimited`` before ``TransientError``, ``TokenRejected`` before
+    ``AuthBlocked`` and ``NoRecord`` before ``PermanentError``.
 
     Preconditions:
         None.
@@ -673,6 +680,8 @@ def _result(err: Exception) -> str:
             return ErrorOutcome.TOKEN_REJECTED
         case AuthBlocked():
             return ErrorOutcome.BLOCKED
+        case NoRecord():
+            return ErrorOutcome.NO_RECORD
         case PermanentError():
             return ErrorOutcome.PERMANENT
         case _:

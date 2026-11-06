@@ -300,7 +300,8 @@ async def run_worker(
         instruments: Where the worker records its metrics.
         runners: The runner for each job that can run.
         known_jobs: Every job in the job registry.
-        health_port: The port ``/health`` listens on; tests pass a free one.
+        health_port: The port ``/health`` listens on; ``_serve`` passes ``Settings.health_port``. Defaults to
+            ``HEALTH_PORT``.
 
     Returns:
         None, once the worker has been stopped, has drained and everything is closed, or once the shutdown deadline
@@ -350,6 +351,8 @@ async def run_worker(
 async def _serve[S: Settings](settings: S, instruments: Instruments, build_registry: BuildRegistry[S]) -> None:
     """Open the shared HTTP client, build the registry with it and run the worker on its jobs, then close the client.
 
+    ``/health`` listens on ``settings.health_port`` (``PIPELINE_HEALTH_PORT``).
+
     Preconditions:
         As ``run_worker``.
 
@@ -369,7 +372,9 @@ async def _serve[S: Settings](settings: S, instruments: Instruments, build_regis
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as http:
         registry = build_registry(settings, http, instruments)
         runners = registry.runners
-        await run_worker(settings, instruments, runners=runners, known_jobs=frozenset(runners))
+        await run_worker(
+            settings, instruments, runners=runners, known_jobs=frozenset(runners), health_port=settings.health_port
+        )
 
 
 def run[S: Settings](settings_type: type[S], build_registry: BuildRegistry[S]) -> None:

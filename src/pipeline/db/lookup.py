@@ -1,13 +1,15 @@
 """Read values from warehouse tables: which of a set of values exist in a column, and a job's one-column query.
 
 Public API:
-    known_values: Return the subset of the given values that appear in ``schema.table.column``.
+    known_values: Return the subset of the given values that appear in ``schema.table.column``, optionally only in
+        one source's rows.
     read_column: Run a one-column query in a read-only transaction and return its values.
 
 """
 
 from collections.abc import Collection, Mapping
 from typing import Any, Final, LiteralString
+from uuid import UUID
 
 from psycopg import sql
 
@@ -29,8 +31,20 @@ _UNBOUNDED: Final[Mapping[str, str]] = {
 _CAST_COLUMN: Final[frozenset[str]] = frozenset({"bit[]"})
 
 
-async def known_values(conn: Connection, table: str, column: str, values: Collection[str]) -> frozenset[str]:
+async def known_values(
+    conn: Connection,
+    table: str,
+    column: str,
+    values: Collection[str],
+    *,
+    source: tuple[str, UUID] | None = None,  # (column, source id): only that source's rows count
+) -> frozenset[str]:
     """Return the subset of ``values`` that appear in ``column`` of ``table``, compared in the column's own type.
+
+    With ``source`` set to ``(source_column, source_id)``, a value is found only in a row whose ``source_column``
+    equals ``source_id``: the second query adds ``AND t.<source_column> = <source_id>``, the id sent as untyped text,
+    so Postgres reads it in the column's own type (``uuid`` or ``text``). A value present only in another source's
+    rows is not found.
 
     With no values it returns an empty frozenset without touching the database. Otherwise it splits ``table`` on
     ``"."`` and, inside ``db_errors``, runs two queries. The first reads the column's type as
@@ -56,13 +70,16 @@ async def known_values(conn: Connection, table: str, column: str, values: Collec
 
     Preconditions:
         ``table`` is ``"schema.name"`` with exactly one dot, as ``Lookup.__post_init__`` guarantees through
-        ``TABLE_PATTERN``; not checked here. The server is Postgres 16 or later, for ``pg_input_is_valid``.
+        ``TABLE_PATTERN``; not checked here. The server is Postgres 16 or later, for ``pg_input_is_valid``. A
+        ``source`` column is of a type whose input reads a UUID's text, such as ``uuid`` or ``text``.
 
     Args:
         conn: Open warehouse connection.
         table: Schema-qualified table name, ``"schema.name"``.
         column: Column to match the values against.
         values: Values to look for, as text; may be empty.
+        source: The column of ``table`` that holds a row's source and the source whose rows count, or ``None`` to
+            look across every row. Defaults to ``None``.
 
     Returns:
         A frozenset of the given values that match a row, spelled as given; empty when ``values`` holds no value
@@ -74,7 +91,8 @@ async def known_values(conn: Connection, table: str, column: str, values: Collec
             ``psycopg.OperationalError``.
         psycopg.Error: Any other database error, unchanged (e.g. ``UndefinedTable`` when the table does not exist,
             ``UndefinedColumn`` when the column does not, ``UndefinedFunction`` when the column's type has no ``=``
-            operator, such as ``json``).
+            operator, such as ``json``; ``InvalidTextRepresentation`` when the ``source`` column's type cannot read the
+            source id, such as ``integer``).
 
     """
     storable = [value for value in values if storable_text(value) == value]  # NUL or a surrogate is never stored
@@ -97,7 +115,11 @@ async def known_values(conn: Connection, table: str, column: str, values: Collec
             "SELECT DISTINCT w.v FROM unnest(%s::text[]) AS w(v) JOIN {table} AS t "
             "ON {stored} = CASE WHEN pg_input_is_valid(w.v, %s) THEN w.v::{type} END"  # an invalid value is not cast
         ).format(table=names["table"], stored=stored, type=column_type)
-        cursor = await conn.execute(query, (storable, type_name))
+        params: list[object] = [storable, type_name]
+        if source is not None:  # only the task's source's rows count
+            query += sql.SQL(" AND t.{source} = %s").format(source=sql.Identifier(source[0]))
+            params.append(str(source[1]))  # untyped text: Postgres reads it in the column's type
+        cursor = await conn.execute(query, params)
         rows = await cursor.fetchall()
     return frozenset(str(found[0]) for found in rows)
 

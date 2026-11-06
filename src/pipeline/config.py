@@ -422,6 +422,8 @@ class Settings(BaseSettings):
         raw_retention (timedelta): How long a page stays in ``raw.page`` after it was fetched, the argument
             ``control.purge_raw`` is called with. An ISO-8601 duration such as ``PT60H``, longer than zero. Defaults to
             60 hours.
+        health_port (int): The TCP port the worker's ``/health`` endpoint listens on, from 1 to 65535 inclusive.
+            Defaults to 8080.
 
     Connector secrets (app keys, API keys) are not settings: each connector client takes its own as constructor
     arguments, so ``ENV_FILE`` must not hold them.
@@ -450,6 +452,7 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING"] = "INFO"
     polars_threads: int = Field(default=2, ge=1)  # Polars' thread-pool size; fixed apart from the container's CPU limit
     raw_retention: timedelta = Field(default=timedelta(hours=60), gt=timedelta(0))  # PIPELINE_RAW_RETENTION, e.g. PT60H
+    health_port: int = Field(default=8080, ge=1, le=65535)  # PIPELINE_HEALTH_PORT; where /health listens
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Refuse a subclass whose ``model_config`` changes ``env_prefix``, ``case_sensitive`` or ``env_file_encoding``.

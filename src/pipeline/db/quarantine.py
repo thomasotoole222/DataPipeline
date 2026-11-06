@@ -3,7 +3,7 @@
 Public API:
     Failure: One validation rule a held row failed.
     HeldRow: One record held back by validation, as stored in ``quarantine.row``.
-    hold: Copy held rows into ``quarantine.row`` inside the caller's open transaction.
+    hold: Replace the open rows earlier tasks held for the same keys, then copy held rows into ``quarantine.row``.
 """
 
 from collections.abc import Sequence
@@ -97,6 +97,15 @@ class HeldRow:
             raise ValueError("a held row needs at least one failure")
 
 
+#: ``DELETE`` statement ``_replace`` runs: removes the open rows for each ``(connector, job, source_id, group_key)``
+#: given as four parallel arrays. A NULL ``group_key`` never equals anything, and only ``status = 'open'`` rows match.
+_REPLACE: Final = (
+    "DELETE FROM quarantine.row AS q "
+    "USING unnest(%s::text[], %s::text[], %s::uuid[], %s::text[]) AS k (connector, job, source_id, group_key) "
+    "WHERE q.status = 'open' AND q.connector = k.connector AND q.job = k.job AND q.source_id = k.source_id "
+    "AND q.group_key = k.group_key"
+)
+
 #: ``COPY`` statement ``hold`` streams rows through, one per ``HeldRow``, its columns in ``HeldRow`` field order.
 _COPY: Final = (
     "COPY quarantine.row (task_id, connector, job, source_id, partition_key, raw_page_no, raw_index, group_key, "
@@ -104,36 +113,76 @@ _COPY: Final = (
 )
 
 
+async def _replace(conn: Connection, rows: Sequence[HeldRow]) -> int:
+    """Delete the open rows already in ``quarantine.row`` for the keys of ``rows`` that have a ``group_key``.
+
+    Collects the distinct ``(connector, job, source_id, group_key)`` of the rows whose ``group_key`` is not ``None``
+    and, when there is at least one, runs ``_REPLACE`` with them as four parallel arrays. Only rows with
+    ``status = 'open'`` are deleted; replayed, released and discarded rows are never touched, and rows with a NULL
+    ``group_key`` never match. No ``task_id`` is compared: it runs before ``hold``'s copy, so every row it can see was
+    committed by an earlier Load. Does not commit and does not check the transaction status; ``hold`` does.
+
+    Preconditions:
+        ``conn`` is inside a transaction, and the caller has not yet copied ``rows``. No other coroutine is using
+        ``conn`` for the duration of the call.
+
+    Args:
+        conn: The connection to delete through, already inside a transaction.
+        rows: The rows about to be held; only their keys are read.
+
+    Returns:
+        The number of rows deleted, as the server reports it. ``0`` without a statement when no row in ``rows`` has
+        a ``group_key``.
+
+    Raises:
+        psycopg.Error: Any database error from the ``DELETE``, unchanged; ``hold`` runs it inside ``db_errors``.
+
+    """
+    keys = sorted({(row.connector, row.job, row.source_id, row.group_key) for row in rows if row.group_key is not None})
+    if not keys:
+        return 0
+    connectors, jobs, sources, groups = (list(column) for column in zip(*keys, strict=True))
+    async with conn.cursor() as cursor:
+        await cursor.execute(_REPLACE, (connectors, jobs, sources, groups))
+        return cursor.rowcount
+
+
 async def hold(conn: Connection, rows: Sequence[HeldRow]) -> int:
-    """Copy held rows into ``quarantine.row`` inside the caller's open transaction.
+    """Replace the open rows earlier tasks held for the same keys, then copy held rows into ``quarantine.row``.
 
     Checks the connection's transaction status first, so the check applies even when ``rows`` is empty. For a
-    non-empty ``rows``, opens a cursor and a ``COPY`` using ``_COPY`` and writes one record per row, with
-    ``payload`` and ``failures`` wrapped as ``Jsonb`` (each failure converted with ``asdict``). Does not commit;
-    the rows become visible only when the caller's transaction commits. The cursor and copy run inside
-    ``db_errors``, so connection and conflict errors are translated and every other error propagates unchanged.
-    ``HeldRow.__post_init__`` guarantees each row has at least one failure and non-negative positions, matching the
-    table's ``CHECK`` constraints.
+    non-empty ``rows``, first runs ``_replace``: every open row already in the table for a
+    ``(connector, job, source_id, group_key)`` of ``rows`` (``group_key`` not ``None``) is deleted, so the current
+    rule set's result replaces the one an earlier task held. Rows replayed, released or discarded are never touched,
+    and a row with a ``None`` ``group_key`` is appended without replacing anything, as before. Then opens a cursor and
+    a ``COPY`` using ``_COPY`` and writes one record per row, with ``payload`` and ``failures`` wrapped as ``Jsonb``
+    (each failure converted with ``asdict``). Every row of ``rows`` is written, so copies sharing a key within one
+    call (one task's Load) all survive. The delete and the copy run in the caller's transaction and inside
+    ``db_errors``, so connection and conflict errors are translated and every other error propagates unchanged. Does
+    not commit; the deletes and rows become visible only when the caller's transaction commits, and both roll back
+    with it. ``HeldRow.__post_init__`` guarantees each row has at least one failure and non-negative positions,
+    matching the table's ``CHECK`` constraints.
 
     Preconditions:
         ``conn`` is inside a transaction (``pq.TransactionStatus.INTRANS``). Every ``payload`` is serialisable by
-        ``Jsonb``. No other coroutine is using ``conn`` for the duration of the call.
+        ``Jsonb``. No other coroutine is using ``conn`` for the duration of the call. ``hold`` is called at most
+        once per task's Load transaction; a second call in one task would replace the first call's rows.
 
     Args:
-        conn: The connection to copy through, already inside a transaction.
+        conn: The connection to delete and copy through, already inside a transaction.
         rows: The rows to copy, in the order they are written.
 
     Returns:
-        ``len(rows)``: the number of rows passed to the copy, not a count reported by the server. Returns ``0``
-        without opening a cursor when ``rows`` is empty.
+        ``len(rows)``: the number of rows passed to the copy, not a count reported by the server, and not counting
+        the rows replaced. Returns ``0`` without opening a cursor when ``rows`` is empty.
 
     Raises:
         RuntimeError: If ``conn.info.transaction_status`` is anything other than ``pq.TransactionStatus.INTRANS``
             (idle, in error, or busy), including when ``rows`` is empty.
         TypeError: If a ``payload`` value cannot be serialised to JSON; ``db_errors`` passes it through unchanged.
-        DatabaseConflict: From ``db_errors``, on a serialization failure or deadlock during the cursor or copy.
-        DatabaseUnavailable: From ``db_errors``, on a lost or refused connection during the cursor or copy.
-        psycopg.Error: Any other database error during the cursor or copy, unchanged, for example a value outside
+        DatabaseConflict: From ``db_errors``, on a serialization failure or deadlock during the delete or copy.
+        DatabaseUnavailable: From ``db_errors``, on a lost or refused connection during the delete or copy.
+        psycopg.Error: Any other database error during the delete or copy, unchanged, for example a value outside
             the ``integer`` range of ``raw_page_no`` or ``raw_index``.
 
     """
@@ -142,6 +191,7 @@ async def hold(conn: Connection, rows: Sequence[HeldRow]) -> int:
     if not rows:
         return 0
     with db_errors():
+        await _replace(conn, rows)
         async with conn.cursor() as cursor, cursor.copy(_COPY) as copy:
             for row in rows:
                 await copy.write_row(

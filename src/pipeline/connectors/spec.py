@@ -15,6 +15,7 @@ Public API:
 """
 
 import copy
+import json
 import string
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -74,7 +75,7 @@ class IdPlace(StrEnum):
 
     Attributes:
         PATH: A field of the path template, such as ``{product_id}``; one id per call.
-        QUERY: A query string parameter; one id per call.
+        QUERY: A query string parameter: one id per call, or a batch of ids encoded as ``IdParam.encoding`` says.
         BODY: A top-level key of the JSON body, holding a list of up to ``IdParam.batch`` ids.
 
     """
@@ -89,27 +90,45 @@ class IdParam:
     """Say where an endpoint called once per id, or once per batch of ids, takes its ids.
 
     Frozen, slotted and keyword-only. Construction guarantees that ``place`` is an ``IdPlace``, ``name`` is not empty,
-    ``batch`` is an ``int`` of 1 or more and more than 1 only in the body, and ``inject`` is ``None`` or a non-empty
-    name, set only with one id per call. Whether ``name`` suits the endpoint's path, method and other parameters is
-    checked by ``EndpointSpec``; writing ``inject`` into records is done outside this page.
+    ``batch`` is an ``int`` of 1 or more, more than 1 only in the body or in the query with an ``encoding``,
+    ``encoding`` is set only for a query id, ``wrap`` is a valid key path set only with the ``"json"`` encoding,
+    ``inject`` is ``None`` or a non-empty name, set only with one id per call, and ``id_at`` is ``None`` or a valid key
+    path. Whether ``name`` suits the endpoint's path, method and other parameters is checked by ``EndpointSpec``;
+    writing ``inject`` into records and reading ``id_at`` from them are done outside this page.
+
+    A query id's value is the one id when ``encoding`` is ``None``; with ``"csv"`` the call's ids joined by commas
+    (``live_ids=1,2``); with ``"json"`` a compact JSON array of them as strings (``video_ids=["1","2"]``), nested in
+    one object per ``wrap`` key, outermost first, so ``name="filtering"`` with ``wrap=("campaign_ids",)`` sends
+    ``filtering={"campaign_ids":["1","2"]}``.
 
     Attributes:
         place (IdPlace): Where the ids go.
         name (str): The path field, query parameter or top-level body key the ids go in.
-        batch (int): The most ids one call is for: a body key takes a list of 1 to ``batch`` ids; a path field or
-            query parameter takes one id, so ``batch`` is 1 there. Defaults to 1.
+        batch (int): The most ids one call is for: a body key takes a list of 1 to ``batch`` ids, and so does a query
+            parameter with an ``encoding``; a path field, or a query parameter without one, takes one id, so ``batch``
+            is 1 there. Defaults to 1.
+        encoding (Literal["csv", "json"] | None): How a query parameter holds its ids: ``"csv"``, comma-joined, or
+            ``"json"``, a JSON array; ``None`` for one id as it is, and for a path or body id. Defaults to ``None``.
+        wrap (KeyPath | None): With the ``"json"`` encoding, the keys of the objects the array is nested in,
+            outermost first; ``None`` sends the bare array. Defaults to ``None``.
         inject (str | None): A top-level field each returned record gets the call's id written into (over any value
             already there), for records that do not carry it; ``None`` writes nothing. Defaults to ``None``.
+        id_at (KeyPath | None): Where each returned record holds the id it is for. When set, an id of a successful
+            call that no returned record carries there is held as ``detail_failed`` (``stages.validate``); ``None``
+            reads no id, and an id left out of a successful call is not noticed. Defaults to ``None``.
 
     """
 
     place: IdPlace
     name: str  # e.g. "product_id" for /product/202309/products/{product_id}
-    batch: int = 1  # ids per call; more than 1 only in the body
+    batch: int = 1  # ids per call; more than 1 only in the body, or in the query with an encoding
     inject: str | None = None  # the record field the id is written into; one id per call only
+    encoding: Literal["csv", "json"] | None = None  # how a query parameter holds its ids; None: one id as it is
+    wrap: KeyPath | None = None  # json only: the object keys the array is nested in, e.g. ("campaign_ids",)
+    id_at: KeyPath | None = None  # where each returned record holds its id, e.g. ("id",); None: not read
 
     def __post_init__(self) -> None:
-        """Reject an empty name, a batch below 1 or outside the body, and an injected field with a batch.
+        """Reject an empty name, a bad batch, encoding, wrap or id_at, and an injected field with a batch.
 
         Preconditions:
             None.
@@ -119,9 +138,11 @@ class IdParam:
 
         Raises:
             ValueError: When ``place`` is not an ``IdPlace``; ``name`` is empty; ``batch`` is not an ``int`` (a
-                ``bool`` included) of 1 or more; ``batch`` is more than 1 for a path field or query parameter; or
-                ``inject`` is ``""``, or set with ``batch`` more than 1, where a record cannot tell which id it is
-                for.
+                ``bool`` included) of 1 or more; ``encoding`` is set outside the query, or is neither ``"csv"`` nor
+                ``"json"``; ``batch`` is more than 1 for a path field or a query parameter without an ``encoding``;
+                ``wrap`` is set without the ``"json"`` encoding, or (from ``check_key_path``) is empty or has an empty
+                key; ``inject`` is ``""``, or set with ``batch`` more than 1, where a record cannot tell which id it
+                is for; or ``id_at`` (from ``check_key_path``) is empty or has an empty key.
 
         """
         if not isinstance(self.place, IdPlace):
@@ -130,10 +151,18 @@ class IdParam:
             raise ValueError("an id parameter needs a name")
         if not isinstance(self.batch, int) or isinstance(self.batch, bool) or self.batch < 1:
             raise ValueError(f"an id batch must be an int of 1 or more: {self.batch!r}")
-        if self.batch > 1 and self.place is not IdPlace.BODY:
+        if self.encoding is not None and (self.place is not IdPlace.QUERY or self.encoding not in ("csv", "json")):
+            raise ValueError(f"only a query id takes an encoding, csv or json: {self.place}, {self.encoding!r}")
+        if self.batch > 1 and self.place is not IdPlace.BODY and self.encoding is None:
             raise ValueError(f"a {self.place} id is one per call, so batch must be 1, not {self.batch}")
+        if self.wrap is not None:
+            if self.encoding != "json":
+                raise ValueError(f"only json-encoded ids are wrapped in an object, not {self.encoding!r} ones")
+            check_key_path(self.wrap)
         if self.inject is not None and (not self.inject or self.batch > 1):
             raise ValueError(f"an injected id field needs a name and one id per call: {self.inject!r}, {self.batch}")
+        if self.id_at is not None:
+            check_key_path(self.id_at)
 
 
 def value_at(body: Mapping[str, Any], path: KeyPath) -> Any:
@@ -470,8 +499,8 @@ class EndpointSpec:
         id_param (IdParam | None): Where the endpoint takes the ids of a fanned-out call, when it is called once per
             id or per batch of ids; ``None`` for an endpoint called without ids. Defaults to ``None``.
         one_record (bool): Whether ``records_at`` holds one record object instead of a list of records, as an
-            endpoint that gets one item by id returns it; nothing or ``null`` there is no record. Defaults to
-            ``False``.
+            endpoint that gets one item by id returns it; nothing, ``null`` or an empty object (``{}``) there is no
+            record. Defaults to ``False``.
 
     """
 
@@ -488,7 +517,7 @@ class EndpointSpec:
     total_at: KeyPath | None = None  # where the connector reports the whole frame's row total; None: not reported
     source_scoped: bool = True  # False: an account-wide endpoint, sent without a source identifier
     id_param: IdParam | None = None  # set: called once per id (or batch of ids) of a fanned-out job
-    one_record: bool = False  # True: records_at holds one record object, or nothing for no record
+    one_record: bool = False  # True: records_at holds one record object, or nothing, null or {} for no record
 
     @property
     def endpoint(self) -> str:
@@ -619,11 +648,11 @@ class EndpointSpec:
         """Return the first request of a fanned-out call for some ids, with the ids where ``id_param`` puts them.
 
         A path id is percent-encoded and checked as ``request`` does a path parameter; a query id is added with
-        ``with_query``; body ids are set as a list at the body key with ``with_body_at``. ``_check_ids`` guarantees the
-        path template's only field is a path id's name, and that a query or body id clashes with no fixed or paging
-        parameter and a body id is never in a GET, so neither builder can refuse the id. Only a path id is checked for
-        being empty: a query id of ``""`` is sent as ``name=`` and body ids of ``""`` are sent as they are. The ids are
-        not checked for duplicates.
+        ``with_query``, encoded by ``_query_ids``; body ids are set as a list at the body key with ``with_body_at``.
+        ``_check_ids`` guarantees the path template's only field is a path id's name, and that a query or body id
+        clashes with no fixed or paging parameter and a body id is never in a GET, so neither builder can refuse the id.
+        Only a path id is checked for being empty: a query id of ``""`` is sent as ``name=`` and body ids of ``""`` are
+        sent as they are. The ids are not checked for duplicates.
 
         Nor is a bare ``str`` refused, though it is a ``Sequence[str]``: ``request_for("12")`` on a body id would send
         ``["1", "2"]`` (todo.txt 19).
@@ -642,7 +671,8 @@ class EndpointSpec:
                 ``id_param.batch`` ids: errors of the caller, not of an id.
             IdRefused: Naming the spec and field but not the id, for a path id that ``request`` refuses: empty,
                 ``"."`` or ``".."``, or holding a lone surrogate. ``_check_ids`` leaves the value as the only thing
-                ``request`` can refuse there; its ``ValueError`` is not chained.
+                ``request`` can refuse there; its ``ValueError`` is not chained. Also from ``_query_ids``, for a
+                comma-joined id that holds a comma.
             Exception: Whatever ``copy.deepcopy`` raises, from ``with_body_at``, for a fixed body that cannot be
                 deep-copied.
 
@@ -658,8 +688,44 @@ class EndpointSpec:
             except ValueError as err:  # the template's only field is the id's, so only its value can be refused
                 raise IdRefused(str(err)) from None
         if where.place is IdPlace.QUERY:
-            return self.request().with_query({where.name: ids[0]})
+            return self.request().with_query({where.name: self._query_ids(where, ids)})
         return self.request().with_body_at((where.name,), list(ids))
+
+    def _query_ids(self, where: IdParam, ids: Sequence[str]) -> str:
+        """Return a query id parameter's value for a call's ids, encoded as ``where.encoding`` says.
+
+        Preconditions:
+            ``where`` is this spec's query ``id_param`` and ``ids`` holds 1 to ``where.batch`` ids (``request_for``
+            checks the count), so without an encoding there is one.
+
+        Args:
+            where: The query id parameter.
+            ids: The call's ids.
+
+        Returns:
+            The one id with no encoding; the ids joined by ``","`` for ``"csv"``; for ``"json"``, the compact JSON
+            (no spaces, non-ASCII kept) of the ids as a list of strings, nested in one object per ``wrap`` key,
+            outermost first.
+
+        Raises:
+            IdRefused: Naming the spec and field but not the id, for a ``"csv"`` id that holds a comma, which would be
+                read as two ids.
+
+        """
+        match where.encoding:
+            case None:
+                return ids[0]
+            case "csv":
+                if any("," in one for one in ids):
+                    raise IdRefused(
+                        f"{self.name}: an id for {where.name!r} holds a comma, so it cannot be comma-joined"
+                    )
+                return ",".join(ids)
+            case "json":
+                value: Any = list(ids)
+                for key in reversed(where.wrap or ()):
+                    value = {key: value}
+                return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
     def request(self, path_params: Mapping[str, str] = _NO_PATH_PARAMS) -> ConnectorRequest:
         """Return the first request for this endpoint, with path parameters substituted.
@@ -701,7 +767,7 @@ class EndpointSpec:
         """Return the records list from a response body.
 
         The list returned is the body's own object, not a copy. For a ``one_record`` endpoint it is a new list of the
-        one record object at ``records_at``, or an empty one when nothing or ``null`` is there.
+        one record object at ``records_at``, or an empty one when nothing, ``null`` or an empty object is there.
 
         Preconditions:
             None.
@@ -710,7 +776,7 @@ class EndpointSpec:
             body: A decoded response body.
 
         Returns:
-            The list at ``records_at``; for a ``one_record`` endpoint, ``[record]`` or ``[]``.
+            The list at ``records_at``; for a ``one_record`` endpoint, ``[record]``, or ``[]`` for no record.
 
         Raises:
             ClientErrorUnhandled: From ``unhandled`` when nothing is at ``records_at`` or the value there is not a list,
@@ -723,7 +789,7 @@ class EndpointSpec:
                 one = value_at(body, self.records_at)
             except KeyError:
                 return []  # an item endpoint leaves out an item it does not return
-            if one is None:
+            if one is None or (isinstance(one, Mapping) and not one):  # an empty object is no record either
                 return []
             if not isinstance(one, Mapping):
                 raise self.unhandled(f"record at {'.'.join(self.records_at)} is a {type(one).__name__}, not an object")
@@ -741,7 +807,7 @@ class EndpointSpec:
 
         On the last page, nothing at ``records_at`` (missing as ``value_at`` defines it) or a ``None`` value there
         counts as 0. Any other value that is not a list still raises, even on the last page. For a ``one_record``
-        endpoint the count is 1 for an object and 0 for nothing or ``null``, on any page.
+        endpoint the count is 1 for an object and 0 for nothing, ``null`` or an empty object, on any page.
 
         Preconditions:
             None.
@@ -752,7 +818,7 @@ class EndpointSpec:
 
         Returns:
             The length of the records list, or 0 on a last page with nothing or ``null`` at ``records_at``; for a
-            ``one_record`` endpoint, 1 or 0.
+            ``one_record`` endpoint, 1 or 0 (no record).
 
         Raises:
             ClientErrorUnhandled: From ``records`` when the records are missing or ``null`` on a page that is not the

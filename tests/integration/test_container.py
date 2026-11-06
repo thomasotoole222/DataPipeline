@@ -6,7 +6,7 @@ replaced under each product-day, and the rating is a one-to-one ``Upsert`` keyed
 
 import dataclasses
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta
 from typing import Annotated, Any, ClassVar
@@ -18,8 +18,8 @@ from opentelemetry.sdk.metrics import MeterProvider
 from psycopg_pool import AsyncConnectionPool
 from pydantic import Field
 
-from pipeline.checks.checks import Validation
-from pipeline.checks.record import Int32, Part, Record
+from pipeline.checks.checks import Lookup, Severity, Validation
+from pipeline.checks.record import DateKey, Int32, Part, Record, TaskDay
 from pipeline.checks.targets import ReplaceChildren, Rows, To, Upsert
 from pipeline.connectors.paging import NoPaging
 from pipeline.connectors.spec import EndpointSpec
@@ -34,6 +34,7 @@ from pipeline.telemetry import Instruments
 
 DSN = os.environ.get("TEST_PIPELINE_DSN", "postgresql://postgres@localhost:5432/pipeline_test")
 SOURCE = UUID("00000000-0000-0000-0000-000000000004")
+OTHER_SOURCE = UUID("00000000-0000-0000-0000-000000000005")
 LONDON = ZoneInfo("Europe/London")
 DAY = date(2026, 11, 4)
 KEYS = frozenset({"data"})
@@ -74,6 +75,100 @@ class ProductDay(Record, container=True):
 
 
 VALIDATION = Validation(model=ProductDay)
+
+
+class TaskProductDay(Record, container=True):
+    """One product's day of performance, dated by the task's day: the response carries no date."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("product", "day")
+    record_version: ClassVar[int] = 1
+
+    product: Annotated[str, To("tiktok_product_id")]
+    day: Annotated[Int32, TaskDay(), To("date_key")]
+    sales: Annotated[list[Sales], Rows()] = Field(default_factory=list)
+
+
+TASK_DAY = Validation(model=TaskProductDay)
+
+
+class ReportProductDay(Record, container=True):
+    """One product's day of performance from a report, dated by its ISO ``stat_time_day``."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("product", "stat_time_day")
+    record_version: ClassVar[int] = 1
+
+    product: Annotated[str, To("tiktok_product_id")]
+    stat_time_day: Annotated[DateKey, To("date_key")]
+    sales: Annotated[list[Sales], Rows()] = Field(default_factory=list)
+
+
+REPORT = Validation(model=ReportProductDay)
+
+#: The traffic source of each named block of a product-day response.
+BLOCKS = {"total": 1, "live": 2}
+
+
+def blocks_to_sales(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Build a product-day from named blocks: ``id`` as the product, one sales row per block, the TaskDay kept.
+
+    Raises ``KeyError`` for a record with no ``blocks``, and reads ``day`` only as the TaskDay filled it.
+    """
+    sales = [{"source_key": BLOCKS[name], "gmv": block["gmv"]} for name, block in record["blocks"].items()]
+    return {"product": record["id"], "day": record["day"], "sales": sales}
+
+
+class ShapedProductDay(Record, container=True):
+    """One product's day of performance, its sales rows built from the response's named blocks."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("product", "day")
+    record_version: ClassVar[int] = 2
+    reshape = blocks_to_sales
+
+    product: Annotated[str, To("tiktok_product_id")]
+    day: Annotated[Int32, TaskDay(), To("date_key")]
+    sales: Annotated[list[Sales], Rows()] = Field(default_factory=list)
+
+
+SHAPED = Validation(model=ShapedProductDay)
+
+#: A sales row whose traffic source is not in t_box.source is dropped; the product-day loads its other rows.
+KNOWN_SOURCES = Validation(
+    model=ProductDay,
+    checks=(
+        Lookup[Sales](
+            "known_source",
+            lambda row: [str(row.source_key)],
+            table="t_box.source",
+            column="source_key",
+            severity=Severity.DROP,
+            rows="sales",
+        ),
+    ),
+)
+
+#: A product-day waits until its product is known for the task's own source; one known for another source is not.
+OWN_PRODUCTS = Validation(
+    model=ProductDay,
+    checks=(
+        Lookup[ProductDay](
+            "own_product",
+            lambda record: [record.product],
+            table="t_box.product",
+            column="tiktok_product_id",
+            until="products",
+            source_column="source_id",
+        ),
+    ),
+)
+#: The same lookup across the whole table, without ``source_column``.
+ANY_PRODUCTS = Validation(
+    model=ProductDay,
+    checks=(
+        Lookup[ProductDay](
+            "any_product", lambda record: [record.product], table="t_box.product", column="tiktok_product_id", until="p"
+        ),
+    ),
+)
 
 
 @pytest.fixture
@@ -147,13 +242,22 @@ def interval(product: str, sales: dict[int, int], stars: int | None = None) -> d
     }
 
 
-async def run(pool: Pool, instruments: Instruments, intervals: list[dict[str, Any]]) -> Loaded:
-    """Land ``intervals`` as one page of a new task, then validate, transform and load."""
+async def run(
+    pool: Pool,
+    instruments: Instruments,
+    intervals: list[dict[str, Any]],
+    validation: Validation[Any] = VALIDATION,
+    partition_key: str | None = None,
+) -> Loaded:
+    """Land ``intervals`` as one page of a new task, then validate, transform and load.
+
+    The task's partition key is ``partition_key``, or a fresh uuid when it is None, so tasks never share one.
+    """
     async with pool.connection() as c:
         await c.execute(
             "INSERT INTO control.task (run_id, connector, job, source_id, partition_key) "
-            "VALUES (7, 'tiktok_shop', 'product_days', %s, gen_random_uuid()::text)",
-            (SOURCE,),
+            "VALUES (7, 'tiktok_shop', 'product_days', %s, coalesce(%s, gen_random_uuid()::text))",
+            (SOURCE, partition_key),
         )
         claimed = await claim(c, "test-worker")
     assert claimed is not None
@@ -171,10 +275,10 @@ async def run(pool: Pool, instruments: Instruments, intervals: list[dict[str, An
     )
     async with pool.connection() as c:
         await raw.save_page(c, page, KEYS)
-    validated = await validate(pool, task, SPEC, None, VALIDATION, instruments)
-    transformed = transform(ProductDay, validated.accepted, task.source_id)
+    validated = await validate(pool, task, SPEC, None, validation, instruments)
+    transformed = transform(validation.model, validated.accepted, task.source_id)
     return await load(
-        pool, task, FakeFence(task), validated, transformed, None, instruments, policy=VALIDATION.policy, zone=LONDON
+        pool, task, FakeFence(task), validated, transformed, None, instruments, policy=validation.policy, zone=LONDON
     )
 
 
@@ -221,3 +325,103 @@ async def test_an_empty_batch_is_valid(pool: Pool, instruments: Instruments) -> 
     loaded = await run(pool, instruments, [])
     assert loaded.changed == dict.fromkeys(TABLES, 0)
     assert await rows(pool, "t_box.sales") == [("p1", 1, 100)]
+
+
+async def test_a_task_day_key_is_filled_from_the_partition_over_any_value_landed(
+    pool: Pool, instruments: Instruments
+) -> None:
+    """Check a TaskDay key field gets the task's day as YYYYMMDD, whether the record left it out or carried another."""
+    intervals = [{"product": "p1", "sales": [{"source_key": 1, "gmv": 5}]}, {**interval("p2", {1: 7}), "day": 1}]
+    loaded = await run(pool, instruments, intervals, TASK_DAY, "2026-11-03")
+    assert loaded.sent == {"t_box.sales": 2}
+    async with pool.connection() as c:
+        cursor = await c.execute("SELECT tiktok_product_id, date_key, gmv FROM t_box.sales ORDER BY 1")
+        assert await cursor.fetchall() == [("p1", 20261103, 5), ("p2", 20261103, 7)]
+
+
+async def test_an_iso_date_key_loads_as_yyyymmdd_and_a_day_that_does_not_exist_is_held(
+    pool: Pool, instruments: Instruments
+) -> None:
+    """Check a DateKey key field loads "2026-11-04" as 20261104, and a record dated 2026-02-30 is held, not loaded."""
+    days: list[dict[str, Any]] = [
+        {"product": "p1", "stat_time_day": "2026-11-04", "sales": [{"source_key": 1, "gmv": 5}]},
+        {"product": "p2", "stat_time_day": "2026-02-30", "sales": [{"source_key": 1, "gmv": 7}]},
+        {"product": "p3", "stat_time_day": 20261105, "sales": [{"source_key": 2, "gmv": 9}]},
+    ]
+    loaded = await run(pool, instruments, days, REPORT)
+    assert loaded.held == 1
+    async with pool.connection() as c:
+        cursor = await c.execute("SELECT tiktok_product_id, date_key, gmv FROM t_box.sales ORDER BY 1")
+        assert await cursor.fetchall() == [("p1", 20261104, 5), ("p3", 20261105, 9)]
+
+
+async def test_a_reshape_builds_child_rows_from_named_blocks_after_the_task_day_is_filled(
+    pool: Pool, instruments: Instruments
+) -> None:
+    """Check reshape runs on the record with its TaskDay filled, and a record it fails on is held as reshape_failed.
+
+    The held row keeps the record as landed, not as reshaped, and has no group key.
+    """
+    records = [{"id": "p1", "blocks": {"total": {"gmv": 10}, "live": {"gmv": 3}}}, {"id": "p2", "no_blocks": {}}]
+    loaded = await run(pool, instruments, records, SHAPED, "2026-11-03")
+    assert loaded.held == 1
+    async with pool.connection() as c:
+        cursor = await c.execute("SELECT tiktok_product_id, date_key, source_key, gmv FROM t_box.sales ORDER BY 3")
+        assert await cursor.fetchall() == [("p1", 20261103, 1, 10), ("p1", 20261103, 2, 3)]
+        cursor = await c.execute("SELECT group_key, payload, failures FROM quarantine.row")
+        assert await cursor.fetchall() == [
+            (
+                None,
+                {"id": "p2", "no_blocks": {}, "day": 20261103},
+                [{"rule": "reshape_failed", "version": 2, "message": "KeyError: 'blocks'", "until": None}],
+            )
+        ]
+
+
+async def test_a_drop_lookup_removes_only_the_child_rows_it_does_not_find(pool: Pool, instruments: Instruments) -> None:
+    """Check a child row whose source is unknown is dropped, its record's other rows load, and nothing is held.
+
+    The product-day already had a row for the unknown source, which the replace then deletes: Transform saw only the
+    kept rows.
+    """
+    async with pool.connection() as c:
+        await c.execute("CREATE TABLE t_box.source (source_key bigint PRIMARY KEY)")
+        await c.execute("INSERT INTO t_box.source VALUES (1), (2)")
+    await run(pool, instruments, [interval("p1", {1: 100, 9: 50})])  # loaded with no checks: 9 is in
+    loaded = await run(pool, instruments, [interval("p1", {1: 100, 9: 50}), interval("p2", {2: 7})], KNOWN_SOURCES)
+    assert loaded.held == 0
+    assert loaded.sent == {"t_box.sales": 2, "t_box.rating": 0}
+    assert await rows(pool, "t_box.sales") == [("p1", 1, 100), ("p2", 2, 7)]
+
+
+async def test_a_source_scoped_lookup_waits_for_a_value_known_only_for_another_source(
+    pool: Pool, instruments: Instruments
+) -> None:
+    """Check a lookup with source_column finds a product only in the task's source's rows, and holds the other.
+
+    p1 is known only for another source, p2 for the task's own. The same lookup across the whole table finds both.
+    """
+    async with pool.connection() as c:
+        await c.execute("CREATE TABLE t_box.product (source_id uuid NOT NULL, tiktok_product_id text NOT NULL)")
+        await c.execute("INSERT INTO t_box.product VALUES (%s, 'p1'), (%s, 'p2')", (OTHER_SOURCE, SOURCE))
+    intervals = [interval("p1", {1: 100}), interval("p2", {1: 7})]
+    loaded = await run(pool, instruments, intervals, OWN_PRODUCTS)
+    assert loaded.held == 1
+    assert await rows(pool, "t_box.sales") == [("p2", 1, 7)]
+    async with pool.connection() as c:
+        cursor = await c.execute("SELECT group_key, failures FROM quarantine.row")
+        assert await cursor.fetchall() == [
+            (
+                '["p1","20261104"]',
+                [
+                    {
+                        "rule": "own_product",
+                        "version": 1,
+                        "message": "not in t_box.product.tiktok_product_id for this source_id: p1",
+                        "until": "products",
+                    }
+                ],
+            )
+        ]
+    loaded = await run(pool, instruments, intervals, ANY_PRODUCTS)
+    assert loaded.held == 0

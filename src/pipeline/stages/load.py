@@ -96,31 +96,36 @@ async def load(
     written.
 
     Everything up to the writes runs on one pooled connection inside one transaction that ``fence.fenced`` opens and
-    fences on the task's lease: ``quarantine.hold`` of the held rows, then ``_columns_checked`` for each target, then
-    a check that no top-level ``Snapshot`` or ``Update(missing="zero")`` frame is empty when pruning, then ``_write``
-    for each pair in ``transformed.frames`` order (parents before their children, at every depth). After a written
-    target, its children's ``parents`` entry is the target's staged table. A container (a target with no table) is
-    staged with ``copy_in`` but written nowhere, has no ``sent``, ``changed`` or ``stale`` entry and is not compared
-    with the catalog; its staged keys are its children's ``parents`` entry, so they are scoped to the container
-    records loaded, and its children are written and pruned as any child is. ``prune`` is true only when nothing was
-    held; ``_write`` passes it to top-level ``Snapshot``, ``Versioned`` and ``Update`` writers. When records were held,
-    a ``ReplacePartition`` target is skipped, not written at all (no ``sent`` or ``changed`` entry), since replacing
-    the partition would delete the held records' earlier rows. Children are pruned whether or not records are held,
-    and an empty child frame is valid: a held record's rows are taken out of every frame, its parent row included, and
+    fences on the task's lease: ``quarantine.hold`` of the held rows (replacing the open rows earlier tasks held for the
+    same group keys), then ``_columns_checked`` for each target, then a check that no top-level ``Snapshot`` (with its
+    own ``prune`` set and ``allow_empty`` not) or ``Update(missing="zero")`` frame is empty when pruning, then
+    ``_write`` for each pair in ``transformed.frames`` order (parents before their children, at every depth). After a
+    written target, its children's ``parents`` entry is their scope: the target's staged table and the child's inherited
+    columns; but a ``ReplaceChildren`` child of a ``ReplaceChildren`` child gets its parent's scope (``_scope``), so it
+    is replaced under its top ``ReplaceChildren`` ancestor's staged parents, and a row under a parent row the replace
+    removed is removed too. A container (a target with no table) is staged with ``copy_in`` but written nowhere, has no
+    ``sent``, ``changed`` or ``stale`` entry and is not compared with the catalog; its staged keys are its children's
+    ``parents`` entry, so they are scoped to the container records loaded, and its children are written and pruned as
+    any child is. ``prune`` is true only when nothing was held; ``_write`` passes it to top-level ``Snapshot``,
+    ``Versioned`` and ``Update`` writers, a ``Snapshot`` or ``Versioned`` one only when its writer's own ``prune`` is
+    set (with ``prune=False`` it is never pruned, and its empty frame is not refused). When records were held, a
+    ``ReplacePartition`` target is skipped, not written at all (no ``sent`` or ``changed`` entry), since replacing the
+    partition would delete the held records' earlier rows. Children are pruned whether or not records are held, and an
+    empty child frame is valid: a held record's rows are taken out of every frame, its parent row included, and
     ``sql.replace_children`` and a ``Versioned`` child's ``sql.versioned`` delete or close only under parents in the
-    staged parent table. An ``Upsert`` child never prunes. Once every write is done, the ``Loaded`` result is built
-    and passed to ``on_loaded`` while the transaction is still open, so a success report written in the same
-    transaction can count it. Any error rolls the whole transaction back. A ``Versioned`` target's observation day
-    (its children's too) is ``task.claimed_at``'s date in ``zone``, computed before the transaction opens. The
-    metrics run only after commit: for each written table, ``sent`` is added to ``instruments.rows`` with
-    ``stage="written"`` and ``changed`` with ``stage="changed"``; for each written table whose ``Versioned`` writer
-    left stale keys alone (keys with a version a later day's task wrote), their count is added with ``stage="stale"``
-    and a warning gives it; for each skipped table, its frame height is added with ``stage="skipped"`` and a warning
-    says it was not written because records are held.
-    When records were held, every top-level ``Snapshot`` and ``Update(missing="zero")`` target is left unpruned (a
-    ``Versioned`` one included, as a ``Snapshot``; children are never counted here, as they are pruned): for each,
-    ``held`` is added with ``stage="prune_skipped"`` and a warning is logged. The records held here are added with
-    ``stage="quarantined"``, and a warning per rule gives their count, never their keys.
+    staged parent table. An ``Upsert`` child never prunes. Once every write is done, the ``Loaded`` result is built and
+    passed to ``on_loaded`` while the transaction is still open, so a success report written in the same transaction can
+    count it. Any error rolls the whole transaction back. A ``Versioned`` target's observation day (its children's too)
+    is ``task.claimed_at``'s date in ``zone``, computed before the transaction opens. The metrics run only after commit:
+    for each written table, ``sent`` is added to ``instruments.rows`` with ``stage="written"`` and ``changed`` with
+    ``stage="changed"``; for each written table whose ``Versioned`` writer left stale keys alone (keys with a version a
+    later day's task wrote), their count is added with ``stage="stale"`` and a warning gives it; for each skipped table,
+    its frame height is added with ``stage="skipped"`` and a warning says it was not written because records are held.
+    When records were held, every top-level ``Snapshot`` whose writer sets ``prune`` and every
+    ``Update(missing="zero")`` target is left unpruned (a ``Versioned`` one included, as a ``Snapshot``; children are
+    never counted here, as they are pruned): for each, ``held`` is added with ``stage="prune_skipped"`` and a warning is
+    logged. The records held here are added with ``stage="quarantined"``, and a warning per rule gives their count,
+    never their keys.
 
     Preconditions:
         ``frame`` is not ``None`` when a target uses ``ReplacePartition``. A ``ReplacePartition`` target has no
@@ -154,8 +159,8 @@ async def load(
         TableMismatch: From ``_columns_checked``, when a target not yet in ``_checked`` does not match its table; a
             target cached earlier in this process is not compared again, so a table altered since fails as a
             ``psycopg.Error`` from the writes instead.
-        NothingLoaded: When pruning and a top-level ``Snapshot`` or ``Update(missing="zero")`` target's frame has no
-            rows; never for a child.
+        NothingLoaded: When pruning and a top-level ``Snapshot`` whose writer sets ``prune`` but not
+            ``allow_empty``, or an ``Update(missing="zero")`` target, has a frame with no rows; never for a child.
         ValueError: From ``_write``, for a ``ReplacePartition`` target with no usable frame or with a row outside the
             frame's bounds, or for a ``Versioned`` target when ``zone`` is ``None``; raised inside the transaction, so
             the hold and any earlier writes roll back.
@@ -194,7 +199,7 @@ async def load(
         and target.table is not None
         and not target.inherited
         and (
-            isinstance(target.writer, Snapshot)
+            (isinstance(target.writer, Snapshot) and target.writer.prune)
             or (isinstance(target.writer, Update) and target.writer.missing == "zero")
         )
     ]
@@ -208,12 +213,14 @@ async def load(
         for target, data in frames:
             if target.inherited:  # a child: an empty frame is valid, and its prune is scoped to its staged parents
                 continue
-            if isinstance(target.writer, Snapshot) and data.height == 0 and prune:  # held records skip the prune
+            writer = target.writer
+            pruning = isinstance(writer, Snapshot) and writer.prune and not writer.allow_empty and prune
+            if pruning and data.height == 0:  # held records skip the prune, so they skip the refusal too
                 raise NothingLoaded(f"{target.table}: a snapshot with no rows would remove every row of the source")
             zeroing = isinstance(target.writer, Update) and target.writer.missing == "zero"
             if zeroing and data.height == 0 and prune:
                 raise NothingLoaded(f"{target.table}: an update with no rows would zero every row of the source")
-        parents: dict[Target, str] = {}  # a child target's parent's staged table
+        parents: dict[Target, tuple[tuple[str, ...], str]] = {}  # a child's scope: columns and a staged table
         for target, data in frames:
             if target.table in skipped:
                 continue
@@ -223,7 +230,7 @@ async def load(
                 staged, changed[target.table], stale[target.table] = await _write(
                     conn, task.source_id, target, data, parents, frame, prune, observed
                 )
-            parents.update((child, staged) for _, child in target.children)
+            parents.update((child, _scope(target, child, staged, parents)) for _, child in target.children)
         loaded = Loaded(sent=sent, changed=changed, held=held)
         if on_loaded is not None:
             on_loaded(loaded)
@@ -247,6 +254,40 @@ async def load(
     for rule, count in sorted(Counter(failure.rule for failure in rejected.values()).items()):
         _log.warning("task %s %s: %d quarantined by %s at load", task.id, task.job, count, rule)
     return loaded
+
+
+def _scope(
+    parent: Target, child: Target, staged: str, scopes: Mapping[Target, tuple[tuple[str, ...], str]]
+) -> tuple[tuple[str, ...], str]:
+    """Return the scope a child target is replaced or pruned under: the parent columns to match and their staged table.
+
+    A child is scoped to its parent's staged rows through its inherited columns. A ``ReplaceChildren`` child of a
+    ``ReplaceChildren`` child is scoped as its parent is instead, so it is replaced under its top ``ReplaceChildren``
+    ancestor's staged parents: its inherited columns begin with that ancestor's (each inherits its parent's row key,
+    which is the parent's inherited columns then its own key), so a row whose parent row is no longer staged (the
+    parent's replace removed it) is matched by the scope and, with no staged row of its own, removed. A ``Versioned``
+    or ``Upsert`` child, and any child of one, is scoped to its own parent's staged rows: no cascade.
+
+    Preconditions:
+        ``parent`` was written or staged as ``staged``, and, when it is a ``ReplaceChildren`` child, ``scopes`` holds
+        its scope (``load`` writes parents before their children).
+
+    Args:
+        parent: The parent target.
+        child: One of its children.
+        staged: The parent's staged table.
+        scopes: The scope of each child target written so far.
+
+    Returns:
+        ``(columns, table)``: the parent-key columns to match by name, and the unqualified staged table listing them.
+
+    Raises:
+        KeyError: When ``parent`` is a ``ReplaceChildren`` child missing from ``scopes``, breaking the precondition.
+
+    """
+    if isinstance(child.writer, ReplaceChildren) and isinstance(parent.writer, ReplaceChildren):
+        return scopes[parent]
+    return child.inherited, staged
 
 
 def _key_violations(transformed: Transformed) -> dict[int, str]:
@@ -313,7 +354,7 @@ async def _write(
     source_id: UUID,
     target: Target,
     data: pl.DataFrame,
-    parents: Mapping[Target, str],
+    parents: Mapping[Target, tuple[tuple[str, ...], str]],
     frame: TimeFrame | None,
     prune: bool,
     observed: date | None = None,
@@ -327,9 +368,9 @@ async def _write(
     child may differ from its writer's ``key``. ``Versioned`` is matched before ``Snapshot``, its base. Its
     ``valid_from`` column is not a target column, so its type is read live from the catalog with ``table_info`` on
     every call (one extra query); ``observed`` and the day before it are passed to ``sql.versioned`` in that type
-    (``_day_value``). A top-level ``Versioned`` target is pruned only with ``prune``, across its source's rows (the
-    whole table when it has no source column); a child (a target with inherited columns) is always pruned, scoped to
-    its parent's staged table through its inherited columns. When the
+    (``_day_value``). A top-level ``Snapshot`` or ``Versioned`` target is pruned only with ``prune`` and its writer's
+    own ``prune``, across its source's rows (the whole table when it has no source column); a child (a target with
+    inherited columns) is always pruned, scoped to its parent's staged table through its inherited columns. When the
     table or the column is missing from the catalog, the type falls back to ``"date"``; that is reachable only for a
     table altered after ``_columns_checked`` cached its target, and the ``sql`` writer then fails. For
     ``ReplacePartition``, a ``date`` column is bounded by ``frame.dates`` and a timestamptz column by ``frame.start``
@@ -340,7 +381,8 @@ async def _write(
     Preconditions:
         ``conn`` is inside a transaction (``copy_in`` checks this). ``target`` has a table: it is not a container. For
         a child target (``ReplaceChildren``, or ``Versioned`` with inherited columns), ``parents`` has ``target``
-        (``load`` ensures this when the parent, a container included, is in the frames before the child). For
+        (``load`` ensures this when the parent, a container included, is in the frames before the child), with the
+        scope ``_scope`` gives it. For
         ``ReplacePartition``, the partition column has no nulls (``_check_writer`` makes it non-nullable and
         ``frame_of`` refuses ``None`` in a non-nullable column). For ``Versioned``, ``valid_from`` is ``integer``,
         ``bigint`` or ``date`` (``mismatches``, run by ``_columns_checked`` before the writes).
@@ -350,9 +392,11 @@ async def _write(
         source_id: The task's source.
         target: The target whose table is written.
         data: The target's frame, columns in ``target.columns`` order.
-        parents: Staged table of each child target's parent, keyed by the child target.
+        parents: Each child target's scope, keyed by the child target: the parent-key columns to match and the
+            staged table listing them (``_scope``).
         frame: The task's time frame, or ``None``; read only for ``ReplacePartition``.
-        prune: Passed to ``sql.snapshot``, ``sql.update`` and, for a top-level target, ``sql.versioned``.
+        prune: Passed to ``sql.update``, and to ``sql.snapshot`` and, for a top-level target, ``sql.versioned``
+            together with the writer's own ``prune``.
         observed: The task's observation day in the job's zone, required for a ``Versioned`` target; ``None``, the
             default, otherwise.
 
@@ -401,18 +445,19 @@ async def _write(
         case Upsert():
             changed = await sql.upsert(conn, table, staged, columns, key)
         case ReplaceChildren():
-            changed = await sql.replace_children(conn, table, staged, columns, target.inherited, key, parents[target])
+            scope, listed = parents[target]
+            changed = await sql.replace_children(conn, table, staged, columns, scope, key, listed)
         case ReplacePartition(column=column) if bounds is not None:  # bounds is always set for ReplacePartition
             changed = await sql.replace_partition(
                 conn, table, staged, columns, target.source_column, source, column, *bounds
             )
-        case Versioned(valid_from=first, valid_to=last, opens_from=opens):
+        case Versioned(valid_from=first, valid_to=last, opens_from=opens, prune=pruned):
             if observed is None:
                 raise ValueError(f"{table}: a Versioned target needs the job's zone to date its observation day")
             info = await table_info(conn, table)
             day_type = info.columns[first].type if info is not None and first in info.columns else "date"
             day, previous = _day_value(observed, day_type), _day_value(observed - timedelta(days=1), day_type)
-            under = parents[target] if target.inherited else None  # a child prunes only under its staged parents
+            under = parents[target][1] if target.inherited else None  # a child prunes only under its staged parents
             changed, stale = await sql.versioned(
                 conn,
                 table,
@@ -426,13 +471,15 @@ async def _write(
                 opens,
                 day,
                 previous,
-                prune or under is not None,
+                (prune and pruned) or under is not None,
                 target.inherited,
                 under,
             )
             return staged, changed, stale
-        case Snapshot():
-            changed = await sql.snapshot(conn, table, staged, columns, key, target.source_column, source, prune)
+        case Snapshot(prune=pruned):
+            changed = await sql.snapshot(
+                conn, table, staged, columns, key, target.source_column, source, prune and pruned
+            )
         case Update(missing=missing):
             changed = await sql.update(conn, table, staged, columns, key, target.source_column, source, missing, prune)
     return staged, changed, 0

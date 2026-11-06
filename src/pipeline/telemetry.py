@@ -109,8 +109,9 @@ class Instruments:
             job's list records), ``fanout_fetched`` (the records of a fanned-out job's per-id or
             per-batch calls) or ``fanout_failed`` (the ids, not records, of its calls that failed
             with a holdable error and landed a marker page) (extract); ``waiting``,
-            ``quarantined``, ``warned``, ``deduplicated`` or ``key_unreadable`` (a failed record
-            whose key could not be read) (validate); ``written``, ``changed``, ``skipped`` (rows
+            ``quarantined``, ``warned``, ``deduplicated``, ``key_unreadable`` (a failed record
+            whose key could not be read) or ``dropped`` (an accepted record's child rows a
+            ``Severity.DROP`` lookup removed) (validate); ``written``, ``changed``, ``skipped`` (rows
             of a ``ReplacePartition`` table not written because records are held) or
             ``prune_skipped`` (the number of held records, added once for each table left
             unpruned), plus a ``table`` attribute (load).

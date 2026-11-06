@@ -295,10 +295,15 @@ def test_versioned_is_a_snapshot_with_the_snapshot_key_rules() -> None:
         ("Versioned(('source_id', 'sku'), valid_from='d', valid_to='e', opens_from='name')",
          "name: Annotated[str, To('name')]", "opens_from must be a target column"),
         ("Versioned(('sku',), valid_from='d', valid_to='e')", "", "must include the source column 'source_id'"),
+        ("Versioned(('source_id', 'sku'), valid_from='d', valid_to='e', prune=False, allow_empty=True)", "",
+         "allow_empty lets an empty frame prune every row, so it needs prune"),
     ],
 )  # fmt: skip
 def test_versioned_declarations_refused(writer: str, field: str, message: str) -> None:
-    """Check a Versioned writer refuses equal day columns, a field loading into one, a bad opens_from, no source."""
+    """Check a Versioned writer refuses equal day columns, a field loading into one, a bad opens_from, no source.
+
+    It also refuses allow_empty without prune, which would have no effect.
+    """
     code = (
         f"class Bad(Record, table='cipher.bad', writer={writer}):\n"
         "    record_key: ClassVar[tuple[str, ...]] = ('id',)\n"
@@ -309,6 +314,29 @@ def test_versioned_declarations_refused(writer: str, field: str, message: str) -
     names = {"Annotated": Annotated, "ClassVar": ClassVar, "Record": Record, "To": To, "Versioned": Versioned}
     with pytest.raises(ValueError, match=message):
         exec(code, names)  # noqa: S102
+
+
+def test_a_top_level_snapshot_or_versioned_may_turn_its_prune_off() -> None:
+    """Check prune defaults to on, and a top-level Snapshot or Versioned target keeps prune=False on its writer."""
+
+    class Window(
+        Record, table="cipher.window", writer=Versioned(("source_id", "kit"), valid_from="f", valid_to="t", prune=False)
+    ):
+        record_key: ClassVar[tuple[str, ...]] = ("id",)
+        record_version: ClassVar[int] = 1
+
+        id: Annotated[str, To("kit")]
+
+    class Stock(Record, table="cipher.stock", writer=Snapshot(("source_id", "sku"), prune=False)):
+        record_key: ClassVar[tuple[str, ...]] = ("sku",)
+        record_version: ClassVar[int] = 1
+
+        sku: Annotated[str, To("sku")]
+
+    assert Snapshot(("sku",)).prune
+    assert not Snapshot(("sku",)).allow_empty
+    assert target_of(Window).writer == Versioned(("source_id", "kit"), valid_from="f", valid_to="t", prune=False)
+    assert target_of(Stock).writer == Snapshot(("source_id", "sku"), prune=False)
 
 
 def test_versioned_accepts_rows_children() -> None:
@@ -559,6 +587,53 @@ def test_an_upsert_child_may_be_one_to_one_with_no_key() -> None:
     assert row_key(address) == ("customer_id",)
 
 
+def test_an_upsert_child_key_may_name_an_inherited_column() -> None:
+    """Check an Upsert list child keyed by its parent's id and its own is keyed by both, the inherited one first."""
+
+    class Line(Part, table="sales.request_line", writer=Upsert(("request_id", "line_id"))):
+        line_id: Annotated[str, To("line_id")]
+        refund: Annotated[Decimal, Field(max_digits=12, decimal_places=2), To("refund")]
+
+    class Request(Record, table="sales.request", writer=Upsert(("source_id", "request_id"))):
+        record_key: ClassVar[tuple[str, ...]] = ("request_id",)
+        record_version: ClassVar[int] = 1
+
+        request_id: Annotated[str, To("request_id")]
+        lines: Annotated[list[Line], Rows()]
+
+    line = dict(target_of(Request).children)["lines"]
+    assert [c.name for c in line.columns] == ["request_id", "line_id", "refund"]
+    assert line.inherited == ("request_id",)
+    assert row_key(line) == ("request_id", "line_id")
+
+
+def test_an_upsert_child_key_naming_a_column_it_does_not_inherit_is_refused() -> None:
+    """Check an Upsert child's key column that is neither its own nor inherited is refused when the parent adopts it."""
+
+    class Line(Part, table="sales.request_line", writer=Upsert(("order_id", "line_id"))):
+        line_id: Annotated[str, To("line_id")]
+
+    with pytest.raises(ValueError, match="names 'order_id', which the child neither has nor inherits"):
+
+        class Request(Record, table="sales.request", writer=Upsert(("source_id", "request_id"))):
+            record_key: ClassVar[tuple[str, ...]] = ("request_id",)
+            record_version: ClassVar[int] = 1
+
+            request_id: Annotated[str, To("request_id")]
+            lines: Annotated[list[Line], Rows()]
+
+
+def test_a_record_key_naming_a_column_it_does_not_have_is_refused() -> None:
+    """Check only a Part's Upsert key may name a column it does not have: a Record's is refused at once."""
+    with pytest.raises(ValueError, match="names 'order_id', which is not a target column"):
+
+        class Request(Record, table="sales.request", writer=Upsert(("source_id", "order_id", "request_id"))):
+            record_key: ClassVar[tuple[str, ...]] = ("request_id",)
+            record_version: ClassVar[int] = 1
+
+            request_id: Annotated[str, To("request_id")]
+
+
 @pytest.mark.parametrize(
     ("child", "field", "message"),
     [
@@ -574,6 +649,10 @@ def test_an_upsert_child_may_be_one_to_one_with_no_key() -> None:
          "Annotated[list[C], Rows()]", "a list's items need a key of their own"),
         ("class C(Part, table='t.c', writer=Versioned((), valid_from='f', valid_to='t')):\n"
          "    k: Annotated[str, To('k')]", "Annotated[list[C], Rows()]", "a list's items need a key of their own"),
+        ("class C(Part, table='t.c', writer=Versioned(('k',), valid_from='f', valid_to='t', prune=False)):\n"
+         "    k: Annotated[str, To('k')]", "Annotated[list[C], Rows()]", "so it cannot set prune=False"),
+        ("class C(Part, table='t.c', writer=Versioned(('k',), valid_from='f', valid_to='t', allow_empty=True)):\n"
+         "    k: Annotated[str, To('k')]", "Annotated[list[C], Rows()]", "so it does not set allow_empty"),
         ("class C(Part):\n    k: Annotated[str, To('k')]", "Annotated[C, Rows()]",
          "Rows needs SomePart or SomePart \\| None, where SomePart declares a table"),
         ("class C(Part, table='t.c', writer=Upsert(('k',))):\n    k: Annotated[str, To('k')]",
@@ -587,7 +666,9 @@ def test_an_upsert_child_may_be_one_to_one_with_no_key() -> None:
     ],
     ids=[
         "snapshot child", "update child", "replace partition child", "child with a source column",
-        "list of keyless upserts", "list of keyless versions", "part without a table", "nullable list",
+        "list of keyless upserts", "list of keyless versions", "child with prune off", "child allowing empty",
+        "part without a table",
+        "nullable list",
         "rows on a scalar", "inherited name clashes", "table clash",
     ],
 )  # fmt: skip

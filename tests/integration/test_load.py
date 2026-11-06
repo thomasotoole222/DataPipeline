@@ -89,6 +89,32 @@ class Order(Record, table="t_load.order", writer=Upsert(("source_id", "order_id"
 VALIDATION = Validation(model=Order)
 
 
+class PromotionSku(Part, table="t_load.promo_sku", writer=ReplaceChildren(key=("sku_id",))):
+    """A SKU of a product in a promotion, replaced under its product."""
+
+    id: Annotated[str, To("sku_id")]
+
+
+class PromotionProduct(Part, table="t_load.promo_product", writer=ReplaceChildren(key=("product_id",))):
+    """A product in a promotion, replaced under its promotion, with its SKUs replaced under it."""
+
+    id: Annotated[str, To("product_id")]
+    skus: Annotated[list[PromotionSku], Rows()] = Field(default_factory=list)
+
+
+class Promotion(Record, table="t_load.promotion", writer=Upsert(("source_id", "promotion_id"))):
+    """A promotion and its products' SKUs, two levels of ReplaceChildren."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("id",)
+    record_version: ClassVar[int] = 1
+
+    id: Annotated[str, To("promotion_id")]
+    products: Annotated[list[PromotionProduct], Rows()] = Field(default_factory=list)
+
+
+PROMOTIONS = Validation(model=Promotion)
+
+
 @pytest.fixture
 async def pool() -> AsyncIterator[Pool]:
     """Yield an open pool on empty control, raw and quarantine tables and fresh test tables."""
@@ -106,6 +132,18 @@ async def pool() -> AsyncIterator[Pool]:
         await c.execute(
             "CREATE TABLE t_load.line (source_id uuid NOT NULL, order_id text NOT NULL, line_id text NOT NULL, "
             "amount numeric(6,2) NOT NULL, PRIMARY KEY (source_id, order_id, line_id))"
+        )
+        await c.execute(
+            "CREATE TABLE t_load.promotion (source_id uuid NOT NULL, promotion_id text NOT NULL, "
+            "PRIMARY KEY (source_id, promotion_id))"
+        )
+        await c.execute(
+            "CREATE TABLE t_load.promo_product (source_id uuid NOT NULL, promotion_id text NOT NULL, "
+            "product_id text NOT NULL, PRIMARY KEY (source_id, promotion_id, product_id))"
+        )
+        await c.execute(
+            "CREATE TABLE t_load.promo_sku (source_id uuid NOT NULL, promotion_id text NOT NULL, "
+            "product_id text NOT NULL, sku_id text NOT NULL, PRIMARY KEY (source_id, promotion_id, product_id, sku_id))"
         )
     try:
         yield p
@@ -167,8 +205,10 @@ async def claimed(pool: Pool) -> ClaimedTask:
     return task
 
 
-async def run(pool: Pool, instruments: Instruments, orders: list[dict[str, Any]]) -> Loaded:
-    """Land ``orders`` as one page of a new task, then validate, transform and load them."""
+async def run(
+    pool: Pool, instruments: Instruments, orders: list[dict[str, Any]], validation: Validation[Any] = VALIDATION
+) -> Loaded:
+    """Land ``orders`` as one page of a new task, then validate, transform and load them with ``validation``."""
     task = await claimed(pool)
     body = {"code": 0, "request_id": f"r{task.id}", "data": {"orders": orders, "next_page_token": ""}}
     page = RawPage(
@@ -183,9 +223,9 @@ async def run(pool: Pool, instruments: Instruments, orders: list[dict[str, Any]]
     )
     async with pool.connection() as c:
         await raw.save_page(c, page, KEYS)
-    validated = await validate(pool, task, SPEC, FRAME, VALIDATION, instruments)
-    transformed = transform(Order, validated.accepted, task.source_id)
-    return await load(pool, task, FakeFence(task), validated, transformed, FRAME, instruments, policy=VALIDATION.policy)
+    validated = await validate(pool, task, SPEC, FRAME, validation, instruments)
+    transformed = transform(validation.model, validated.accepted, task.source_id)
+    return await load(pool, task, FakeFence(task), validated, transformed, FRAME, instruments, policy=validation.policy)
 
 
 async def rows(pool: Pool, query: str) -> list[tuple[Any, ...]]:
@@ -317,3 +357,31 @@ async def test_a_failure_after_extract_carries_the_rows_fetched(pool: Pool, inst
     with pytest.raises(TableMismatch) as info:
         await job(task, FakeLease(task, pool))
     assert getattr(info.value, "rows_fetched", None) == 2
+
+
+def promotion(promotion_id: str, products: dict[str, list[str]]) -> dict[str, Any]:
+    """Build a promotion payload: each product with its SKU ids."""
+    return {
+        "id": promotion_id,
+        "products": [{"id": p, "skus": [{"id": s} for s in skus]} for p, skus in products.items()],
+    }
+
+
+async def test_a_product_dropped_from_a_promotion_takes_its_skus_with_it(pool: Pool, instruments: Instruments) -> None:
+    """Check a ReplaceChildren grandchild under a parent row its replace removed is removed too, and only there.
+
+    Promotion P drops product B (and A's SKU a2); B's SKU b1 is deleted with it. Promotion Q is not staged, so its
+    products and SKUs are left.
+    """
+    await run(pool, instruments, [promotion("P", {"A": ["a1", "a2"], "B": ["b1"]}), promotion("Q", {"C": ["c1"]})],
+              PROMOTIONS)  # fmt: skip
+    loaded = await run(pool, instruments, [promotion("P", {"A": ["a1"]})], PROMOTIONS)
+    assert loaded.changed == {"t_load.promotion": 0, "t_load.promo_product": 1, "t_load.promo_sku": 2}
+    assert await rows(pool, "SELECT promotion_id, product_id FROM t_load.promo_product ORDER BY 1, 2") == [
+        ("P", "A"),
+        ("Q", "C"),
+    ]
+    assert await rows(pool, "SELECT promotion_id, product_id, sku_id FROM t_load.promo_sku ORDER BY 1, 2, 3") == [
+        ("P", "A", "a1"),
+        ("Q", "C", "c1"),
+    ]

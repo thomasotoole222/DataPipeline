@@ -74,8 +74,12 @@ async def replace_children(
     Preconditions:
         ``table`` is ``"schema.name"``. ``inherited`` is non-empty and names the parent-key columns of ``table``, and
         ``parents`` has a column of each of those names (Load passes the parent's staged table, and ``build_target``
-        makes the child's inherited columns the parent's writer key, which the parent's columns include). ``key`` is
-        ``inherited`` followed by the child's own key columns and is exactly the columns of a unique index or
+        makes the child's inherited columns the parent's writer key, which the parent's columns include). For a
+        ``ReplaceChildren`` grandchild of a ``ReplaceChildren`` child, Load passes instead its top ``ReplaceChildren``
+        ancestor's inherited columns and staged parents, a prefix of the grandchild's own inherited columns, so its
+        rows under a parent row that ancestor's replace removed are deleted too; a foreign key from it to that parent
+        row must then be deferrable or cascade, since the parent row is deleted first. ``key`` is the child's
+        inherited columns followed by its own key columns and is exactly the columns of a unique index or
         constraint on the table (``row_key``; ``load`` checks the table with ``mismatches``). ``staged`` has every name
         in ``columns``, no two rows with the same ``key`` (else Postgres raises ``CardinalityViolation``), and each
         staged row belongs to a parent in ``parents`` (rows of any other parent are upserted beside the existing ones).
@@ -85,7 +89,7 @@ async def replace_children(
         table: Target table as ``"schema.name"``.
         staged: Unqualified name of the staged table.
         columns: Columns copied from the stage to the table.
-        inherited: Parent-key columns, matched by name in ``table`` and ``parents``.
+        inherited: Parent-key columns, matched by name in ``table`` and ``parents``: the scope of the delete.
         key: Row-key columns: the conflict columns, also used to find the rows missing from the stage.
         parents: Unqualified name of the table listing the parents to replace.
 
@@ -272,8 +276,9 @@ async def versioned(
         (Load holds key violations first). ``day`` and ``previous`` match ``valid_from``'s type, and ``opens_from``,
         when set, is in ``columns`` and of that type (``checks.targets`` checks the table with ``mismatches``). With
         ``prune`` and no ``parents``, ``staged`` is not empty (Load raises ``NothingLoaded`` first, as ``Versioned`` is
-        a ``Snapshot``); with ``parents``, ``staged`` may be empty, so every open version under a listed parent is
-        closed or dropped. With ``parents``, ``inherited`` is non-empty and names columns of ``table`` and of
+        a ``Snapshot``) unless the writer sets ``allow_empty``, when every open version of the source is closed or
+        dropped; with ``parents``, ``staged`` may be empty, so every open version under a listed parent is closed or
+        dropped. With ``parents``, ``inherited`` is non-empty and names columns of ``table`` and of
         ``parents``. A staged row need not belong to a parent in ``parents``: it is still versioned by steps 2, 3 and
         5, but the keys missing under its parent are not pruned.
 

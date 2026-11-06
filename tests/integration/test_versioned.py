@@ -68,6 +68,50 @@ class Product(
 VALIDATION = Validation(model=Product)
 
 
+class WindowProduct(
+    Record,
+    table="t_ver.product",
+    writer=Versioned(
+        ("source_id", "product_id"),
+        valid_from="valid_from_key",
+        valid_to="valid_to_key",
+        opens_from="created_date_key",
+        prune=False,
+    ),
+):
+    """The product fetched by an update window: only the ids changed in it are returned, so none is closed."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("id",)
+    record_version: ClassVar[int] = 1
+
+    id: Annotated[str, To("product_id")]
+    title: Annotated[str, To("title")]
+    status: Annotated[Int16 | None, To("status")] = None
+    created: Annotated[Int32 | None, To("created_date_key")] = None
+
+
+WINDOW = Validation(model=WindowProduct)
+
+
+class StockedProduct(
+    Record,
+    table="t_ver.product",
+    writer=Versioned(
+        ("source_id", "product_id"), valid_from="valid_from_key", valid_to="valid_to_key", allow_empty=True
+    ),
+):
+    """A product listed only while it exists, as TikTok omits goods with no stock: an empty response is a valid day."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("id",)
+    record_version: ClassVar[int] = 1
+
+    id: Annotated[str, To("product_id")]
+    title: Annotated[str, To("title")]
+
+
+STOCKED = Validation(model=StockedProduct)
+
+
 @pytest.fixture
 async def pool() -> AsyncIterator[Pool]:
     """Yield an open pool on empty control, raw and quarantine tables and a fresh versioned table."""
@@ -133,7 +177,13 @@ def product(product_id: str, title: str | None, created: int | None = None) -> d
     return {"id": product_id, "title": title, "created": created}
 
 
-async def run(pool: Pool, instruments: Instruments, day: date, products: list[dict[str, Any]]) -> Loaded:
+async def run(
+    pool: Pool,
+    instruments: Instruments,
+    day: date,
+    products: list[dict[str, Any]],
+    validation: Validation[Any] = VALIDATION,
+) -> Loaded:
     """Land ``products`` as one page of a new task observed on ``day`` in London, then validate, transform and load."""
     async with pool.connection() as c:
         await c.execute(
@@ -158,10 +208,10 @@ async def run(pool: Pool, instruments: Instruments, day: date, products: list[di
     )
     async with pool.connection() as c:
         await raw.save_page(c, page, KEYS)
-    validated = await validate(pool, task, SPEC, None, VALIDATION, instruments)
-    transformed = transform(Product, validated.accepted, task.source_id)
+    validated = await validate(pool, task, SPEC, None, validation, instruments)
+    transformed = transform(validation.model, validated.accepted, task.source_id)
     return await load(
-        pool, task, FakeFence(task), validated, transformed, None, instruments, policy=VALIDATION.policy, zone=LONDON
+        pool, task, FakeFence(task), validated, transformed, None, instruments, policy=validation.policy, zone=LONDON
     )
 
 
@@ -289,6 +339,36 @@ async def test_an_empty_response_is_refused_when_pruning(pool: Pool, instruments
     with pytest.raises(NothingLoaded):
         await run(pool, instruments, date(2026, 11, 5), [])
     assert await versions(pool) == [("p1", "Lash", 20260301, None, True)]
+
+
+async def test_with_prune_off_a_missing_id_keeps_its_open_version(pool: Pool, instruments: Instruments) -> None:
+    """Check prune=False closes no id missing from an update window, while a changed id is still versioned."""
+    await run(pool, instruments, date(2026, 11, 4), [product("p1", "Lash"), product("p2", "Brow")], WINDOW)
+    await run(pool, instruments, date(2026, 11, 6), [product("p2", "Brow Pro")], WINDOW)
+    assert await versions(pool) == [
+        ("p1", "Lash", 20261104, None, True),
+        ("p2", "Brow", 20261104, 20261105, False),
+        ("p2", "Brow Pro", 20261106, None, True),
+    ]
+
+
+async def test_with_prune_off_an_empty_window_is_valid(pool: Pool, instruments: Instruments) -> None:
+    """Check prune=False takes an empty frame, a day with no updates, without NothingLoaded, and changes nothing."""
+    await run(pool, instruments, date(2026, 11, 4), [product("p1", "Lash")], WINDOW)
+    loaded = await run(pool, instruments, date(2026, 11, 5), [], WINDOW)
+    assert loaded.changed == {"t_ver.product": 0}
+    assert await versions(pool) == [("p1", "Lash", 20261104, None, True)]
+
+
+async def test_an_allowed_empty_response_closes_every_id(pool: Pool, instruments: Instruments) -> None:
+    """Check allow_empty takes an empty frame as a day on which nothing exists: every open version is closed."""
+    await run(pool, instruments, date(2026, 11, 4), [product("p1", "Lash"), product("p2", "Brow")], STOCKED)
+    loaded = await run(pool, instruments, date(2026, 11, 6), [], STOCKED)
+    assert loaded.changed == {"t_ver.product": 2}
+    assert await versions(pool) == [
+        ("p1", "Lash", 20261104, 20261105, False),
+        ("p2", "Brow", 20261104, 20261105, False),
+    ]
 
 
 async def test_versioned_returns_the_stale_count_and_handles_date_columns(pool: Pool) -> None:

@@ -19,7 +19,7 @@ from uuid import UUID
 from pipeline.connectors.client import ConnectorClient
 from pipeline.connectors.spec import EndpointSpec
 from pipeline.connectors.windows import Window
-from pipeline.errors import RowLimitReached
+from pipeline.errors import NoRecord, RowLimitReached
 from pipeline.timeutil import TimeFrame, ensure_utc, utc_now
 
 #: The version stored under ``"v"`` in every fetch cursor. ``_Position.decode`` rejects any cursor whose ``"v"``
@@ -474,6 +474,13 @@ async def fetch_pages[C](
     The first request is ``spec.request(path_params)``, or ``spec.request_for(ids)`` for a fanned-out call, which a
     spec with an ``id_param`` needs and any other refuses. Every page of the call carries the same ids.
 
+    A sub-frame's first request that ``client.send`` answers with ``NoRecord`` (an ``ErrorRule`` with the outcome
+    ``NO_RECORD``) means the sub-frame has no record: when a later sub-frame follows, the request is no page, as a
+    split request is not, and the fetch moves on to it; otherwise the fetch ends with an empty last page (payload
+    ``{}``, no records, ``cursor_next`` of ``None``, ``fetched_at`` from ``clock``), so a call with no record still
+    lands a page and Validate reads no record from it. On any later request ``NoRecord`` propagates, since landing an
+    empty page there would end the sub-frame early.
+
     Preconditions:
         ``resume_from``, when given, is a ``cursor_in`` or ``cursor_next`` from a fetch with the same ``spec``,
         ``window``, ``frame``, ``source_id``, ``path_params`` and ``ids``. Only the frame's edges are checked, and only
@@ -507,6 +514,7 @@ async def fetch_pages[C](
         TypeError: From ``Window.apply`` or ``_split_up_front`` when a whole-day window or split meets a zone that is
             not a ``tzinfo``.
         RowLimitReached: From ``_split_up_front`` or ``_following`` when the endpoint's row limit is reached.
+        NoRecord: From ``client.send``, on a request that is not a sub-frame's first.
         IdRefused: From ``EndpointSpec.request_for``, before anything is sent, for an id it cannot place.
         ClientErrorUnhandled: From ``EndpointSpec.total``, ``EndpointSpec.record_count`` or
             ``Paginator.next_cursor`` for a body they cannot read; or from ``EndpointSpec.unhandled`` when the
@@ -530,7 +538,16 @@ async def fetch_pages[C](
             sent.add(at.paging)
         sub = at.sub_frame(frame)
         request = base if win is None or sub is None else win.apply(base, sub)
-        body = await client.send(spec.paginator.apply(request, at.paging), source_id)
+        try:
+            body = await client.send(spec.paginator.apply(request, at.paging), source_id)
+        except NoRecord:
+            if at.paging is not None:  # past a sub-frame's first page, an empty page would cut the sub-frame short
+                raise
+            if len(at.bounds) > 2:  # a later sub-frame follows: this request is no page, like a split request
+                at = _Position(at.page_no, None, 0, at.bounds[1:])
+                continue
+            yield Page(at.page_no, cursor_in, None, clock(), {}, 0)
+            return
         fetched_at = clock()
         halved = _split_up_front(spec, win, frame, at, body)
         if halved is not None:

@@ -40,6 +40,7 @@ Private units:
 
 """
 
+import dataclasses
 import math
 import re
 from collections.abc import Iterator, Sequence
@@ -164,8 +165,11 @@ class Upsert:
 
     ``__post_init__`` is not defined, so ``key`` is not validated here; ``_check_writer`` checks it when the target is
     built. As a child's writer, ``key`` names the child's own columns, and the parent's columns it inherits are plain
-    columns outside it; a one-to-one child may leave ``key`` empty, and is then keyed by its inherited columns
-    (``row_key``). An ``Upsert`` child never deletes: a row its parent no longer lists stays as it is.
+    columns outside it unless ``key`` names them too: a child keyed by its parent's id and its own
+    (``("request_id", "line_item_id")``, with ``request_id`` inherited) names both, and its table's unique key is that
+    pair. An inherited column in ``key`` is checked when the parent adopts the child (``_adopt``), as the child's own
+    class cannot know what it will inherit. A one-to-one child may leave ``key`` empty, and is then keyed by its
+    inherited columns (``row_key``). An ``Upsert`` child never deletes: a row its parent no longer lists stays as it is.
 
     Attributes:
         key: Target column names: distinct, not nullable, and including the source column when the table has one;
@@ -218,15 +222,30 @@ class Snapshot:
     """Writer keyed by ``key`` that sets ``removed_at`` itself.
 
     ``__post_init__`` is not defined, so nothing is validated here; ``_check_writer`` checks ``key`` and that no field
-    loads into ``removed_at`` when the target is built.
+    loads into ``removed_at`` when the target is built, and ``_child`` refuses ``prune=False`` on a ``Versioned`` child.
+
+    A top-level target is pruned only when ``prune`` is true: a load that holds no record then marks the source's rows
+    missing from its frame removed. With ``prune=False`` it is never pruned, so a target fed by an update window (only
+    the rows changed in the window are fetched) keeps the rows the window leaves out, and an empty frame is not
+    refused, since it removes nothing. A pruned target's empty frame is refused (``NothingLoaded``), since it would
+    remove every row of the source, unless ``allow_empty`` is true: the connector then leaves out what does not exist
+    (TikTok omits goods with no stock), so an empty frame is a valid day on which nothing exists, and the prune runs
+    and removes every row of the source. ``_check_writer`` refuses ``allow_empty`` without ``prune``, which would have
+    no effect, and ``_child`` refuses it on a ``Versioned`` child, whose empty frame is always valid.
 
     Attributes:
         key: Target column names: non-empty, distinct, not nullable, and including the source column when the table has
             one.
+        prune: Keyword-only. Whether a top-level target's rows missing from its frame are pruned; only ``True``, the
+            default, for a child, which is pruned under its staged parents.
+        allow_empty: Keyword-only. Whether a top-level target's empty frame is valid and prunes every row of the
+            source; ``False`` by default, and always for a child. Needs ``prune``.
 
     """
 
     key: tuple[str, ...]  # target columns, the source column included when the table has one
+    prune: bool = dataclasses.field(default=True, kw_only=True)  # False: a top-level target is never pruned
+    allow_empty: bool = dataclasses.field(default=False, kw_only=True)  # True: an empty frame prunes every row
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,20 +282,26 @@ class Versioned(Snapshot):
     is closed on D - 1, or deleted when it started on D (the day's last observation wins). Nothing else is deleted.
 
     As a ``Snapshot`` subclass it shares ``Snapshot``'s rules wherever they test for ``Snapshot``: ``key`` is checked
-    as a writer key (distinct, not nullable, the source column included), and for a top-level target no missing id is
-    closed while records are held, and an empty frame is refused when pruning. ``_check_writer`` and ``mismatches``
-    give it checks of its own in place of ``Snapshot``'s ``removed_at`` ones.
+    as a writer key (distinct, not nullable, the source column included), and for a top-level target ``prune``
+    decides whether missing ids are closed at all, no missing id is closed while records are held, and an empty frame
+    is refused when pruning unless ``allow_empty`` is set, when it closes every open version of the source.
+    ``_check_writer`` and ``mismatches`` give it checks of its own in place of ``Snapshot``'s ``removed_at`` ones.
 
     As a child's writer, the id is the child's row key (``row_key``): its own ``key``, or, for a one-to-one child that
     leaves ``key`` empty, the columns it inherits from its parent, which are otherwise plain columns. A child is always
     pruned, but only under its parents staged in the same load: an open version whose inherited columns match a staged
     parent and whose id is not staged is closed on D - 1, or deleted when it started on D, even while records are held
     (a held record's parent is not staged). An empty child frame is valid. Closing a parent closes none of its
-    children.
+    children. A child keeps ``prune`` and ``allow_empty`` at their defaults (``_child`` refuses either changed), as
+    its scoped prune is what keeps it equal to its parent's list.
 
     Attributes:
         key: As for ``Snapshot``: the columns that identify an id, the source column included when the table has one;
             for a child, its own columns, empty only for a one-to-one child.
+        prune: Keyword-only, inherited from ``Snapshot``: whether a top-level target's missing ids are closed;
+            ``True`` by default, and always for a child.
+        allow_empty: Keyword-only, inherited from ``Snapshot``: whether a top-level target's empty frame is valid and
+            closes every open version of the source; ``False`` by default, and always for a child.
         valid_from: The table column holding a version's first day; ``integer`` or ``bigint`` (``YYYYMMDD`` date keys)
             or ``date``, not nullable, set by the writer only.
         valid_to: The table column holding a version's last day, of ``valid_from``'s kind (a date key of either
@@ -482,7 +507,8 @@ def build_target(model: type[BaseModel], table: str, writer: Writer, source_colu
     rows: list[tuple[str, Target]] = []
     columns = (*source, *_columns(model, (), False, rows, (model,)))
     _check_names(name, columns)
-    _check_writer(name, writer, columns, source_column)
+    part = getattr(model, "record_key", None) is None  # a Part loads only as a child, so it may inherit key columns
+    _check_writer(name, writer, columns, source_column, part)
     key = row_key(Target(table, writer, source_column, columns, (), ()))  # the row key, as a child would see it
     if rows and not key:
         raise TypeError(f"{name}: Rows needs a writer with a key of its own, such as Upsert or ReplaceChildren")
@@ -492,7 +518,9 @@ def build_target(model: type[BaseModel], table: str, writer: Writer, source_colu
     children: list[tuple[str, Target]] = []
     for field, child in rows:  # a keyed child is per parent id, not per source: it leaves the source column out
         whole = isinstance(child.writer, ReplaceChildren)
-        passed = tuple(by_name[column] for column in key or () if whole or column != source_column)
+        passed = tuple(  # a key column this Part inherits is not known yet: _adopt passes it on once it is
+            by_name[column] for column in key or () if (whole or column != source_column) and column in by_name
+        )
         if not passed:
             raise TypeError(
                 f"{name}.{field}: Rows needs its parent's key to hold a column besides the source column "
@@ -613,6 +641,8 @@ def _adopt(where: str, child: Target, inherited: tuple[Column, ...]) -> Target:
     Raises:
         TypeError: From ``_check_names``, when an inherited column has the name of one of the child's own columns, at
             this depth or below.
+        ValueError: An ``Upsert`` child's key names a column that is neither its own nor inherited, at this depth or
+            below.
 
     """
     names = tuple(column.name for column in inherited)
@@ -621,6 +651,10 @@ def _adopt(where: str, child: Target, inherited: tuple[Column, ...]) -> Target:
     _check_names(where, columns)
     adopted = Target(child.table, child.writer, None, columns, names, ())
     by_name = {column.name: column for column in columns}
+    own_key = _key(child.writer) if child.writer is not None else None  # a child always has a writer
+    for column in own_key or ():  # an Upsert child's key may name inherited columns: now they are known
+        if column not in by_name:
+            raise ValueError(f"{where}: the writer's key names {column!r}, which the child neither has nor inherits")
     passed = tuple(by_name[column] for column in row_key(adopted) or ())  # never empty: own key or the inherited
     grandchildren = tuple((field, _adopt(f"{where}.{field}", grand, passed)) for field, grand in child.children)
     return Target(child.table, child.writer, None, columns, names, grandchildren)
@@ -832,7 +866,8 @@ def _child(where: str, annotation: Any, nullable: bool) -> Target:
     ``X`` must declare a table with no source column and an ``Upsert``, ``Versioned`` or ``ReplaceChildren`` writer
     (``Versioned`` is told apart from the ``Snapshot`` it subclasses, which is refused, as are ``Update`` and
     ``ReplacePartition``). A list's ``Upsert`` or ``Versioned`` item needs a non-empty key of its own: with none,
-    every item of a parent would have the same key.
+    every item of a parent would have the same key. A ``Versioned`` child may not set ``prune=False`` or
+    ``allow_empty=True``: a child is always pruned under its staged parents, and its empty frame is always valid.
 
     Preconditions:
         ``annotation`` is a stripped annotation whose ``get_origin`` is ``list`` or that is a ``BaseModel`` subclass
@@ -850,9 +885,10 @@ def _child(where: str, annotation: Any, nullable: bool) -> Target:
 
     Raises:
         TypeError: A list field or its item allows None, a list does not have exactly one argument (``list[X, Y]``),
-            ``X`` declares no table, ``X`` has a source column, ``X``'s writer is not one of the three above, or a
-            list's ``X`` has an ``Upsert`` or ``Versioned`` writer with an empty key; also from ``_unwrap``, for an
-            item that is a subscripted generic alias whose arguments cannot be substituted.
+            ``X`` declares no table, ``X`` has a source column, ``X``'s writer is not one of the three above, a
+            list's ``X`` has an ``Upsert`` or ``Versioned`` writer with an empty key, or ``X``'s ``Versioned`` writer
+            sets ``prune=False`` or ``allow_empty=True``; also from ``_unwrap``, for an item that is a subscripted
+            generic alias whose arguments cannot be substituted.
 
     """
     target: Target | None = None
@@ -872,6 +908,12 @@ def _child(where: str, annotation: Any, nullable: bool) -> Target:
         raise TypeError(f"{where}: a Rows child has no source_column; it inherits its parent's key")
     if many and isinstance(writer, Versioned | Upsert) and not writer.key:
         raise TypeError(f"{where}: a list's items need a key of their own; only a one-to-one child may have none")
+    if isinstance(writer, Versioned) and not writer.prune:
+        raise TypeError(
+            f"{where}: a Rows child is always pruned under its staged parents, so it cannot set prune=False"
+        )
+    if isinstance(writer, Versioned) and writer.allow_empty:
+        raise TypeError(f"{where}: a Rows child's empty frame is always valid, so it does not set allow_empty")
     return target
 
 
@@ -1001,7 +1043,9 @@ def _check_names(where: str, columns: Sequence[Column]) -> None:
         raise TypeError(f"{where}: columns named more than once: {', '.join(repeated)}")
 
 
-def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_column: str | None) -> None:
+def _check_writer(
+    name: str, writer: Writer, columns: Sequence[Column], source_column: str | None, part: bool = False
+) -> None:
     """Check that a writer fits the columns.
 
     A writer key must name distinct target columns that do not allow None, and include the source column when there is
@@ -1013,14 +1057,17 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
     and ``valid_to`` names that no field loads into, and an ``opens_from`` that is a target column whose type is in
     ``_VERSION_TYPES`` (``bigint``, ``integer`` or ``date``: an ``int`` field with no 16-bit ``Width``, or a ``date``
     field); it is matched before ``Snapshot``, whose check it does not take. ``Snapshot`` refuses a column named
-    ``removed_at``. ``Update`` needs a column outside its key, and with ``missing="zero"`` every such column must match
+    ``removed_at``. Either refuses ``allow_empty`` without ``prune``, since an empty frame that prunes nothing needs
+    no allowing. ``Update`` needs a column outside its key, and with ``missing="zero"`` every such column must match
     ``_NUMERIC`` (``bigint``, ``integer``, ``smallint`` or ``numeric(p,s)``).
     ``ReplaceChildren`` needs at least one column: ``columns`` are the child's own, as ``build_target`` adds the
     inherited key columns only when it rebuilds the child target, and without one every list item would load as the
     same key-only row; its ``key`` is then checked as a writer key is, against those own columns (``_adopt`` adds the
     inherited columns later). An ``Upsert`` or
     ``Versioned`` child's key, and a ``Versioned`` child's ``opens_from``, are likewise checked against its own
-    columns only, never the inherited ones. ``Upsert`` has no check beyond the key's.
+    columns only, never the inherited ones, except that a ``Part``'s ``Upsert`` key may also name columns it does not
+    have (``part``): they must be inherited, which ``_adopt`` checks, and inherited columns are never nullable (they
+    are a row key's). ``Upsert`` has no check beyond the key's.
 
     Preconditions:
         Column names in ``columns`` are distinct (``build_target`` calls ``_check_names`` first).
@@ -1030,6 +1077,7 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
         writer: The writer to check.
         columns: The target's columns.
         source_column: The target's source column, or None.
+        part: Whether the target is a ``Part``'s, which loads only as a child. Defaults to ``False``.
 
     Returns:
         None.
@@ -1048,12 +1096,16 @@ def _check_writer(name: str, writer: Writer, columns: Sequence[Column], source_c
         if (not key and not one_to_one) or len(set(key)) != len(key):
             raise ValueError(f"{name}: the writer's key must name distinct columns, got {key!r}")
         for column in key:
+            if column not in by_name and part and isinstance(writer, Upsert):
+                continue  # to be inherited: _adopt checks it
             if column not in by_name:
                 raise ValueError(f"{name}: the writer's key names {column!r}, which is not a target column")
             if by_name[column].nullable:
                 raise ValueError(f"{name}: the writer's key column {column!r} cannot allow None")
         if source_column is not None and source_column not in key:
             raise ValueError(f"{name}: the writer's key must include the source column {source_column!r}")
+    if isinstance(writer, Snapshot) and writer.allow_empty and not writer.prune:
+        raise ValueError(f"{name}: allow_empty lets an empty frame prune every row, so it needs prune")
     match writer:
         case ReplacePartition(column=column):
             if column not in by_name or by_name[column].postgres not in (_TIMESTAMPTZ, "date"):

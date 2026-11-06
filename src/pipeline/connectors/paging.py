@@ -159,14 +159,16 @@ class NoPaging:
 class CursorPaginator:
     """Page an endpoint that returns an opaque token for the next page.
 
-    Every request carries the page size; every request after the first also carries the token. Construction
-    guarantees that ``size`` is positive, that ``token_param`` and ``size_param`` are non-empty and different, and
-    that ``next_at`` and any ``has_more_at`` are valid key paths.
+    Every request carries the page size, when the endpoint takes one; every request after the first also carries the
+    token. Construction guarantees that ``size_param`` and ``size`` are both set or both ``None``, that ``size`` is
+    positive when set, that ``token_param`` and any ``size_param`` are non-empty and different, and that ``next_at``
+    and any ``has_more_at`` are valid key paths.
 
     Attributes:
         token_param (str): The parameter name (one-key path) the token is sent under.
-        size_param (str): The parameter name (one-key path) the page size is sent under.
-        size (int): The page size requested, at least 1.
+        size_param (str | None): The parameter name (one-key path) the page size is sent under, or ``None`` for an
+            endpoint that takes no page size (TikTok's LIVE per-minute performance), which then pages at its own size.
+        size (int | None): The page size requested, at least 1; ``None`` exactly when ``size_param`` is.
         next_at (KeyPath): Where the next token is in a response body.
         has_more_at (KeyPath | None): Where a boolean "more pages follow" flag is, or ``None`` to end on a missing,
             ``null`` or empty token instead.
@@ -175,14 +177,14 @@ class CursorPaginator:
     """
 
     token_param: str  # e.g. "page_token"
-    size_param: str  # e.g. "page_size"
-    size: int
+    size_param: str | None  # e.g. "page_size"; None: the endpoint takes no page size
+    size: int | None  # None exactly when size_param is None
     next_at: KeyPath  # e.g. ("data", "next_page_token")
     has_more_at: KeyPath | None = None  # set when the connector also says has_more; it then decides the end
     place: Place = Place.QUERY
 
     def __post_init__(self) -> None:
-        """Reject a non-positive page size or an invalid key path.
+        """Reject a page size without its parameter or the reverse, a non-positive page size, or an invalid key path.
 
         Preconditions:
             None.
@@ -191,15 +193,17 @@ class CursorPaginator:
             None.
 
         Raises:
-            ValueError: When ``size`` is less than 1, when ``token_param`` or ``size_param`` is empty or they are
-                equal, or from ``check_key_path`` when ``next_at`` or a set ``has_more_at`` is empty or has an empty
-                key.
+            ValueError: When only one of ``size_param`` and ``size`` is ``None``; when ``size`` is less than 1; when
+                ``token_param`` or a set ``size_param`` is empty or they are equal; or from ``check_key_path`` when
+                ``next_at`` or a set ``has_more_at`` is empty or has an empty key.
 
         """
-        if self.size < 1:
+        if (self.size_param is None) != (self.size is None):
+            raise ValueError(f"a page size and its parameter go together: {self.size_param!r}, {self.size!r}")
+        if self.size is not None and self.size < 1:
             raise ValueError(f"page size must be positive: {self.size}")
         # a bad name would otherwise fail only when a task runs, after page 1 is saved
-        if not self.token_param or not self.size_param or self.token_param == self.size_param:
+        if not self.token_param or self.size_param == "" or self.token_param == self.size_param:
             raise ValueError(f"parameter names must be non-empty and differ: {self.token_param!r}, {self.size_param!r}")
         check_key_path(self.next_at)
         if self.has_more_at is not None:
@@ -207,22 +211,25 @@ class CursorPaginator:
 
     @property
     def params(self) -> tuple[tuple[Place, str], ...]:
-        """Return the page size and token parameters, both at ``place``.
+        """Return the page size and token parameters, both at ``place``; no page size when there is no ``size_param``.
 
         Preconditions:
             None.
 
         Returns:
-            ``((place, size_param), (place, token_param))``; the token is added only after the first page.
+            ``((place, size_param), (place, token_param))``, or ``((place, token_param),)`` without a ``size_param``;
+            the token is added only after the first page.
 
         Raises:
             Nothing.
 
         """
+        if self.size_param is None:
+            return ((self.place, self.token_param),)
         return ((self.place, self.size_param), (self.place, self.token_param))
 
     def apply(self, request: ConnectorRequest, cursor: str | None) -> ConnectorRequest:
-        """Return the request with the page size, and the token when there is one.
+        """Return the request with the page size, when the endpoint takes one, and the token when there is one.
 
         Preconditions:
             None.
@@ -232,8 +239,8 @@ class CursorPaginator:
             cursor: The token of the page to request, or ``None`` for the first page.
 
         Returns:
-            A copy of ``request`` with ``size_param`` set, and ``token_param`` set to ``cursor`` when it is not
-            ``None``.
+            ``request`` with ``size_param`` set to ``size`` when there is a ``size_param``, and ``token_param`` set to
+            ``cursor`` when it is not ``None``: a copy when either is added, else ``request`` itself.
 
         Raises:
             ValueError: From ``ConnectorRequest.with_param`` when the request already has one of the names, or (in the
@@ -241,7 +248,8 @@ class CursorPaginator:
             Exception: In the body, whatever ``copy.deepcopy`` raises through ``with_param``.
 
         """
-        request = request.with_param(self.place, (self.size_param,), self.size)
+        if self.size_param is not None and self.size is not None:  # set together, as __post_init__ checks
+            request = request.with_param(self.place, (self.size_param,), self.size)
         if cursor is None:  # first page: no token
             return request
         return request.with_param(self.place, (self.token_param,), cursor)

@@ -13,7 +13,7 @@ from typing import Any, Final, Literal, Protocol, final
 from zoneinfo import ZoneInfo
 
 from pipeline.checks.checks import Validation
-from pipeline.checks.record import Record
+from pipeline.checks.record import Record, task_day_fields
 from pipeline.checks.targets import ReplacePartition, target_of, walk
 from pipeline.connectors.client import ConnectorClient
 from pipeline.connectors.fanout import DEFAULT_CONCURRENCY, FromList, FromQuery, IdSource
@@ -191,7 +191,8 @@ class BatchJob[R: Record]:
 
         The record model's root target is built with ``target_of``, so a model that would fail every run after
         Extract is refused here instead: one that declares no table or loads as child rows, and one whose root
-        target writes with ``ReplacePartition`` under a ``"none"`` partition, which has no frame to replace. A child
+        target writes with ``ReplacePartition`` under a ``"none"`` partition, which has no frame to replace, and one
+        with a ``TaskDay`` field under any partition but ``"day"``, which has no day to fill it with. A child
         target always writes with ``Upsert``, ``Versioned`` or ``ReplaceChildren`` (the ``Rows`` mark in
         ``pipeline.checks.targets`` refuses any other; not among this page's contracts), so only the root is checked.
         A job with ``id_source`` or ``spec.id_param`` set is checked as a fan-out by ``_check_fan_out``, in place of
@@ -214,7 +215,8 @@ class BatchJob[R: Record]:
             ValueError: ``client.connector`` is not ``spec.connector``; ``partition`` is neither ``"day"`` nor
                 ``"none"``; ``window`` is ``None`` for a ``"day"`` partition, set for a ``"none"`` one, or, for a job
                 that is not fanned out, not a name in ``spec.windows``; for a fan-out, anything ``_check_fan_out``
-                refuses; or the model's root target writes with ``ReplacePartition`` under a ``"none"`` partition.
+                refuses; the model's root target writes with ``ReplacePartition`` under a ``"none"`` partition; or the
+                model has a ``TaskDay`` field and the partition is not ``"day"``.
 
         """
         for attribute in ("name", "spec", "window", "partition", "validation"):
@@ -233,6 +235,11 @@ class BatchJob[R: Record]:
         root = target_of(self.validation.model)
         if self.partition == "none" and isinstance(root.writer, ReplacePartition):
             raise ValueError(f"job {self.name}: {root.table} replaces a partition, but a none partition has no frame")
+        days = task_day_fields(self.validation.model)
+        if days and self.partition != "day":
+            raise ValueError(
+                f"job {self.name}: {days[0]} is a TaskDay, so it needs a day partition, not {self.partition}"
+            )
         self._client = client
         self._zone = zone
         self._instruments = instruments

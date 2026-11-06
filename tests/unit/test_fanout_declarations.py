@@ -9,7 +9,7 @@ import pytest
 from opentelemetry.sdk.metrics import MeterProvider
 
 from pipeline.checks.checks import DETAIL_RULE, Rule, Validation
-from pipeline.checks.record import Record
+from pipeline.checks.record import Int32, Record, TaskDay
 from pipeline.checks.targets import ReplacePartition, To, Upsert
 from pipeline.connectors.fanout import FromList, FromQuery, id_text
 from pipeline.connectors.paging import CursorPaginator, NoPaging
@@ -66,10 +66,20 @@ def spec(path: str = "/items", method: Any = "POST", **kwargs: Any) -> EndpointS
         ({"place": IdPlace.QUERY, "name": "x", "batch": 2}, "one per call"),
         ({"place": IdPlace.PATH, "name": "x", "inject": ""}, "injected id field"),
         ({"place": IdPlace.BODY, "name": "ids", "batch": 2, "inject": "id"}, "injected id field"),
+        ({"place": IdPlace.PATH, "name": "x", "encoding": "csv"}, "only a query id takes an encoding"),
+        ({"place": IdPlace.BODY, "name": "ids", "encoding": "json"}, "only a query id takes an encoding"),
+        ({"place": IdPlace.QUERY, "name": "x", "encoding": "xml"}, "only a query id takes an encoding, csv or json"),
+        ({"place": IdPlace.QUERY, "name": "x", "batch": 2, "wrap": ("ids",)}, "one per call"),
+        ({"place": IdPlace.QUERY, "name": "x", "encoding": "csv", "wrap": ("ids",)}, "only json-encoded ids"),
+        ({"place": IdPlace.QUERY, "name": "x", "encoding": "json", "wrap": ()}, "key path"),
+        ({"place": IdPlace.QUERY, "name": "x", "encoding": "json", "wrap": ("a", "")}, "key path"),
+        ({"place": IdPlace.QUERY, "name": "x", "batch": 2, "encoding": "csv", "inject": "id"}, "injected id field"),
+        ({"place": IdPlace.BODY, "name": "ids", "batch": 2, "id_at": ()}, "key path"),
+        ({"place": IdPlace.BODY, "name": "ids", "batch": 2, "id_at": ("data", "")}, "key path"),
     ],
 )
 def test_id_param_refuses_a_bad_declaration(kwargs: dict[str, Any], match: str) -> None:
-    """Refuse an empty name, a batch below 1 or outside the body, and an injected field with a batch."""
+    """Refuse an empty name, a bad batch, encoding, wrap or id_at, and an injected field with a batch."""
     with pytest.raises(ValueError, match=match):
         IdParam(**kwargs)
 
@@ -111,6 +121,39 @@ def test_request_for_puts_one_id_in_the_query() -> None:
     """Add a query id beside the fixed query."""
     query = spec(method="GET", fixed_query={"v": "2"}, id_param=IdParam(place=IdPlace.QUERY, name="live_id"))
     assert query.request_for(["7"]).query == {"v": "2", "live_id": "7"}
+
+
+@pytest.mark.parametrize(
+    ("id_param", "value"),
+    [
+        (IdParam(place=IdPlace.QUERY, name="ids", batch=3, encoding="csv"), "a,b"),
+        (IdParam(place=IdPlace.QUERY, name="ids", batch=3, encoding="json"), '["a","b"]'),
+        (
+            IdParam(place=IdPlace.QUERY, name="ids", batch=100, encoding="json", wrap=("filtering", "campaign_ids")),
+            '{"filtering":{"campaign_ids":["a","b"]}}',
+        ),
+    ],
+    ids=["csv", "json", "json wrapped twice"],
+)
+def test_request_for_encodes_a_batch_of_ids_in_the_query(id_param: IdParam, value: str) -> None:
+    """Join a query batch by commas, or send it as a compact JSON array, nested in its wrap keys."""
+    query = spec(method="GET", fixed_query={"v": "2"}, id_param=id_param)
+    assert query.request_for(["a", "b"]).query == {"v": "2", "ids": value}
+
+
+def test_request_for_wraps_json_ids_for_a_gmv_max_filter() -> None:
+    """Send filtering={"campaign_ids":[...]}, as the GMV Max report takes its campaign ids."""
+    where = IdParam(place=IdPlace.QUERY, name="filtering", batch=100, encoding="json", wrap=("campaign_ids",))
+    request = spec(method="GET", id_param=where).request_for(["1", "2"])
+    assert request.query == {"filtering": '{"campaign_ids":["1","2"]}'}
+    assert spec(method="GET", id_param=where).request_for(["1"]).query == {"filtering": '{"campaign_ids":["1"]}'}
+
+
+def test_request_for_refuses_a_comma_in_a_comma_joined_id() -> None:
+    """Refuse, as a holdable IdRefused, a csv id holding a comma, which would be read as two ids."""
+    batched = spec(method="GET", id_param=IdParam(place=IdPlace.QUERY, name="ids", batch=2, encoding="csv"))
+    with pytest.raises(IdRefused, match="holds a comma"):
+        batched.request_for(["a", "b,c"])
 
 
 def test_request_for_puts_a_batch_of_ids_in_the_body() -> None:
@@ -376,3 +419,24 @@ def test_a_none_fan_out_with_a_windowed_endpoint_says_it_needs_a_day_partition()
     """Refuse a windowed list under a none partition, saying a day partition is needed."""
     with pytest.raises(ValueError, match="products_search has windows, so it needs a day partition, not none"):
         job(partition="none", window=None)
+
+
+class ProductDay(Record, table="t_fan.product_day", writer=Upsert(("source_id", "product_id", "date_key"))):
+    """A product's day, dated by the task's day."""
+
+    record_key: ClassVar[tuple[str, ...]] = ("id", "day")
+    record_version: ClassVar[int] = 1
+
+    id: Annotated[str, To("product_id")]
+    day: Annotated[Int32, TaskDay(), To("date_key")]
+
+
+def test_a_task_day_is_accepted_under_a_day_partition() -> None:
+    """Accept a model with a TaskDay field in a job with a day partition."""
+    job(validation=Validation(model=ProductDay))
+
+
+def test_a_task_day_is_refused_under_a_none_partition() -> None:
+    """Refuse a model with a TaskDay field in a job with a none partition, which has no day to fill it with."""
+    with pytest.raises(ValueError, match="day is a TaskDay, so it needs a day partition, not none"):
+        job(validation=Validation(model=ProductDay), id_source=FromQuery("SELECT 1"), partition="none", window=None)

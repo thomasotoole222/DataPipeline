@@ -238,6 +238,53 @@ async def test_hold_rolls_back_with_load(pool: Pool) -> None:
         assert await cursor.fetchone() == (0,)
 
 
+async def test_hold_replaces_earlier_open_rows_for_a_key(pool: Pool) -> None:
+    """Check a re-run task's held rows replace the open rows an earlier task held for the same key.
+
+    Each task holds two copies of group ``o1`` and one row with no group key. After the re-run, exactly the re-run's
+    two ``o1`` copies are open, the no-group rows of both tasks are open, and a released ``o1`` row, an open ``o2`` row
+    and an open ``o1`` row of another source are untouched. A re-run that rolls back replaces nothing.
+    """
+    source, other = uuid4(), uuid4()
+
+    def task_rows(task: int) -> list[HeldRow]:
+        return [
+            held(task_id=task, source_id=source, raw_index=1),
+            held(task_id=task, source_id=source, raw_index=2),
+            held(task_id=task, source_id=source, raw_index=3, group_key=None, payload={"id": None}),
+        ]
+
+    async with pool.connection() as c:
+        async with c.transaction():
+            await hold(c, [held(task_id=0, source_id=source, raw_index=9)])
+        await c.execute("UPDATE quarantine.row SET status = 'released', resolved_at = now()")
+        async with c.transaction():
+            await hold(c, [held(task_id=0, source_id=source, group_key="o2"), held(task_id=0, source_id=other)])
+        async with c.transaction():
+            assert await hold(c, task_rows(1)) == 3
+        with pytest.raises(ZeroDivisionError):
+            async with c.transaction():
+                await hold(c, task_rows(2))
+                1 / 0  # noqa: B018 - the failure that rolls the re-run back
+        cursor = await c.execute("SELECT count(*) FROM quarantine.row WHERE task_id = 1 AND status = 'open'")
+        assert await cursor.fetchone() == (3,)
+        async with c.transaction():
+            assert await hold(c, task_rows(2)) == 3
+        cursor = await c.execute(
+            "SELECT task_id, source_id = %s, group_key, raw_index, status FROM quarantine.row ORDER BY task_id, id",
+            (source,),
+        )
+        assert await cursor.fetchall() == [
+            (0, True, "o1", 9, "released"),
+            (0, True, "o2", 3, "open"),
+            (0, False, "o1", 3, "open"),
+            (1, True, None, 3, "open"),
+            (2, True, "o1", 1, "open"),
+            (2, True, "o1", 2, "open"),
+            (2, True, None, 3, "open"),
+        ]
+
+
 async def test_quarantine_has_no_raw_table_column(pool: Pool) -> None:
     """Check quarantine.row no longer names a raw table."""
     async with pool.connection() as c:

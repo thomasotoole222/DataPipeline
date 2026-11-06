@@ -5,11 +5,14 @@ Public API:
     Bool: A boolean field's type: its input mapped through ``BOOL_VALUES``, then checked as a strict ``bool``.
     Int32: An ``int`` field bounded to -2**31 to 2**31 - 1 and marked ``Width(32)``, so it loads into ``integer``.
     Int16: An ``int`` field bounded to -2**15 to 2**15 - 1 and marked ``Width(16)``, so it loads into ``smallint``.
+    DateKey: An ``int`` field read from a ``YYYY-MM-DD`` date or a ``YYYYMMDD`` int, held as the ``YYYYMMDD`` int.
+    TaskDay: Field mark that fills a top-level field of a Record with the task's day as a ``YYYYMMDD`` int.
+    task_day_fields: Return the names of a model's fields marked ``TaskDay``, in field order.
     Part: Frozen pydantic model that keeps unknown fields; the base for nested parts of a record.
     Record: A ``Part`` whose subclasses must declare ``record_key`` and ``record_version``, checked at class creation;
         each key field must be required, have a type defined when the model is declared, not accept ``None`` and have
         a type and metadata allowed by ``_key_refusal``; a subclass may not set ``strict=True`` in its
-        ``model_config``.
+        ``model_config``; it may declare a ``reshape`` applied to each landed record before it is parsed.
     Keyed: A parsed record together with its key from ``key_of``.
     key_of: Return a record's key values in ``record_key`` order, read from its landed payload.
 
@@ -20,16 +23,19 @@ fills only its ``Rows`` children's tables, and its target is built by ``build_co
 
 Private units:
     _to_bool: Return the ``bool`` that ``BOOL_VALUES`` maps a boolean field's input to, or the input unchanged.
+    _DateKeyInput: The mark ``DateKey`` carries, which reads a date key's input before its ``int`` checks.
+    _date_key: Return a date key's input as its ``YYYYMMDD`` int.
     _annotated: Return the field's type annotated with its own metadata, as a key field's form is checked.
     _allows_none: Return whether a field accepts ``None``.
     _key_refusal: Return why a type form is refused for a key field, or ``None`` when it is allowed.
-    _declarative: Return whether a metadata item is a declarative constraint or mark (``To``, ``Width``), which a key
-        field may carry.
+    _declarative: Return whether a metadata item is a declarative constraint or mark (``To``, ``Width``,
+        ``TaskDay``, ``DateKey``'s), which a key field may carry.
+    _check_task_days: Check that every ``TaskDay`` field of a model is a Record's plain ``int`` field with no alias.
     _key_model: Return a model of only a Record's ``record_key`` fields, built once per record model.
     _check_table_key: Check that a Record's writer key is its source column plus its ``record_key`` columns.
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -46,6 +52,7 @@ from pydantic import (
     BaseModel,
     BeforeValidator,
     ConfigDict,
+    GetCoreSchemaHandler,
     PydanticSchemaGenerationError,
     PydanticUserError,
     Strict,
@@ -54,6 +61,7 @@ from pydantic import (
     create_model,
 )
 from pydantic.fields import FieldInfo
+from pydantic_core import core_schema
 
 from pipeline.checks.targets import (
     Snapshot,
@@ -145,6 +153,113 @@ Int32 = Annotated[int, Ge(-(2**31)), Le(2**31 - 1), Width(32)]
 Int16 = Annotated[int, Ge(-(2**15)), Le(2**15 - 1), Width(16)]
 
 
+def _date_key(value: object) -> int:
+    """Return a date key's input as its ``YYYYMMDD`` int.
+
+    Preconditions:
+        None.
+
+    Args:
+        value: The field's input, as JSON decoded it.
+
+    Returns:
+        ``year * 10000 + month * 100 + day`` for a ``str`` written ``YYYY-MM-DD``; an ``int`` (not a ``bool``) as it
+        is, once its digits are found to name a real date.
+
+    Raises:
+        ValueError: ``value`` is a ``str`` that is not a date written ``YYYY-MM-DD`` (the compact ``"20261104"``
+            included), an ``int`` whose ``YYYYMMDD`` digits name no date (``20260230``, ``0``, a negative one), or of
+            any other type, a ``bool`` and a ``float`` included; Pydantic turns it into a ``ValidationError``.
+
+    """
+    if isinstance(value, str):
+        day = date.fromisoformat(value)
+        if day.isoformat() != value:
+            raise ValueError(f"a date key is written YYYY-MM-DD, not {value!r}")
+        return day.year * 10000 + day.month * 100 + day.day
+    if isinstance(value, int) and not isinstance(value, bool):
+        date(value // 10000, value // 100 % 100, value % 100)  # raises ValueError when the digits name no date
+        return value
+    raise ValueError(f"a date key is a YYYY-MM-DD date or a YYYYMMDD int, not a {type(value).__name__}")
+
+
+@dataclass(frozen=True, slots=True)
+class _DateKeyInput:
+    """The mark ``DateKey`` carries, which reads a date key's input before its ``int`` checks.
+
+    A declarative mark in ``_declarative``'s sense, so a ``DateKey`` may be a key field: it has no fields, and its
+    one piece of code, ``_date_key``, is fixed here. Placed last in ``DateKey``'s metadata, so its validator wraps
+    the ``int`` schema and its bounds and runs first, on the raw input.
+
+    """
+
+    def __get_pydantic_core_schema__(self, source: Any, handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
+        """Return the field's schema with ``_date_key`` run on its input before it.
+
+        Preconditions:
+            None.
+
+        Args:
+            source: The annotated type, ``int``.
+            handler: Builds the schema of ``source`` with the metadata before this mark.
+
+        Returns:
+            A before-validator schema of ``_date_key`` around the handler's schema.
+
+        Raises:
+            Exception: Whatever ``handler`` raises building the inner schema.
+
+        """
+        return core_schema.no_info_before_validator_function(_date_key, handler(source))
+
+
+#: An int field read from a ``YYYY-MM-DD`` date (``"2026-11-04"``) or an int already in ``YYYYMMDD`` (``20261104``), and
+#: held as the ``YYYYMMDD`` int, e.g. a report's ``stat_time_day`` as a ``date_key``. Any other input, and a date that
+#: does not exist, fails model validation in Validate, so the record is held. ``Ge``, ``Le`` and ``Width(32)`` make it
+#: load into ``integer``, as ``Int32`` does. Every item is declarative, so a DateKey may be a key field.
+DateKey = Annotated[int, Ge(10101), Le(99991231), Width(32), _DateKeyInput()]
+
+
+@dataclass(frozen=True, slots=True)
+class TaskDay:
+    """Field mark that fills a top-level field of a Record with the task's day as a ``YYYYMMDD`` int.
+
+    Used like ``To``, and usually with it: ``date_key: Annotated[Int32, TaskDay(), To("date_key")]``. Validate writes
+    the day of the task's ``"day"`` partition (its ``partition_key``, ``YYYY-MM-DD``) into each landed record's field
+    of that name, over any value already there, before the record is validated (see ``stages.validate``), so the
+    field's own constraints check it and it may be a ``record_key`` field. The mark has no fields and runs no code:
+    Pydantic ignores it when it validates.
+
+    Rules, checked when the model is declared by ``_check_task_days``: the field is a field of a ``Record``, not of a
+    nested part (only a record's own payload is filled); its type is ``int`` (``Int32`` included), not optional; it has
+    no alias, since the value is written under the field's name; and it carries one ``TaskDay``. ``BatchJob`` refuses
+    a model with a ``TaskDay`` field unless the job's partition is ``"day"``.
+
+    """
+
+
+def task_day_fields(model: type[BaseModel]) -> tuple[str, ...]:
+    """Return the names of a model's fields marked ``TaskDay``, in field order.
+
+    Only the model's own fields are read, not those of a nested part.
+
+    Preconditions:
+        None.
+
+    Args:
+        model: The record model.
+
+    Returns:
+        The names; ``()`` when no field is marked.
+
+    Raises:
+        Nothing.
+
+    """
+    fields = model.model_fields.items()
+    return tuple(name for name, field in fields if any(isinstance(item, TaskDay) for item in field.metadata))
+
+
 class Part(BaseModel):
     """Frozen pydantic model that keeps unknown fields; the base for nested parts of a record.
 
@@ -219,7 +334,8 @@ class Part(BaseModel):
         ``class R[T](Record)`` or ``class R(Record, Generic[T])``) is refused, so a parametrised one (``R[int]``),
         which Pydantic would create with no class keywords and so without its origin's target, is never created.
         ``container`` reaches this as True only for a ``Part`` that is not a ``Record`` (``Record`` takes the keyword
-        and builds its container itself), so it is refused.
+        and builds its container itself), so it is refused. A ``TaskDay`` field is refused on a Part that is not a
+        ``Record``, since only a record's own payload is filled.
 
         Preconditions:
             None.
@@ -235,8 +351,9 @@ class Part(BaseModel):
             None.
 
         Raises:
-            TypeError: ``container`` is True (a Part cannot be a container); the subclass is generic (has type
-                parameters or is parametrised); only one of ``table`` and ``writer`` is given; or from
+            TypeError: ``container`` is True (a Part cannot be a container); a field of a Part that is not a
+                ``Record`` carries ``TaskDay``; the subclass is generic (has type parameters or is parametrised); only
+                one of ``table`` and ``writer`` is given; or from
                 ``build_target``, for a bad declaration (e.g. a field type that is not defined yet, a field without a
                 ``To``, a writer that does not fit the columns). The checks run in that order.
             ValueError: From ``build_target``, for a bad declaration (e.g. a malformed table or column name, a
@@ -246,6 +363,9 @@ class Part(BaseModel):
         super().__pydantic_init_subclass__(**kwargs)
         if container:
             raise TypeError(f"{cls.__name__}: only a Record can be a container; a Part loads with a table")
+        marked = task_day_fields(cls)
+        if marked and not issubclass(cls, Record):  # Record is defined below this class, before any marked one
+            raise TypeError(f"{cls.__name__}.{marked[0]}: TaskDay fills a Record's own field, not a nested part's")
         generic = cls.__pydantic_generic_metadata__
         if generic["parameters"] or generic["origin"] is not None:  # R[int] would lose R's target
             raise TypeError(f"{cls.__name__}: a Record or Part must be concrete, not generic")
@@ -286,17 +406,29 @@ class Record(Part):
     ``model_config``: payloads are JSON-decoded values validated in Python mode, where strict validation refuses the
     string forms of ``date``, ``datetime``, ``UUID`` and ``Decimal``.
 
+    A subclass may declare ``reshape`` (``reshape = flatten``, or with the ``ClassVar`` annotation), a pure function
+    of one landed record that returns the record Validate parses and reads the key from, for a response whose shape
+    the model cannot read as it is: lifting ``products[].skus[]`` into a list of its own, building child rows from
+    named blocks. Validate applies it to each landed record that is a mapping, after the call's id is written in
+    (``IdParam.inject``) and after the ``TaskDay`` fields are filled, and before the key is read and the record is
+    parsed (``stages.validate``); a record whose ``reshape`` raises, or returns something other than a mapping, is
+    held under ``RESHAPE_RULE``. The raw pages and a held record's stored payload stay as landed. It is inherited by a
+    subclass; one that is not callable is refused at class creation.
+
     Attributes:
         record_key (ClassVar[tuple[str, ...]]): Names of the declared fields that identify a record, in key order. At
             least one; each must be a declared field that is required (no default), whose type is defined when the
             model is declared, that does not accept ``None`` as judged by ``_allows_none``, and whose type and
             metadata are allowed by ``_key_refusal``. Duplicate names are not rejected.
         record_version (ClassVar[int]): Version of the record's shape, 1 or more.
+        reshape (ClassVar[Callable[[Mapping[str, Any]], Mapping[str, Any]]]): Optional. Turns a landed record into
+            the record parsed; must not change its argument. Not set on ``Record``.
 
     """
 
     record_key: ClassVar[tuple[str, ...]]  # the fields that identify a record, e.g. ("id",)
     record_version: ClassVar[int]  # bumped when the model's meaning changes; stored with a schema failure
+    reshape: ClassVar[Callable[[Mapping[str, Any]], Mapping[str, Any]]]  # optional; applied before parsing
 
     @classmethod
     def __pydantic_init_subclass__(
@@ -307,7 +439,9 @@ class Record(Part):
         Pydantic calls this after it has built ``model_fields`` for the subclass. A container given a ``table`` or
         ``writer`` is refused before anything else. ``Part.__pydantic_init_subclass__`` then builds the target (``None``
         for a container, since it is given neither, and ``container`` is not passed on). Checks then run in order:
-        ``model_config`` does not set ``strict=True``; ``record_key`` is non-empty, ``record_version`` is 1 or more,
+        ``model_config`` does not set ``strict=True``; every ``TaskDay`` field passes ``_check_task_days``; a
+        ``reshape``, when set, is callable;
+        ``record_key`` is non-empty, ``record_version`` is 1 or more,
         then for each key name in turn: it is a declared field, the field has no default, every item of its own metadata
         is allowed by ``_declarative``, no ``field_validator`` (any mode) or deprecated ``validator``, inherited ones
         included, names it or ``"*"``, its type can be resolved, it does not accept ``None`` as judged by
@@ -340,7 +474,9 @@ class Record(Part):
             None.
 
         Raises:
-            TypeError: ``model_config`` sets ``strict=True``, ``record_key`` is missing or empty, ``record_version``
+            TypeError: ``model_config`` sets ``strict=True``, a ``TaskDay`` field breaks a rule of
+                ``_check_task_days``, ``reshape`` is set to something that is not callable, ``record_key`` is missing
+                or empty, ``record_version``
                 is missing or less than 1, a key name is not a declared field, a key field has a default, a
                 ``field_validator`` or deprecated ``validator`` names a key field or ``"*"`` (the message, the same for
                 both, says key normalisation must be declarative), a key field's type names a class that is not defined
@@ -368,6 +504,9 @@ class Record(Part):
         super().__pydantic_init_subclass__(source_column=source_column, **kwargs)
         if cls.model_config.get("strict"):  # Python-mode strict refuses the JSON string forms of dates, UUIDs, ...
             raise TypeError(f"{cls.__name__}: a Record cannot set strict=True, since its payloads are decoded JSON")
+        _check_task_days(cls)
+        if hasattr(cls, "reshape") and not callable(cls.reshape):
+            raise TypeError(f"{cls.__name__}.reshape must be a function of one record, not {cls.reshape!r}")
         key = getattr(cls, "record_key", ())
         if not key:
             raise TypeError(f"{cls.__name__} must set record_key")
@@ -408,6 +547,40 @@ class Record(Part):
             cls.__target__ = build_container(cls, key, source_column)
         elif cls.__target__ is not None:
             _check_table_key(cls.__name__, cls.__target__, key)
+
+
+def _check_task_days(model: type[BaseModel]) -> None:
+    """Check that every ``TaskDay`` field of a model is a Record's plain ``int`` field with no alias.
+
+    Each field marked ``TaskDay`` must carry one ``TaskDay``, have the type ``int`` (Pydantic moves an ``Int32``'s
+    bounds and ``Width`` into the field's metadata, so ``Int32`` is ``int`` here; an optional ``int`` or a ``type``
+    alias is refused), and have neither an ``alias`` nor a ``validation_alias``, since Validate writes the day under
+    the field's name.
+
+    Preconditions:
+        ``model`` is a ``Record`` subclass; ``Part.__pydantic_init_subclass__`` refuses a marked field of any other
+        model.
+
+    Args:
+        model: The record model whose fields are checked.
+
+    Returns:
+        None.
+
+    Raises:
+        TypeError: A marked field carries more than one ``TaskDay``, is not of type ``int``, or has an alias.
+
+    """
+    for name in task_day_fields(model):
+        field, where = model.model_fields[name], f"{model.__name__}.{name}"
+        if sum(isinstance(item, TaskDay) for item in field.metadata) > 1:
+            raise TypeError(f"{where}: a field takes one TaskDay mark")
+        if field.annotation is not int:
+            raise TypeError(
+                f"{where}: TaskDay fills a YYYYMMDD int, so the field must be an int, not {field.annotation!r}"
+            )
+        if field.alias is not None or field.validation_alias is not None:
+            raise TypeError(f"{where}: TaskDay writes the day under the field's name, so the field takes no alias")
 
 
 def _check_table_key(name: str, target: Target, key: tuple[str, ...]) -> None:
@@ -593,18 +766,19 @@ def _declarative(item: object) -> bool:
     value outside the types ``_key_refusal`` allows (unhashable or unstorable), and ``Strict`` refuses the JSON
     string forms of dates, UUIDs and decimals, so the key could not be read.
 
-    Allowed: an ``annotated_types`` constraint (``BaseMetadata``: ``MinLen``, ``Ge`` and Pydantic's own, such as
-    the general metadata ``Field(...)`` leaves), Pydantic's ``AllowInfNan``, ``Strict(False)``, a group of them
+    Allowed: an ``annotated_types`` constraint (``BaseMetadata``: ``MinLen``, ``Ge`` and Pydantic's own, such as the
+    general metadata ``Field(...)`` leaves), Pydantic's ``AllowInfNan``, ``Strict(False)``, a group of them
     (``GroupedMetadata``: ``StringConstraints``, ``Interval``) whose items are each allowed, a ``FieldInfo``
-    (``Field(...)`` inside an ``Annotated`` that is not the field's own) whose metadata items are each allowed, a
-    ``To`` mark and a ``Width`` mark (so ``Int32`` and ``Int16`` keys are allowed; Pydantic ignores the mark when it
-    validates). Anything else is refused: ``Strict(True)`` (``Field(strict=True)``, ``StrictStr``, ...),
-    ``annotated_types.Predicate``, which runs code, and every validator (``AfterValidator``, ``BeforeValidator``,
-    ``WrapValidator``, ``PlainValidator``) among them. The test is ``isinstance``, so an instance of any subclass of
-    ``BaseMetadata``, ``AllowInfNan``, ``GroupedMetadata``, ``To`` or ``Width`` is allowed, including one whose
-    class defines ``__get_pydantic_core_schema__`` and so runs code of its own; ``key_of`` reads the key from the
-    payload with ``_key_model`` alone, so such an item cannot give a failed copy and a parsed copy of one payload
-    different keys.
+    (``Field(...)`` inside an ``Annotated`` that is not the field's own) whose metadata items are each allowed, a ``To``
+    mark, a ``Width`` mark (so ``Int32`` and ``Int16`` keys are allowed; Pydantic ignores the mark when it validates), a
+    ``TaskDay`` mark, which Validate fills before the key is read, and the ``_DateKeyInput`` mark of ``DateKey``, whose
+    fixed conversion gives only a ``YYYYMMDD`` int. Anything else is refused: ``Strict(True)`` (``Field(strict=True)``,
+    ``StrictStr``, ...), ``annotated_types.Predicate``, which runs code, and every validator (``AfterValidator``,
+    ``BeforeValidator``, ``WrapValidator``, ``PlainValidator``) among them. The test is ``isinstance``, so an instance
+    of any subclass of ``BaseMetadata``, ``AllowInfNan``, ``GroupedMetadata``, ``To``, ``Width``, ``TaskDay`` or
+    ``_DateKeyInput`` is allowed, including one whose class defines ``__get_pydantic_core_schema__`` and so runs code of
+    its own; ``key_of`` reads the key from the payload with ``_key_model`` alone, so such an item cannot give a failed
+    copy and a parsed copy of one payload different keys.
 
     Preconditions:
         None.
@@ -625,7 +799,7 @@ def _declarative(item: object) -> bool:
         return all(_declarative(inner) for inner in item)
     if isinstance(item, Strict):
         return not item.strict  # strict Python mode refuses the JSON string forms the key arrives in
-    return isinstance(item, BaseMetadata | AllowInfNan | To | Width) and not isinstance(
+    return isinstance(item, BaseMetadata | AllowInfNan | To | Width | TaskDay | _DateKeyInput) and not isinstance(
         item, Predicate
     )  # Predicate runs code
 

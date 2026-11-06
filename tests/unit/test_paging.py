@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from pipeline.connectors.paging import CursorPaginator, HasMore, PageNumberPaginator, ShortPage, TotalCount
-from pipeline.connectors.spec import EndpointSpec
+from pipeline.connectors.spec import ConnectorRequest, EndpointSpec, Place
 from pipeline.errors import ClientErrorUnhandled
 
 SAMPLES_PAGING = PageNumberPaginator("page", "page_size", 2, HasMore(("data", "has_more")))
@@ -43,6 +43,29 @@ def test_cursor_rejects_empty_or_shared_names(token: str, size: str) -> None:
     """Refuse to build a ``CursorPaginator`` with an empty or shared parameter name."""
     with pytest.raises(ValueError, match="non-empty and differ"):
         CursorPaginator(token, size, 100, ("data", "next_page_token"))
+
+
+def test_cursor_without_a_page_size_sends_only_its_token() -> None:
+    """Page an endpoint that takes no page size: no size parameter is listed or sent, the token is."""
+    paging = CursorPaginator(token_param="page_token", size_param=None, size=None, next_at=("data", "next"))  # noqa: S106
+    first = ConnectorRequest("GET", "/minutes", {"currency": "LOCAL"}, None)
+    assert paging.params == ((Place.QUERY, "page_token"),)
+    assert paging.apply(first, None) is first
+    assert paging.apply(first, "t2").query == {"currency": "LOCAL", "page_token": "t2"}
+
+
+@pytest.mark.parametrize(
+    ("size_param", "size", "match"),
+    [
+        (None, 100, "a page size and its parameter go together"),
+        ("page_size", None, "a page size and its parameter go together"),
+        ("page_size", 0, "page size must be positive"),
+    ],
+)
+def test_cursor_needs_a_page_size_with_its_parameter(size_param: str | None, size: int | None, match: str) -> None:
+    """Refuse a page size without its parameter, a parameter without a size, and a size below 1."""
+    with pytest.raises(ValueError, match=match):
+        CursorPaginator("page_token", size_param, size, ("data", "next"))
 
 
 @pytest.mark.parametrize(("page", "size"), [("", "page_size"), ("page", ""), ("page", "page")])

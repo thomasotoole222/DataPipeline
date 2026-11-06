@@ -1,6 +1,7 @@
 """Integration tests for fanned-out jobs: ``stages.extract.fan_out`` and ``BatchJob`` with an id source."""
 
 import asyncio
+import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -29,6 +30,7 @@ from pipeline.db.raw import RawPage
 from pipeline.errors import (
     AuthBlocked,
     ClientErrorUnhandled,
+    NoRecord,
     PermanentError,
     RateLimited,
     TransientError,
@@ -91,6 +93,38 @@ LIVES = EndpointSpec(
     paginator=NoPaging(),
     records_at=("data", "lives"),
     id_param=IdParam(place=IdPlace.BODY, name="live_ids", batch=2),
+)
+LIVES_BY_ID = EndpointSpec(
+    name="tiktok_shop.lives",
+    connector="tiktok_shop",
+    method="POST",
+    path="/live/202508/lives/details",
+    paginator=NoPaging(),
+    records_at=("data", "lives"),
+    id_param=IdParam(place=IdPlace.BODY, name="live_ids", batch=3, id_at=("id",)),
+)
+UNSIZED_MINUTES = EndpointSpec(
+    name="tiktok_shop.live_minutes",
+    connector="tiktok_shop",
+    method="GET",
+    path="/live/202508/lives/{live_id}/minutes",
+    paginator=CursorPaginator(
+        token_param="page_token",  # noqa: S106 - a parameter name, not a password
+        size_param=None,
+        size=None,
+        next_at=("data", "next_page_token"),
+    ),
+    records_at=("data", "minutes"),
+    id_param=IdParam(place=IdPlace.PATH, name="live_id", inject="live_id"),
+)
+REPORT = EndpointSpec(
+    name="tiktok_shop.gmv_max_report",
+    connector="tiktok_shop",
+    method="GET",
+    path="/open_api/v1.3/gmv_max/report/get/",
+    paginator=NoPaging(),
+    records_at=("data", "list"),
+    id_param=IdParam(place=IdPlace.QUERY, name="filtering", batch=2, encoding="json", wrap=("campaign_ids",)),
 )
 LIVE_IDS = FromQuery(
     "SELECT live_id FROM t_fan.live_source WHERE source_id = %(source_id)s "
@@ -178,6 +212,41 @@ class Lives(BatchJob[Live]):
 
     name = "lives"
     spec = LIVES
+    window = "update"
+    partition = "day"
+    validation = Validation(model=Live)
+    id_source = LIVE_IDS
+    concurrency = 1
+
+
+class LivesById(BatchJob[Live]):
+    """Fetch the day's LIVEs' totals, three LIVEs a call, each record read for the id it is for."""
+
+    name = "lives"
+    spec = LIVES_BY_ID
+    window = "update"
+    partition = "day"
+    validation = Validation(model=Live)
+    id_source = LIVE_IDS
+    concurrency = 1
+
+
+class UnsizedMinutes(BatchJob[Minute]):
+    """Fetch each of the day's LIVEs' per-minute rows from an endpoint that takes no page size."""
+
+    name = "live_minutes"
+    spec = UNSIZED_MINUTES
+    window = "update"
+    partition = "day"
+    validation = Validation(model=Minute)
+    id_source = LIVE_IDS
+
+
+class Reports(BatchJob[Live]):
+    """Fetch the day's campaigns' totals from a GET report, two campaign ids a call in a JSON filter."""
+
+    name = "campaign_report"
+    spec = REPORT
     window = "update"
     partition = "day"
     validation = Validation(model=Live)
@@ -762,3 +831,108 @@ async def test_raw_page_refuses_a_null_or_nested_id_and_an_empty_error_class(
                 "ids, error_class) VALUES (1, 0, 'c', 'e', now(), '{}', '\\x00', %s::text[], %s)",
                 (ids, error_class),
             )
+
+
+async def test_a_no_record_answer_or_an_empty_object_loads_the_list_row(pool: Pool, instruments: Instruments) -> None:
+    """Check a call answered with NoRecord lands an empty page, and it and a data of {} both keep the list row."""
+    search = [[row("p1"), row("p2", "FREEZE"), row("p3", "DELETED")]]
+    details: dict[str, dict[str, Any] | Exception] = {
+        "p1": product("p1", "One"),
+        "p2": NoRecord("product frozen"),
+        "p3": {"code": 0, "data": {}},
+    }
+    task = await run(pool, Products, FakeClient(products(search, details)), instruments)
+    assert await rows(pool, "SELECT product_id, status, title FROM t_fan.product ORDER BY product_id") == [
+        ("p1", "ACTIVATE", "One"),
+        ("p2", "FREEZE", None),
+        ("p3", "DELETED", None),
+    ]
+    landed = await pages(pool, task.id)
+    assert [(p.ids, p.payload, p.error_class) for p in landed[1:]] == [
+        (("p1",), product("p1", "One"), None),
+        (("p2",), {}, None),
+        (("p3",), {"code": 0, "data": {}}, None),
+    ]
+    assert await rows(pool, "SELECT count(*) FROM quarantine.row") == [(0,)]
+
+
+async def test_a_no_record_answer_on_a_later_page_is_held_as_detail_failed(
+    pool: Pool, instruments: Instruments
+) -> None:
+    """Check NoRecord after a call's first page fails the call, held as detail_failed, while the others load."""
+    await lives(pool, (SOURCE, "L1", NOON), (SOURCE, "L2", NOON))
+    paged = minutes({"L1": [[(1, 10), (2, 20)], [(3, 30)]], "L2": [[(1, 5)]]})
+
+    def reply(request: ConnectorRequest) -> dict[str, Any] | Exception:
+        later = request.path.split("/")[-2] == "L1" and "page_token" in request.query
+        return NoRecord("room gone") if later else paged(request)
+
+    await run(pool, Minutes, FakeClient(reply), instruments)
+    assert await rows(pool, "SELECT live_id, minute FROM t_fan.minute") == [("L2", 1)]
+    held = await rows(pool, "SELECT payload, failures->0->>'rule' FROM quarantine.row")
+    assert held == [({"id": "L1"}, "detail_failed")]
+
+
+async def test_query_ids_are_sent_in_json_batches_inside_their_filter(pool: Pool, instruments: Instruments) -> None:
+    """Check a GET's query ids go in batches as filtering={"campaign_ids":[...]}, each page under its call's ids."""
+    await lives(pool, (SOURCE, "c", NOON), (SOURCE, "a", NOON), (SOURCE, "b", NOON))
+
+    def reply(request: ConnectorRequest) -> dict[str, Any]:
+        found = json.loads(request.query["filtering"])["campaign_ids"]
+        return {"code": 0, "data": {"list": [{"id": i, "gmv": ord(i)} for i in found]}}
+
+    client = FakeClient(reply)
+    task = await run(pool, Reports, client, instruments)
+    assert [r.query for r in client.requests] == [
+        {"filtering": '{"campaign_ids":["a","b"]}'},
+        {"filtering": '{"campaign_ids":["c"]}'},
+    ]
+    assert [p.ids for p in await pages(pool, task.id)] == [("a", "b"), ("c",)]
+    assert await rows(pool, "SELECT live_id, gmv FROM t_fan.live ORDER BY live_id") == [("a", 97), ("b", 98), ("c", 99)]
+
+
+async def test_an_endpoint_without_a_page_size_is_paged_by_its_token_alone(
+    pool: Pool, instruments: Instruments
+) -> None:
+    """Check a cursor paginator with no size_param sends no page size, only the token after the first page."""
+    await lives(pool, (SOURCE, "L1", NOON))
+    client = FakeClient(minutes({"L1": [[(1, 10), (2, 20)], [(3, 30)]]}))
+    await run(pool, UnsizedMinutes, client, instruments)
+    assert [r.query for r in client.requests] == [{}, {"page_token": "1"}]
+    assert await rows(pool, "SELECT live_id, minute, viewers FROM t_fan.minute ORDER BY minute") == [
+        ("L1", 1, 10),
+        ("L1", 2, 20),
+        ("L1", 3, 30),
+    ]
+
+
+@pytest.mark.parametrize(("job", "held"), [(LivesById, 1), (Lives, 0)], ids=["id_at", "no id_at"])
+async def test_an_id_a_batch_call_leaves_out_is_held_as_detail_failed_with_id_at(
+    pool: Pool, instruments: Instruments, job: type[BatchJob[Live]], held: int
+) -> None:
+    """Check a batch of three ids answered with two records loads both and, with id_at, holds the third.
+
+    Without id_at the left-out id is not noticed: nothing is held for it.
+    """
+    await lives(pool, (SOURCE, "a", NOON), (SOURCE, "b", NOON), (SOURCE, "c", NOON))
+
+    def reply(request: ConnectorRequest) -> dict[str, Any]:
+        assert request.body is not None
+        return {"code": 0, "data": {"lives": [{"id": i, "gmv": ord(i)} for i in request.body["live_ids"] if i != "b"]}}
+
+    await run(pool, job, FakeClient(reply), instruments)
+    assert await rows(pool, "SELECT live_id FROM t_fan.live ORDER BY live_id") == [("a",), ("c",)]
+    expected = [
+        (
+            0,
+            1,
+            '["b"]',
+            {"id": "b"},
+            [{"rule": "detail_failed", "version": 1, "message": "no record returned for the id", "until": None}],
+        )
+    ]
+    assert (
+        await rows(pool, "SELECT raw_page_no, raw_index, group_key, payload, failures FROM quarantine.row")
+        == expected[:held]
+    )
+    assert await rows(pool, "SELECT state, rows_rejected FROM control.task") == [("succeeded", held)]

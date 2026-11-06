@@ -13,13 +13,16 @@ import logging
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from itertools import groupby
 from typing import Any, Final
+from uuid import UUID
 
 from pydantic import BaseModel, ValidationError
 
 from pipeline.checks.checks import (
     DETAIL_RULE,
+    RESHAPE_RULE,
     SCHEMA_RULE,
     BatchPolicy,
     CheckContext,
@@ -28,13 +31,13 @@ from pipeline.checks.checks import (
     Severity,
     Validation,
 )
-from pipeline.checks.record import Keyed, Record, key_of
-from pipeline.connectors.fanout import FromList, IdSource
-from pipeline.connectors.spec import EndpointSpec
+from pipeline.checks.record import Keyed, Part, Record, key_of, task_day_fields
+from pipeline.connectors.fanout import FromList, IdSource, id_text
+from pipeline.connectors.spec import EndpointSpec, KeyPath, value_at
 from pipeline.db import raw
 from pipeline.db.control import ClaimedTask
 from pipeline.db.lookup import known_values
-from pipeline.db.pool import Pool
+from pipeline.db.pool import Pool, storable_text
 from pipeline.db.quarantine import Failure, HeldRow
 from pipeline.db.raw import RawPage
 from pipeline.errors import QualityFailed
@@ -48,6 +51,8 @@ _EXAMPLES: Final = 5
 #: The group key ``_fanned_records`` gives a page with no ``ids``, typed as a call's ids; never reached, since it
 #: groups only pages with ``ids``, but it narrows the key to ``tuple[str, ...]``.
 _NO_IDS: Final[tuple[str, ...]] = ()
+#: The message of the ``DETAIL_RULE`` failure of an id a successful call returned no record for (``IdParam.id_at``).
+_NOT_RETURNED: Final = "no record returned for the id"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -63,11 +68,11 @@ class Validated[R: Record]:
             hold it back after Validate.
         held: Rows held back, one per record that failed to parse, parsed with a key that could not be read, shares
             its key with a record that failed to parse, or failed a non-``WARN`` check, and one per id whose
-            fanned-out call failed.
+            fanned-out call failed or, with ``IdParam.id_at``, returned no record for it.
         records: Number of records landed, before deduplication.
         deduplicated: Number of records dropped by ``_dedupe``.
         judged_total: The total ``judge`` was given: records landed, less those ``_dedupe`` dropped and the held
-            copies of a failed key after the first, plus the ids whose fanned-out call failed.
+            copies of a failed key after the first, plus the ids held as ``detail_failed``.
         judged: The held rows ``judge`` was given; Load gives them to ``judge`` again with its own held records.
 
     """
@@ -77,46 +82,66 @@ class Validated[R: Record]:
     held: tuple[HeldRow, ...]  # records held back, for Load to write with quarantine.hold
     records: int  # records on the task's pages, duplicates included
     deduplicated: int  # earlier copies dropped because a later page had the same key
-    judged_total: int  # records landed less dropped copies and repeats of failed keys, plus failed ids
+    judged_total: int  # records landed less dropped copies and repeats of failed keys, plus detail_failed ids
     judged: tuple[HeldRow, ...]  # the held rows judge was given; Load judges them again with its own
 
 
 @dataclass(frozen=True, slots=True)
 class _Landed:
-    """One record as landed: its page, its position in the page, and its raw JSON value.
+    """One record as landed: its page, its position in the page, its raw JSON value, and the value parsed.
 
     Frozen and slotted. No field is checked.
 
     Attributes:
         page_no: ``page_no`` of the ``RawPage`` the record came from.
         index: Position of the record in that page's records list.
-        payload: The record as decoded from JSON; any type.
+        payload: The record as decoded from JSON, with a call's id and the ``TaskDay`` fields written in; any type.
+            A held row stores it.
+        shaped: The model's ``reshape`` of ``payload``, or ``None`` when it was not reshaped. Defaults to ``None``.
 
     """
 
     page_no: int
     index: int  # position in the page's records
     payload: Any  # the record as landed
+    shaped: dict[str, Any] | None = None  # the reshaped record; None: not reshaped
+
+    @property
+    def record(self) -> Any:
+        """Return the value Validate parses and reads the key from: ``shaped``, or ``payload`` when not reshaped.
+
+        Preconditions:
+            None.
+
+        Returns:
+            ``shaped`` when it is not ``None``, else ``payload``.
+
+        Raises:
+            Nothing.
+
+        """
+        return self.payload if self.shaped is None else self.shaped
 
 
 @dataclass(frozen=True, slots=True)
 class _Failed:
-    """One id whose fanned-out call failed: where its marker landed and what the held row carries.
+    """One id held as ``detail_failed``: where its call landed and what the held row carries.
 
-    Frozen and slotted. No field is checked.
+    The id's call failed (it landed a marker page), or succeeded but returned no record carrying the id at
+    ``IdParam.id_at``. Frozen and slotted. No field is checked.
 
     Attributes:
-        page_no: ``page_no`` of the marker page.
-        index: The id's position in the marker's ``ids``.
+        page_no: ``page_no`` of the marker page, or of the successful call's first page.
+        index: The id's position in that page's ``ids``.
         payload: The id's list row, or ``{"id": <id>}`` when it has none (a query's id).
-        message: ``"<error class>: <message>"``, from the marker.
+        message: ``"<error class>: <message>"``, from the marker; or ``_NOT_RETURNED``.
 
     """
 
     page_no: int
     index: int  # position in the call's ids
     payload: dict[str, Any]  # the list row, or {"id": ...}
-    message: str
+    message: str  # the marker's error, or _NOT_RETURNED
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +153,7 @@ class _Parsed[R: Record]:
     Attributes:
         landed: Where the record came from and its raw value.
         record: The parsed record.
-        key: The record's key, ``key_of`` of its model and ``landed.payload``.
+        key: The record's key, ``key_of`` of its model and ``landed.record``.
 
     """
 
@@ -150,26 +175,41 @@ async def validate[R: Record](
     """Parse, deduplicate and check the records a task landed, and split them into accepted and held.
 
     Reads every page of ``task`` from ``raw.page`` on one pooled connection and flattens them into records with
-    ``_records``, or, for a fanned-out job, with ``_fanned_records``, which also gives the ids whose call failed.
-    ``_parse_records`` parses them, holds every record that failed to parse and every parsed copy of a key that failed
-    to parse, and returns the other parsed records. Then, once: ``_dedupe`` drops earlier copies of a
-    key among those records, ``_fetch_lookups`` makes one ``known_values`` call per ``Lookup`` over the kept
-    records, and each kept record is checked. Failures with severity ``WARN`` are only reported, with the record's
-    key; any other failure (error or wait) holds the record, and a record with no such failure is accepted. Then
-    each failed id is held, at its marker's page and its position in the marker's ``ids``, with one ``DETAIL_RULE``
-    failure carrying ``model.record_version`` and the marker's error, and with ``_group_key`` of its payload's key as
-    its group key, or none when ``_payload_key`` cannot read that key; every such row is counted for the batch
-    policy. Then ``_report`` and ``judge`` run, and the result is returned.
+    ``_records``, or, for a fanned-out job, with ``_fanned_records``, which also gives the ids whose call failed, or,
+    with ``IdParam.id_at``, that a successful call returned no record for, and writes a call's id into its records
+    (``IdParam.inject``). When the model has ``TaskDay`` fields, ``_with_task_day``
+    then writes the task's day (``_day_key`` of its ``partition_key``) into each record's fields of those names. When
+    the model declares ``reshape``, ``_reshaped`` then applies it to each record: in all, a record is prepared in the
+    order id injection, ``TaskDay``, ``reshape``, then key read and parse. A record whose ``reshape`` fails is held at
+    once with one ``RESHAPE_RULE`` failure carrying ``model.record_version`` and no group key (its key is read only from
+    the reshaped record), and counted for the batch policy on its own. ``_parse_records`` parses the others, holds every
+    record that failed to parse and every parsed copy of a key that failed to parse, and returns the other parsed
+    records. Then, once: ``_dedupe`` drops earlier copies of a key among those records, ``_fetch_lookups`` makes one
+    ``known_values`` call per ``Lookup`` over the kept records (a lookup on a child's rows over their rows; one with
+    ``source_column`` set over the task's source's rows only), and each
+    kept record is checked: ``_drop_rows`` first removes the child rows each ``Severity.DROP`` lookup does not find,
+    then ``_check`` runs the other checks on what is left, which is the record accepted, so Transform sees only the
+    kept rows. An accepted record's dropped rows are counted and logged by ``_report_drops``; a held record's are not,
+    and its held row stores its payload as landed, every row included. Failures with severity
+    ``WARN`` are only reported, with the record's key; any other failure (error or wait) holds the record, and a record
+    with no such failure is accepted. Then each failed id is held, at its marker's page (or its successful call's first
+    page) and its position in that page's ``ids``, with one ``DETAIL_RULE`` failure carrying ``model.record_version``
+    and the marker's error (or ``"no record returned for the id"``), and with ``_group_key`` of its payload's key as
+    its group key, or none when ``_payload_key`` cannot read that key; every such row is counted for the batch policy.
+    Then ``_report`` and ``judge`` run, and the result is returned.
 
     A record that fails both an error check and a wait check is held with both failures and counts as an error,
     because ``_waiting`` needs every failure to have an ``until`` job. Every ``SCHEMA_RULE`` failure (a parse
-    failure, an unreadable key, or a parsed copy of a key that failed to parse) and every ``DETAIL_RULE`` failure
-    counts as an ``ERROR`` failure in ``_report``.
+    failure, an unreadable key, or a parsed copy of a key that failed to parse), every ``RESHAPE_RULE`` failure and
+    every ``DETAIL_RULE`` failure counts as an ``ERROR`` failure in ``_report``.
 
-    ``judge`` is given the rows ``_parse_records`` counts (one per failed key and one per record whose key could not
-    be read) and every held kept record, and a total of the records landed less those ``_dedupe`` dropped and the held
-    rows it does not count, plus the ids whose call failed. So a key fetched three times counts as one record and one
-    held row whether it fails to parse or fails an error check.
+    Without ``IdParam.id_at``, an id that a successful call leaves out is not noticed: nothing is held or counted for
+    it.
+
+    ``judge`` is given the reshape failures, the rows ``_parse_records`` counts (one per failed key and one per record
+    whose key could not be read) and every held kept record, and a total of the records landed less those ``_dedupe``
+    dropped and the held rows it does not count, plus the ids held as ``detail_failed``. So a key fetched three times
+    counts as one record and one held row whether it fails to parse or fails an error check.
 
     Preconditions:
         None.
@@ -185,11 +225,12 @@ async def validate[R: Record](
         id_source: The job's id source, or ``None`` for a job that is not fanned out. Defaults to ``None``.
 
     Returns:
-        A ``Validated`` with the accepted records and their keys, and where each landed; every held row, parse
-        failures and parsed records with an unreadable key first in landed order, then the parsed copies of
-        failed keys in landed order, then check failures in kept order, then the failed ids in page order;
-        ``records``, the number of records landed before deduplication; ``deduplicated``, the number of records
-        dropped by ``_dedupe``; and ``judged_total`` and ``judged``, the total and the held rows ``judge`` was given.
+        A ``Validated`` with the accepted records and their keys, and where each landed; every held row, reshape
+        failures first in landed order, then parse failures and parsed records with an unreadable key in landed order,
+        then the parsed copies of failed keys in landed order, then check failures in kept order, then the failed ids in
+        page order; ``records``, the number of records landed before deduplication; ``deduplicated``, the number of
+        records dropped by ``_dedupe``; and ``judged_total`` and ``judged``, the total and the held rows ``judge`` was
+        given.
 
     Raises:
         QualityFailed: From ``judge``, when the held rows that are not waiting, each failed key counted once, break
@@ -203,7 +244,9 @@ async def validate[R: Record](
             ``UndefinedTable`` for a lookup table that does not exist).
         TypeError: From ``raw.read_pages``, when building a ``RawPage`` from a row whose payload is not an object;
             or from ``_lookup_values``, when a lookup's ``values`` returns a bare ``str``.
-        ValueError: From ``raw.read_pages``, when building a ``RawPage`` from a row whose ``page_no`` is negative.
+        ValueError: From ``raw.read_pages``, when building a ``RawPage`` from a row whose ``page_no`` is negative; or
+            from ``_day_key``, when the model has a ``TaskDay`` field and ``task.partition_key`` is not a
+            ``YYYY-MM-DD`` day (``BatchJob`` gives such a model only a ``"day"`` partition, whose key it has read).
         Exception: Any exception a rule's predicate or a lookup's ``values`` raises propagates unchanged; so does
             any exception ``_parse`` lets through ``_parse_records``.
 
@@ -216,16 +259,25 @@ async def validate[R: Record](
         landed = _records(pages, spec)
     else:
         landed, detail = _fanned_records(pages, spec, id_source)
-    clean, held, counted, new_fields = _parse_records(task, validation.model, landed, instruments)
+    days = task_day_fields(validation.model)
+    if days:
+        landed = _with_task_day(landed, days, _day_key(task.partition_key))
+    shaped, unshaped = _reshaped(validation.model, landed)
+    clean, held, counted, new_fields = _parse_records(task, validation.model, shaped, instruments)
+    version = validation.model.record_version
+    broken = [_held(task, item, None, (Failure(RESHAPE_RULE, version, message),)) for item, message in unshaped]
+    held, counted = [*broken, *held], [*broken, *counted]  # each reshape failure counts on its own
     failed = [(Severity.ERROR, failure) for row in held for failure in row.failures]  # schema failures, held order
     kept, dropped = _dedupe(clean)
-    known = await _fetch_lookups(pool, validation.checks, [p.record for p in kept])
+    known = await _fetch_lookups(pool, validation.checks, [p.record for p in kept], task.source_id)
     accepted: list[Keyed[R]] = []
     origins: list[_Landed] = []  # where each accepted record landed
     warned: list[tuple[Failure, tuple[object, ...]]] = []
     warned_rows = 0
+    removed: list[tuple[Lookup[Any], tuple[object, ...], int]] = []  # an accepted record's rows a lookup dropped
     for entry in kept:
-        failures = _check(entry.record, ctx, validation.checks, known)
+        record, cut = _drop_rows(entry.record, validation.checks, known)
+        failures = _check(record, ctx, validation.checks, known)
         failed.extend(failures)
         kept_failures = tuple(failure for severity, failure in failures if severity is not Severity.WARN)
         warnings = [failure for severity, failure in failures if severity is Severity.WARN]
@@ -234,10 +286,11 @@ async def validate[R: Record](
             held.append(_held(task, entry.landed, _group_key(entry.key), kept_failures))
             counted.append(held[-1])
         else:
-            accepted.append(Keyed(entry.record, entry.key))
+            accepted.append(Keyed(record, entry.key))
             origins.append(entry.landed)
             warned_rows += bool(warnings)
-    for item in detail:  # a failed call's ids: each held once and counted, like a record that failed to parse
+            removed.extend((lookup, entry.key, count) for lookup, count in cut)
+    for item in detail:  # a failed call's ids, or ones a call left out: each held and counted, like a parse failure
         failure = Failure(DETAIL_RULE, validation.model.record_version, item.message)
         failed.append((Severity.ERROR, failure))
         key = _payload_key(validation.model, item.payload)
@@ -246,6 +299,7 @@ async def validate[R: Record](
         held.append(row)
         counted.append(row)
     _report(task, instruments, held, warned, warned_rows, failed, dropped, new_fields)
+    _report_drops(task, instruments, removed)
     repeats = len(held) - len(counted)  # the other copies of failed keys, counted once like deduplicated ones
     judged_total = len(landed) - len(dropped) - repeats + len(detail)
     judge(validation.policy, judged_total, counted)
@@ -294,7 +348,7 @@ def _records(pages: Iterable[RawPage], spec: EndpointSpec) -> list[_Landed]:
 def _fanned_records(
     pages: Sequence[RawPage], spec: EndpointSpec, source: IdSource
 ) -> tuple[list[_Landed], list[_Failed]]:
-    """Flatten a fanned-out task's pages into landed records, and list the ids whose call failed.
+    """Flatten a fanned-out task's pages into landed records, and list the ids whose call failed or was left out.
 
     For a ``FromList`` source, the pages with no ``ids`` are its list pages: their records (as ``_records`` reads them,
     with ``source.spec``) are not records of the task but the list rows, each under its ``FromList.id_of`` id, the
@@ -305,7 +359,10 @@ def _fanned_records(
     its other pages, if any, are not read. Any other call's pages give their records as ``_records`` reads them with
     ``spec``. With ``keep_list_row``, a call that gives no record lands the id's list row, at its list page and
     position, as the record. When ``spec.id_param.inject`` is set, every record a call gives, a kept list row
-    included, is passed through ``_inject`` with the call's one id, so every record carries it.
+    included, is passed through ``_inject`` with the call's one id, so every record carries it. When
+    ``spec.id_param.id_at`` is set, each id of a call with no marker that none of its records carries, by ``_returned``,
+    gives one ``_Failed``, at the call's first page and the id's position, with the message ``_NOT_RETURNED``; a kept
+    list row counts as the record returned for its id. Without ``id_at``, an id a call leaves out gives nothing.
 
     Preconditions:
         ``pages`` are in ``page_no`` order, as ``raw.read_pages`` gives them, and consecutive calls have different
@@ -320,7 +377,8 @@ def _fanned_records(
 
     Returns:
         ``(landed, failed)``: the records in page order, then record order, each kept list row after its call's
-        pages; and the failed ids in page order, then id order. Both are empty when there are no pages with ``ids``.
+        pages; and the failed and left-out ids in page order, then id order. Both are empty when there are no pages
+        with ``ids``.
 
     Raises:
         ClientErrorUnhandled: From ``_records``, for a list or call page whose records it cannot read (a page other
@@ -334,6 +392,7 @@ def _fanned_records(
             rows[source.id_of(row.payload)] = row
     keep = isinstance(source, FromList) and source.keep_list_row
     inject = None if spec.id_param is None else spec.id_param.inject
+    id_at = None if spec.id_param is None else spec.id_param.id_at
     landed: list[_Landed] = []
     failed: list[_Failed] = []
     for ids, group in groupby((page for page in pages if page.ids is not None), key=lambda page: page.ids or _NO_IDS):
@@ -346,10 +405,50 @@ def _fanned_records(
                 failed.append(_Failed(marker.page_no, index, payload, message))
             continue
         found = _records(call, spec)
+        returned = set() if id_at is None else _returned(found, id_at)
         if keep and not found and ids[0] in rows:
             found = [rows[ids[0]]]
+            returned.add(ids[0])  # a kept list row is the id's record
+        if id_at is not None:
+            for index, one in enumerate(ids):
+                if one not in returned:
+                    payload = rows[one].payload if one in rows else {"id": one}
+                    failed.append(_Failed(call[0].page_no, index, payload, _NOT_RETURNED))
         landed.extend(found if inject is None else [_inject(item, inject, ids[0]) for item in found])
     return landed, failed
+
+
+def _returned(found: Iterable[_Landed], id_at: KeyPath) -> set[str]:
+    """Return the ids a call's records carry at ``id_at``, each written as ``id_text`` writes it.
+
+    A record that is not a ``Mapping``, has nothing at ``id_at``, or has a value there that ``id_text`` refuses carries
+    no id; it is still landed, and fails to parse or loads as any record would.
+
+    Preconditions:
+        None.
+
+    Args:
+        found: The records of one call, as landed.
+        id_at: ``IdParam.id_at``: where each record holds its id.
+
+    Returns:
+        The ids found; empty when no record carries one.
+
+    Raises:
+        Nothing.
+
+    """
+    ids: set[str] = set()
+    for item in found:
+        if not isinstance(item.payload, Mapping):
+            continue
+        try:
+            text = id_text(value_at(item.payload, id_at))
+        except KeyError:  # nothing at id_at: the record carries no id
+            continue
+        if text is not None:
+            ids.add(text)
+    return ids
 
 
 def _inject(item: _Landed, field: str, value: str) -> _Landed:
@@ -375,6 +474,101 @@ def _inject(item: _Landed, field: str, value: str) -> _Landed:
     if not isinstance(item.payload, Mapping):
         return item
     return _Landed(item.page_no, item.index, {**item.payload, field: value})
+
+
+def _day_key(partition_key: str) -> int:
+    """Return a ``"day"`` partition's key as a ``YYYYMMDD`` int, the value a ``TaskDay`` field is filled with.
+
+    Preconditions:
+        None.
+
+    Args:
+        partition_key: The task's ``partition_key``.
+
+    Returns:
+        ``year * 10000 + month * 100 + day`` of the date the key names.
+
+    Raises:
+        ValueError: ``partition_key`` is not a date written ``YYYY-MM-DD`` (``date.fromisoformat`` also reads forms
+            such as ``"20240101"``, which the round-trip check refuses).
+
+    """
+    day = date.fromisoformat(partition_key)
+    if day.isoformat() != partition_key:
+        raise ValueError(f"partition key {partition_key!r} is not a YYYY-MM-DD day, so TaskDay has no day to fill")
+    return day.year * 10000 + day.month * 100 + day.day
+
+
+def _with_task_day(landed: Sequence[_Landed], fields: Sequence[str], value: int) -> list[_Landed]:
+    """Return landed records with the task's day written at each ``TaskDay`` field, over any value already there.
+
+    Preconditions:
+        None.
+
+    Args:
+        landed: The landed records, a call's id already injected.
+        fields: The model's ``TaskDay`` field names, from ``task_day_fields``.
+        value: The task's day as a ``YYYYMMDD`` int, from ``_day_key``.
+
+    Returns:
+        One ``_Landed`` per record, at the same page and position, whose payload is a copy of a ``Mapping`` payload
+        with every field in ``fields`` set to ``value``; a record whose payload is not a ``Mapping`` is returned
+        unchanged, and then fails to parse. The pages' payloads are not changed.
+
+    Raises:
+        Nothing.
+
+    """
+    filled = dict.fromkeys(fields, value)
+    return [
+        _Landed(item.page_no, item.index, {**item.payload, **filled}) if isinstance(item.payload, Mapping) else item
+        for item in landed
+    ]
+
+
+def _reshaped(model: type[Record], landed: Sequence[_Landed]) -> tuple[list[_Landed], list[tuple[_Landed, str]]]:
+    """Apply a model's ``reshape`` to each landed record, and list the records it failed on.
+
+    A record whose payload is a ``Mapping`` is passed to ``model.reshape``; its result, when a ``Mapping``, is copied
+    into a ``dict`` and set as the record's ``shaped`` value. A payload that is not a ``Mapping`` is not passed and is
+    kept unshaped, so it fails to parse as it would without a reshape. With no ``reshape`` every record is kept as it
+    is.
+
+    Preconditions:
+        ``model.reshape``, when set, does not change its argument, which is the page's own record object.
+
+    Args:
+        model: The record model.
+        landed: The landed records, a call's id and the ``TaskDay`` fields already written in.
+
+    Returns:
+        ``(kept, failed)``: the records to parse, in landed order; and each record ``reshape`` raised on, or returned
+        something other than a ``Mapping`` for, with the message ``"<exception class>: <message>"`` or ``"reshape
+        returned a <type>, not a mapping"``, made storable by ``storable_text``, in landed order.
+
+    Raises:
+        Nothing: every ``Exception`` from ``reshape`` is caught and its record listed as failed.
+
+    """
+    shape = getattr(model, "reshape", None)
+    if shape is None:
+        return list(landed), []
+    kept: list[_Landed] = []
+    failed: list[tuple[_Landed, str]] = []
+    for item in landed:
+        if not isinstance(item.payload, Mapping):  # fails to parse, as it would with no reshape
+            kept.append(item)
+            continue
+        try:
+            result = shape(item.payload)
+        except Exception as err:  # any error of the function is the record's failure, held under RESHAPE_RULE
+            failed.append((item, storable_text(f"{type(err).__name__}: {err}")))
+            continue
+        if not isinstance(result, Mapping):
+            failed.append((item, f"reshape returned a {type(result).__name__}, not a mapping"))
+            continue
+        kept.append(_Landed(item.page_no, item.index, item.payload, dict(result)))
+    return kept, failed
 
 
 def _parse_records[R: Record](
@@ -428,7 +622,7 @@ def _parse_records[R: Record](
     for item in landed:
         outcome = _parse(model, item)
         if isinstance(outcome, Failure):
-            key = _payload_key(model, item.payload)
+            key = _payload_key(model, item.record)
             first = key is None or key not in unparsed_keys  # an unreadable key counts on its own
             if key is None:
                 group_key = None
@@ -438,7 +632,7 @@ def _parse_records[R: Record](
             held.append(_held(task, item, group_key, (outcome,)))
             if first:
                 counted.append(held[-1])
-        elif (key := _payload_key(model, item.payload)) is None:  # parsed, but no key to load or dedupe it by
+        elif (key := _payload_key(model, item.record)) is None:  # parsed, but no key to load or dedupe it by
             unreadable += 1
             held.append(_held(task, item, None, (unkeyed,)))
             counted.append(held[-1])
@@ -462,9 +656,9 @@ def _parse_records[R: Record](
 def _parse[R: Record](model: type[R], item: _Landed) -> R | Failure:
     """Parse one landed record into ``model``, or describe why it does not parse.
 
-    Calls ``model.model_validate(item.payload)``, in Python mode on the JSON-decoded payload; ``Record`` refuses a
-    model whose config sets ``strict=True``, which would refuse the JSON string forms of dates, UUIDs and decimals.
-    If that raises ``ValidationError``, the errors are joined as
+    Calls ``model.model_validate(item.record)`` (the reshaped record, or the payload), in Python mode on the
+    JSON-decoded value; ``Record`` refuses a model whose config sets ``strict=True``, which would refuse the JSON
+    string forms of dates, UUIDs and decimals. If that raises ``ValidationError``, the errors are joined as
     ``"loc: msg"`` with ``"; "``, using ``"(record)"`` for an empty location, into a ``SCHEMA_RULE`` failure carrying
     ``model.record_version``.
 
@@ -486,7 +680,7 @@ def _parse[R: Record](model: type[R], item: _Landed) -> R | Failure:
 
     """
     try:
-        return model.model_validate(item.payload)
+        return model.model_validate(item.record)
     except ValidationError as err:
         problems = "; ".join(
             f"{'.'.join(str(part) for part in error['loc']) or '(record)'}: {error['msg']}" for error in err.errors()
@@ -560,13 +754,15 @@ def _dedupe[R: Record](parsed: Sequence[_Parsed[R]]) -> tuple[list[_Parsed[R]], 
 
 
 async def _fetch_lookups[R: Record](
-    pool: Pool, checks: Iterable[Rule[R] | Lookup[R]], records: Sequence[R]
+    pool: Pool, checks: Iterable[Rule[R] | Lookup[R] | Lookup[Any]], records: Sequence[R], source_id: UUID
 ) -> dict[str, frozenset[str]]:
     """Fetch, for each ``Lookup`` in ``checks``, which of the records' values exist in its table.
 
     Returns ``{}`` without a connection when there are no lookups or no records. Otherwise it opens one pooled
     connection and makes one ``known_values`` call per lookup, in check order, on the union of ``lookup.values``
-    over all records.
+    over all records, or, for a lookup with ``rows`` set, over every row of each record's ``rows`` field. A lookup
+    with ``source_column`` set passes ``(source_column, source_id)`` as ``source``, so only the task's source's rows
+    count.
 
     Preconditions:
         Lookup names are unique, as ``Validation.__post_init__`` guarantees.
@@ -575,6 +771,7 @@ async def _fetch_lookups[R: Record](
         pool: Pool to take the connection from.
         checks: The rules and lookups; rules are ignored.
         records: The records whose values are looked up.
+        source_id: The task's source, which a lookup with ``source_column`` set restricts its rows to.
 
     Returns:
         Lookup name to the subset of its wanted values that exist, as text.
@@ -593,20 +790,87 @@ async def _fetch_lookups[R: Record](
     known: dict[str, frozenset[str]] = {}
     async with pool.connection() as conn:
         for lookup in lookups:
-            wanted = {value for record in records for value in _lookup_values(lookup, record)}
-            known[lookup.name] = await known_values(conn, lookup.table, lookup.column, wanted)
+            subjects = [row for record in records for row in _subjects(lookup, record)]
+            wanted = {value for subject in subjects for value in _lookup_values(lookup, subject)}
+            source = None if lookup.source_column is None else (lookup.source_column, source_id)
+            known[lookup.name] = await known_values(conn, lookup.table, lookup.column, wanted, source=source)
     return known
 
 
-def _check[R: Record](
-    record: R, ctx: CheckContext, checks: Iterable[Rule[R] | Lookup[R]], known: Mapping[str, frozenset[str]]
-) -> list[tuple[Severity, Failure]]:
-    """Run every check on one record and return the failures with their severities.
+def _subjects(lookup: Lookup[Any], record: Record) -> Sequence[Any]:
+    """Return what a lookup's ``values`` is called with for one record: the record, or the rows of its ``rows`` field.
 
-    The type test is ``isinstance(check, Rule)``. A rule fails when its predicate returns false; a lookup fails when
-    any of its values is missing from ``known[check.name]`` (an absent name counts as empty), with message
-    ``"not in <table>.<column>: <missing values>"``. Each failure is built as ``Failure(name, version, message,
-    until)`` with the check's ``until``.
+    Preconditions:
+        ``lookup.rows``, when set, names a list ``Rows`` field of the record's model, as ``Validation`` checks.
+
+    Args:
+        lookup: The lookup.
+        record: The parsed record.
+
+    Returns:
+        ``[record]`` when ``lookup.rows`` is ``None``, else the record's list at that field.
+
+    Raises:
+        Nothing.
+
+    """
+    return [record] if lookup.rows is None else getattr(record, lookup.rows)
+
+
+def _drop_rows[R: Record](
+    record: R, checks: Iterable[Rule[R] | Lookup[R] | Lookup[Any]], known: Mapping[str, frozenset[str]]
+) -> tuple[R, list[tuple[Lookup[Any], int]]]:
+    """Remove from a record the child rows each ``Severity.DROP`` lookup finds a value missing for.
+
+    Each lookup with ``rows`` set, in check order, keeps the rows of its field whose every value is in
+    ``known[lookup.name]`` (an absent name counts as empty); when it keeps fewer, the record is replaced by a copy with
+    only the kept rows in that field (``model_copy``, which runs no validation and leaves the record's other fields and
+    its extra fields as they are). Other checks are skipped.
+
+    Preconditions:
+        Every lookup's ``rows`` names a list ``Rows`` field of ``record``'s model, as ``Validation`` checks.
+
+    Args:
+        record: The parsed record.
+        checks: The rules and lookups.
+        known: Lookup name to the values found for it, from ``_fetch_lookups``.
+
+    Returns:
+        The record, or the copy without the dropped rows, and each lookup that dropped rows with their number, in
+        check order.
+
+    Raises:
+        TypeError: From ``_lookup_values``, when a lookup's ``values`` returns a bare ``str``.
+        Exception: Any exception a lookup's ``values`` raises propagates unchanged.
+
+    """
+    cut: list[tuple[Lookup[Any], int]] = []
+    for check in checks:
+        if not isinstance(check, Lookup) or check.rows is None:
+            continue
+        found = known.get(check.name, frozenset())
+        rows = getattr(record, check.rows)
+        kept = [row for row in rows if set(_lookup_values(check, row)) <= found]
+        if len(kept) < len(rows):
+            cut.append((check, len(rows) - len(kept)))
+            record = record.model_copy(update={check.rows: kept})
+    return record, cut
+
+
+def _check[R: Record](
+    record: R,
+    ctx: CheckContext,
+    checks: Iterable[Rule[R] | Lookup[R] | Lookup[Any]],
+    known: Mapping[str, frozenset[str]],
+) -> list[tuple[Severity, Failure]]:
+    """Run every check on one record, but a lookup on a child's rows, and return the failures with their severities.
+
+    The type test is ``isinstance(check, Rule)``; a lookup with ``rows`` set is skipped, as ``_drop_rows`` runs it. A
+    rule fails when its predicate returns false; a lookup fails when any of its values is missing from
+    ``known[check.name]`` (an absent name counts as empty), with message ``"not in <table>.<column>: <missing
+    values>"``, or ``"not in <table>.<column> for this <source_column>: <missing values>"`` for a lookup with
+    ``source_column`` set. Each failure is built as ``Failure(name, version, message, until)`` with the check's
+    ``until``.
 
     Preconditions:
         None.
@@ -630,16 +894,17 @@ def _check[R: Record](
         if isinstance(check, Rule):
             if not check.check(record, ctx):
                 failures.append((check.severity, Failure(check.name, check.version, "check failed", check.until)))
-        else:
+        elif check.rows is None:
             missing = sorted(set(_lookup_values(check, record)) - known.get(check.name, frozenset()))
             if missing:
-                message = f"not in {check.table}.{check.column}: {', '.join(missing)}"
+                scope = "" if check.source_column is None else f" for this {check.source_column}"
+                message = f"not in {check.table}.{check.column}{scope}: {', '.join(missing)}"
                 failures.append((check.severity, Failure(check.name, check.version, message, check.until)))
     return failures
 
 
-def _lookup_values[R: Record](lookup: Lookup[R], record: R) -> Iterable[str]:
-    """Return a lookup's values for one record, refusing a bare ``str``.
+def _lookup_values[P: Part](lookup: Lookup[P], record: P) -> Iterable[str]:
+    """Return a lookup's values for one record, or one child row, refusing a bare ``str``.
 
     ``Lookup.values`` is typed to return ``Iterable[str]``, which a ``str`` is, so a ``values`` that returns one value
     instead of a collection of them would otherwise be looked up one character at a time.
@@ -649,7 +914,7 @@ def _lookup_values[R: Record](lookup: Lookup[R], record: R) -> Iterable[str]:
 
     Args:
         lookup: The lookup whose ``values`` is called.
-        record: The record passed to it.
+        record: The record, or for a lookup with ``rows`` set the child row, passed to it.
 
     Returns:
         What ``lookup.values(record)`` returned, unchanged.
@@ -668,12 +933,15 @@ def _lookup_values[R: Record](lookup: Lookup[R], record: R) -> Iterable[str]:
 def _held(task: ClaimedTask, item: _Landed, group_key: str | None, failures: tuple[Failure, ...]) -> HeldRow:
     """Build the held row for one landed record from the task it came from and the checks it failed.
 
-    A ``dict`` payload is stored as is, not copied; any other JSON value is wrapped as ``{"record": payload}``.
+    The record's ``payload`` is stored, as landed (a call's id and the ``TaskDay`` fields written in), never its
+    reshaped value. A ``dict`` payload is stored as is, not copied; any other JSON value is wrapped as
+    ``{"record": payload}``.
 
     Preconditions:
         ``failures`` is not empty, as ``HeldRow`` requires; ``_parse_records`` passes one schema failure and
-        ``validate`` a non-empty ``kept_failures`` or one ``DETAIL_RULE`` failure. ``item.page_no`` and
-        ``item.index`` are 0 or more, as ``RawPage``, ``enumerate`` and ``_fanned_records`` give them.
+        ``validate`` a non-empty ``kept_failures``, one ``RESHAPE_RULE`` failure or one ``DETAIL_RULE`` failure.
+        ``item.page_no`` and ``item.index`` are 0 or more, as ``RawPage``, ``enumerate`` and ``_fanned_records`` give
+        them.
 
     Args:
         task: The task that landed the record; gives the id, connector, job, source and partition.
@@ -830,6 +1098,54 @@ def judge(policy: BatchPolicy, total: int, held: Sequence[HeldRow]) -> None:
     if policy.fails(total, len(errors)):
         by_rule = Counter(failure.rule for row in errors for failure in row.failures)
         raise QualityFailed(rows_total=total, rows_quarantined=len(errors), by_rule=by_rule)
+
+
+def _report_drops(
+    task: ClaimedTask, instruments: Instruments, removed: Sequence[tuple[Lookup[Any], tuple[object, ...], int]]
+) -> None:
+    """Count and log the child rows ``Severity.DROP`` lookups removed from accepted records.
+
+    ``instruments.rows`` gets the total with ``job`` and ``stage="dropped"`` attributes, when it is not 0. One
+    warning per lookup name, in sorted order, gives the rows it dropped, its version, table and column, and up to
+    ``_EXAMPLES`` distinct record keys, each from ``_group_key``, in first-seen order; never a row's values.
+
+    Preconditions:
+        Lookup names are unique, as ``Validation`` guarantees.
+
+    Args:
+        task: Gives the id and job for the metric attributes and log lines.
+        instruments: ``rows`` is the counter added to.
+        removed: Each accepted record's dropping lookup, the record's key and the rows it dropped.
+
+    Returns:
+        None.
+
+    Raises:
+        Nothing.
+
+    """
+    total = sum(count for _, _, count in removed)
+    if not total:
+        return
+    instruments.rows.add(total, {"job": task.job, "stage": "dropped"})
+    by_name: dict[str, list[tuple[Lookup[Any], tuple[object, ...], int]]] = {}
+    for item in removed:
+        by_name.setdefault(item[0].name, []).append(item)
+    for name, items in sorted(by_name.items()):
+        lookup = items[0][0]
+        keys = ", ".join(list(dict.fromkeys(_group_key(key) for _, key, _ in items))[:_EXAMPLES])
+        rows = sum(count for _, _, count in items)
+        _log.warning(
+            "task %s %s: %d rows dropped by %s v%d, not in %s.%s, e.g. %s",
+            task.id,
+            task.job,
+            rows,
+            name,
+            lookup.version,
+            lookup.table,
+            lookup.column,
+            keys,
+        )
 
 
 def _report(
