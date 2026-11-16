@@ -53,6 +53,11 @@ ROW_GROUP_BYTES: Final = 64 * 1024 * 1024
 #: Pages fetched from Postgres per round trip.
 _FETCH_ROWS: Final = 200
 
+#: Raise the pool's 60 s ``statement_timeout`` for the archive's own transactions only: ``_PAGES`` sorts a whole
+#: (job, month) before its first row (``video_daily`` for 2026-06 took over 60 s), and ``_MARK`` updates every page of
+#: it. ``SET LOCAL`` ends with the transaction, so the connection goes back to the pool with the 60 s limit.
+_LONG_STATEMENTS: Final = "SET LOCAL statement_timeout = '30min'"
+
 #: zstd level for every column; the archive is written once and read rarely.
 _ZSTD_LEVEL: Final = 9
 
@@ -330,6 +335,7 @@ async def _write(pool: Pool, month_key: MonthKey, path: Path) -> tuple[list[int]
         buffered: list[tuple[Any, ...]] = []
         buffered_bytes = 0
         async with pool.connection() as conn, conn.transaction(), conn.cursor(name="archive_pages") as cur:
+            await conn.execute(_LONG_STATEMENTS)
             await cur.execute(_PAGES, (month_key.job, month_key.month))
             while batch := await cur.fetchmany(_FETCH_ROWS):
                 for row in batch:
@@ -405,6 +411,7 @@ async def archive_month(
             f"sha256 {back_sha}; stored sha256 {stored.sha256 if stored else None}"
         )
     async with pool.connection() as conn, fence.fenced(conn):
+        await conn.execute(_LONG_STATEMENTS)
         await conn.execute(_RECORD, (month_key.job, month_key.month, key, rows, size, bytes.fromhex(sha256)))
         marked = (await conn.execute(_MARK, (month_key.month, task_ids, page_nos))).rowcount
         if marked != rows:  # raising rolls the manifest row back
