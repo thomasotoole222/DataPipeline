@@ -152,7 +152,8 @@ class _Completing:
 class BatchJob[R: Record]:
     """Run one claimed task of a job: Extract, Validate, Transform and Load, then report success inside Load.
 
-    A subclass sets ``name``, ``spec``, ``window``, ``partition`` and ``validation`` as class attributes, and
+    A subclass sets ``name``, ``spec``, ``window``, ``partition``, ``validation`` and ``refetch_days`` as class
+    attributes, and
     ``id_source`` and ``concurrency`` for a fanned-out job, and nothing else; the lifecycle, ``__call__``, is final. An
     instance is the job's ``TaskRunner``. ``__init__`` checks that the attributes are set and agree with each other,
     with the client and with the record model's root target (see ``__init__``).
@@ -171,6 +172,10 @@ class BatchJob[R: Record]:
             ``None`` exactly when ``partition`` is ``"none"``.
         partition (Partition): How a task's ``partition_key`` becomes its time frame.
         validation (Validation[R]): The record model, its checks and the batch policy.
+        refetch_days (int): The oldest age, in days, at which any schedule fetches a partition of this job again (0
+            when none does, as for a snapshot job); an ``int`` of 0 or more. The raw archive writes a month of this
+            job's pages only once that many days (plus a margin) have passed after the month ends, so it must cover
+            every schedule's re-fetch, backfills apart.
         id_source (IdSource | None): Where a fanned-out job's ids come from; ``None``, the default, for a job that is
             not fanned out.
         concurrency (int): The most fanned-out calls a task has in flight at once: an ``int`` of 1 or more, checked
@@ -183,6 +188,7 @@ class BatchJob[R: Record]:
     window: str | None
     partition: Partition
     validation: Validation[R]
+    refetch_days: int  # the oldest age, in days, any schedule re-fetches a partition at; the archive waits for it
     id_source: IdSource | None = None  # set: a fanned-out job, spec called per id
     concurrency: int = DEFAULT_CONCURRENCY  # fanned-out calls in flight per task
 
@@ -212,15 +218,18 @@ class BatchJob[R: Record]:
         Raises:
             AttributeError: A class attribute is not set.
             TypeError: From ``target_of``: ``validation.model`` declares no table, or loads as child rows.
-            ValueError: ``client.connector`` is not ``spec.connector``; ``partition`` is neither ``"day"`` nor
+            ValueError: ``refetch_days`` is not an ``int`` of 0 or more; ``client.connector`` is not
+                ``spec.connector``; ``partition`` is neither ``"day"`` nor
                 ``"none"``; ``window`` is ``None`` for a ``"day"`` partition, set for a ``"none"`` one, or, for a job
                 that is not fanned out, not a name in ``spec.windows``; for a fan-out, anything ``_check_fan_out``
                 refuses; the model's root target writes with ``ReplacePartition`` under a ``"none"`` partition; or the
                 model has a ``TaskDay`` field and the partition is not ``"day"``.
 
         """
-        for attribute in ("name", "spec", "window", "partition", "validation"):
+        for attribute in ("name", "spec", "window", "partition", "validation", "refetch_days"):
             getattr(self, attribute)
+        if not isinstance(self.refetch_days, int) or isinstance(self.refetch_days, bool) or self.refetch_days < 0:
+            raise ValueError(f"job {self.name}: refetch_days must be an int of 0 or more, not {self.refetch_days!r}")
         if client.connector != self.spec.connector:
             raise ValueError(f"job {self.name}: client is for {client.connector}, spec is for {self.spec.connector}")
         if self.partition not in ("day", "none"):

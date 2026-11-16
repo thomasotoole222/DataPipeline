@@ -10,7 +10,7 @@
 --     control.report_outcome: Record an attempt's outcome, release the lease and return the task's new state.
 --     control.record_lease_loss: Log a lease a worker gave up.
 --     control.expire_leases: Release every expired lease whose row is not locked, log each one and count them.
---     control.purge_raw: Delete the raw pages past a retention whose task is not open, then the payloads left unused.
+--     control.purge_raw: Delete archived raw pages and late re-fetches of archived months, then unused payloads.
 --     control.notify_task: Trigger function that notifies channel control_task with the task's id.
 --     task_notify: Trigger that runs control.notify_task when a task is inserted as, or moved to, pending.
 --
@@ -443,21 +443,25 @@ LANGUAGE sql AS $$
     SELECT count(*) FROM logged
 $$;
 
--- Delete the raw pages fetched more than retention ago whose task is not open, then every payload no page references.
+-- Delete the raw pages the archive holds, and the late re-fetches of archived months, then every payload left unused.
 --
--- A page goes when fetched_at < now() - retention and no control.task row with its task_id is pending, running or
--- blocked; a page whose task_id names no task goes too. Then every raw.payload row that no raw.page row references
--- goes, whatever its age. The two deletes are separate statements, so the second sees the first's deletions. now()
--- is the calling transaction's start. A page saved while the purge runs can find the payload it shares deleted
--- between raw.save_page's two statements; that save then fails with foreign_key_violation. Called by the
--- Orchestrator with the PIPELINE_RAW_RETENTION setting.
+-- A page goes when it is archived (archived_month set), or when it was fetched more than retention ago, its task is
+-- not pending, running or blocked, and its task's job and data month (raw.data_month) are already in
+-- raw.archive_manifest: a repair or backfill re-fetch of a month written earlier, which updated the warehouse but is
+-- not added to the archive. No other page goes, so a page is never deleted before its month is archived; a page whose
+-- task_id names no task is kept. Then every raw.payload row that no raw.page row references goes, whatever its age.
+-- The two deletes are separate statements, so the second sees the first's deletions. now() is the calling
+-- transaction's start. A page saved while the purge runs can find the payload it shares deleted between
+-- raw.save_page's two statements; that save then fails with foreign_key_violation. Called by the Scheduler's
+-- pipeline/purge_raw job with its retention (7 days).
 --
 -- Preconditions:
---     raw.page and raw.payload exist, as pipeline_raw_quarantine.sql creates them. retention is not checked: a NULL
---     retention deletes no page, and a negative one deletes pages fetched up to now().
+--     raw.page, raw.payload, raw.archive_manifest and raw.data_month exist, as pipeline_raw_quarantine.sql creates
+--     them. retention is not checked: a NULL retention deletes only archived pages, and a negative one treats every
+--     re-fetch of an archived month as old.
 --
 -- Args:
---     retention: How long a page is kept after it was fetched.
+--     retention: How long a re-fetch of an archived month is kept after it was fetched.
 --
 -- Returns:
 --     One row: pages, the raw.page rows deleted, and payloads, the raw.payload rows deleted; 0 when none.
@@ -470,9 +474,12 @@ RETURNS TABLE (pages bigint, payloads bigint)
 LANGUAGE plpgsql AS $$
 BEGIN
     DELETE FROM raw.page AS p
-     WHERE p.fetched_at < now() - retention
-       AND NOT EXISTS (SELECT FROM control.task AS t
-                        WHERE t.id = p.task_id AND t.state IN ('pending', 'running', 'blocked'));
+     WHERE p.archived_month IS NOT NULL
+        OR (p.fetched_at < now() - retention
+            AND EXISTS (SELECT FROM control.task AS t
+                          JOIN raw.archive_manifest AS m
+                            ON m.job = t.job AND m.month = raw.data_month(t.partition_key, t.created_at)
+                         WHERE t.id = p.task_id AND t.state NOT IN ('pending', 'running', 'blocked')));
     GET DIAGNOSTICS pages = ROW_COUNT;
     DELETE FROM raw.payload AS y
      WHERE NOT EXISTS (SELECT FROM raw.page AS p WHERE p.payload_hash = y.hash);

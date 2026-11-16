@@ -1,6 +1,6 @@
 CREATE SCHEMA raw;
 COMMENT ON SCHEMA raw IS
-    'Source pages as fetched: each page''s envelope in raw.page, its hashed part once in raw.payload. Purged by control.purge_raw.';
+    'Source pages as fetched: each page''s envelope in raw.page, its hashed part once in raw.payload. Archived by pipeline.archive, then purged by control.purge_raw.';
 
 CREATE TABLE raw.payload (
     hash        bytea       PRIMARY KEY,              -- sha256 of body's canonical JSON (raw.save_page)
@@ -23,12 +23,36 @@ CREATE TABLE raw.page (
                  CHECK (cardinality(ids) > 0 AND array_ndims(ids) = 1 AND array_position(ids, NULL) IS NULL),
     error_class  text        CHECK (error_class <> ''),  -- a failed fanned-out call's error class; its page is a marker
     CHECK (error_class IS NULL OR ids IS NOT NULL),
+    archived_month date      CHECK (extract(day FROM archived_month) = 1),  -- set once the page is in the archive
     PRIMARY KEY (task_id, page_no)                    -- numbered across the task: list pages, then per-id pages
 );
 CREATE INDEX page_payload ON raw.page (payload_hash);  -- control.purge_raw finds the payloads no page references
 CREATE INDEX page_fetched ON raw.page (fetched_at);    -- control.purge_raw finds the pages past the retention
 COMMENT ON TABLE raw.page IS
-    'Source responses from every endpoint, without their hashed part. Grain: one row per page of a task. Writer: pipeline Extract; control.purge_raw. Layer: raw.';
+    'Source responses from every endpoint, without their hashed part. Grain: one row per page of a task. Writer: pipeline Extract; archived_month by pipeline.archive; control.purge_raw. Layer: raw.';
+
+-- The month a task's pages are archived under, as its first day: the month of the task's day key for a day partition
+-- ('YYYY-MM-DD'), otherwise the UTC month the task was created in, which is the day a snapshot job fetched.
+CREATE FUNCTION raw.data_month(partition_key text, created_at timestamptz) RETURNS date
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+    SELECT CASE WHEN partition_key ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                THEN make_date(left(partition_key, 4)::int, substr(partition_key, 6, 2)::int, 1)
+                ELSE date_trunc('month', created_at AT TIME ZONE 'UTC')::date END
+$$;
+
+-- One archived Parquet object per job and month, written once: UNIQUE (job, month) refuses a second.
+CREATE TABLE raw.archive_manifest (
+    job        text        NOT NULL,
+    month      date        NOT NULL CHECK (extract(day FROM month) = 1),  -- the month's first day
+    object_key text        NOT NULL UNIQUE,                               -- e.g. 'raw/month=2026-05/job=orders.parquet'
+    rows       bigint      NOT NULL CHECK (rows > 0),                     -- pages in the object, one row each
+    bytes      bigint      NOT NULL CHECK (bytes > 0),
+    sha256     bytea       NOT NULL CHECK (octet_length(sha256) = 32),    -- of the object's bytes
+    written_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (job, month)
+);
+COMMENT ON TABLE raw.archive_manifest IS
+    'The raw archive''s objects. Grain: one row per job and month. Writer: pipeline.archive. Layer: raw.';
 
 CREATE SCHEMA quarantine;
 COMMENT ON SCHEMA quarantine IS 'Records held back by validation until they are replayed, released or discarded.';

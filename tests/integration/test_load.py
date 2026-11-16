@@ -329,6 +329,7 @@ class MissingJob(BatchJob[Missing]):
     spec = SPEC
     window = None
     partition = "none"
+    refetch_days = 0
     validation = Validation(model=Missing)
 
 

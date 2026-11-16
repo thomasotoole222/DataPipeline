@@ -181,6 +181,7 @@ class Products(BatchJob[Product]):
     spec = GET_PRODUCT
     window = "update"
     partition = "day"
+    refetch_days = 0
     validation = Validation(model=Product)
     id_source = FromList(spec=SEARCH, id_at=("id",), keep_list_row=True)
 
@@ -192,6 +193,7 @@ class Minutes(BatchJob[Minute]):
     spec = MINUTES
     window = "update"
     partition = "day"
+    refetch_days = 0
     validation = Validation(model=Minute)
     id_source = LIVE_IDS
 
@@ -203,6 +205,7 @@ class MinuteSnapshots(BatchJob[MinuteSnapshot]):
     spec = MINUTES
     window = "update"
     partition = "day"
+    refetch_days = 0
     validation = Validation(model=MinuteSnapshot)
     id_source = LIVE_IDS
 
@@ -214,6 +217,7 @@ class Lives(BatchJob[Live]):
     spec = LIVES
     window = "update"
     partition = "day"
+    refetch_days = 0
     validation = Validation(model=Live)
     id_source = LIVE_IDS
     concurrency = 1
@@ -226,6 +230,7 @@ class LivesById(BatchJob[Live]):
     spec = LIVES_BY_ID
     window = "update"
     partition = "day"
+    refetch_days = 0
     validation = Validation(model=Live)
     id_source = LIVE_IDS
     concurrency = 1
@@ -238,6 +243,7 @@ class UnsizedMinutes(BatchJob[Minute]):
     spec = UNSIZED_MINUTES
     window = "update"
     partition = "day"
+    refetch_days = 0
     validation = Validation(model=Minute)
     id_source = LIVE_IDS
 
@@ -249,6 +255,7 @@ class Reports(BatchJob[Live]):
     spec = REPORT
     window = "update"
     partition = "day"
+    refetch_days = 0
     validation = Validation(model=Live)
     id_source = LIVE_IDS
     concurrency = 1
@@ -695,6 +702,7 @@ class Writes(BatchJob[Minute]):
     spec = MINUTES
     window = "update"
     partition = "day"
+    refetch_days = 0
     validation = Validation(model=Minute)
     id_source = FromQuery("INSERT INTO t_fan.live_source (live_id) VALUES ('x') RETURNING live_id")
 
@@ -715,6 +723,7 @@ class Smuggles(BatchJob[Minute]):
     spec = MINUTES
     window = "update"
     partition = "day"
+    refetch_days = 0
     validation = Validation(model=Minute)
     id_source = FromQuery("SELECT live_id FROM t_fan.live_source; DELETE FROM t_fan.live_source")
 
@@ -791,6 +800,7 @@ class KeyedProducts(BatchJob[KeyedProduct]):
     spec = GET_PRODUCT_INJECTED
     window = "update"
     partition = "day"
+    refetch_days = 0
     validation = Validation(model=KeyedProduct)
     id_source = FromList(spec=SEARCH, id_at=("ref",), keep_list_row=True)
 

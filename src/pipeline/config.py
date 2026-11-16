@@ -24,13 +24,13 @@ import stat
 from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
 import psycopg
 from dotenv.main import resolve_variables
 from dotenv.parser import Binding, parse_stream
 from psycopg.conninfo import conninfo_to_dict
-from pydantic import Field, SecretStr, StringConstraints, ValidationError, field_validator
+from pydantic import Field, SecretStr, StringConstraints, ValidationError, field_validator, model_validator
 from pydantic_core import InitErrorDetails
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 from pydantic_settings.sources import DotenvType
@@ -419,9 +419,16 @@ class Settings(BaseSettings):
             ``"INFO"``.
         polars_threads (int): Size of Polars' thread pool, 1 or more, with no upper bound here. Defaults to 2. Not
             checked against the container's CPU limit by this class; the caller does that at startup.
-        raw_retention (timedelta): How long a page stays in ``raw.page`` after it was fetched, the argument
-            ``control.purge_raw`` is called with. An ISO-8601 duration such as ``PT60H``, longer than zero. Defaults to
-            60 hours.
+        raw_retention (timedelta): How long a re-fetch of an already archived month stays in ``raw.page`` after it
+            was fetched, the argument ``control.purge_raw`` is called with. An ISO-8601 duration such as ``P7D``,
+            longer than zero. Defaults to 7 days.
+        archive_bucket (str | None): The bucket the raw archive is written to; ``None``, the default, when this
+            worker has no archive store. The four ``archive_`` settings below it are set exactly when it is.
+        archive_endpoint (str | None): The bucket's S3 endpoint URL, e.g. ``https://storage.railway.app``.
+        archive_region (str | None): The bucket's S3 region, e.g. ``auto``.
+        archive_access_key_id (SecretStr | None): The bucket's access key id. Masked in ``repr`` and ``str``.
+        archive_secret_access_key (SecretStr | None): The bucket's secret access key. Masked in ``repr`` and
+            ``str``.
         health_port (int): The TCP port the worker's ``/health`` endpoint listens on, from 1 to 65535 inclusive.
             Defaults to 8080.
 
@@ -451,7 +458,12 @@ class Settings(BaseSettings):
     concurrency: int = Field(default=1, ge=1, le=4)
     log_level: Literal["DEBUG", "INFO", "WARNING"] = "INFO"
     polars_threads: int = Field(default=2, ge=1)  # Polars' thread-pool size; fixed apart from the container's CPU limit
-    raw_retention: timedelta = Field(default=timedelta(hours=60), gt=timedelta(0))  # PIPELINE_RAW_RETENTION, e.g. PT60H
+    raw_retention: timedelta = Field(default=timedelta(days=7), gt=timedelta(0))  # PIPELINE_RAW_RETENTION, e.g. P7D
+    archive_bucket: str | None = None  # PIPELINE_ARCHIVE_BUCKET; None: no archive store
+    archive_endpoint: str | None = None  # PIPELINE_ARCHIVE_ENDPOINT; the bucket's S3 endpoint URL
+    archive_region: str | None = None  # PIPELINE_ARCHIVE_REGION
+    archive_access_key_id: SecretStr | None = None  # PIPELINE_ARCHIVE_ACCESS_KEY_ID
+    archive_secret_access_key: SecretStr | None = None  # PIPELINE_ARCHIVE_SECRET_ACCESS_KEY
     health_port: int = Field(default=8080, ge=1, le=65535)  # PIPELINE_HEALTH_PORT; where /health listens
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -554,6 +566,34 @@ class Settings(BaseSettings):
 
         """
         return (init_settings,)
+
+    @model_validator(mode="after")
+    def _check_archive(self) -> Self:
+        """Refuse an archive store that is only partly set: the five ``archive_`` settings are set together or not.
+
+        Preconditions:
+            None.
+
+        Returns:
+            The instance unchanged.
+
+        Raises:
+            ValueError: If some but not all of ``archive_bucket``, ``archive_endpoint``, ``archive_region``,
+                ``archive_access_key_id`` and ``archive_secret_access_key`` are set; the message names the unset
+                ones. Pydantic reports it as a ``ValidationError``.
+
+        """
+        archive = {
+            "archive_bucket": self.archive_bucket,
+            "archive_endpoint": self.archive_endpoint,
+            "archive_region": self.archive_region,
+            "archive_access_key_id": self.archive_access_key_id,
+            "archive_secret_access_key": self.archive_secret_access_key,
+        }
+        unset = sorted(name for name, value in archive.items() if value is None)
+        if unset and len(unset) < len(archive):
+            raise ValueError(f"the archive store needs all five archive settings; unset: {', '.join(unset)}")
+        return self
 
     @field_validator("warehouse_url")
     @classmethod

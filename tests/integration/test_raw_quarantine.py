@@ -2,7 +2,7 @@
 
 import os
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -318,35 +318,54 @@ async def test_a_body_without_its_hashed_keys_reads_back_whole(pool: Pool) -> No
         assert await last_page(c, 1) == body
 
 
-async def test_purge_raw_keeps_open_tasks_and_recent_pages(pool: Pool) -> None:
-    """Check purge_raw deletes old pages of closed tasks and the payloads left unused, and keeps everything else."""
+async def test_purge_raw_deletes_only_archived_pages_and_old_refetches_of_archived_months(pool: Pool) -> None:
+    """Check purge_raw deletes archived pages and old re-fetches of archived months, then unused payloads, only."""
     async with pool.connection() as c:
-        await c.execute("TRUNCATE control.lease_loss, control.task RESTART IDENTITY")
+        await c.execute("TRUNCATE control.lease_loss, control.task, raw.archive_manifest RESTART IDENTITY")
         await c.execute(
             "INSERT INTO control.task (run_id, connector, job, source_id, partition_key, state) VALUES "
-            "(1, 'tiktok_shop', 'orders', gen_random_uuid(), 'a', 'succeeded'), "
-            "(1, 'tiktok_shop', 'orders', gen_random_uuid(), 'b', 'blocked'), "
-            "(1, 'tiktok_shop', 'orders', gen_random_uuid(), 'c', 'failed')"
+            "(1, 'tiktok_shop', 'orders', gen_random_uuid(), '2026-05-03', 'succeeded'), "
+            "(1, 'tiktok_shop', 'orders', gen_random_uuid(), '2026-05-04', 'succeeded'), "
+            "(1, 'tiktok_shop', 'orders', gen_random_uuid(), '2026-05-05', 'blocked'), "
+            "(1, 'tiktok_shop', 'orders', gen_random_uuid(), '2026-06-01', 'succeeded'), "
+            "(1, 'tiktok_shop', 'returns', gen_random_uuid(), '2026-05-03', 'succeeded')"
         )
-        await save_page(c, page(0, task=1, payload={"v": 1}), KEYS)  # old, task closed: purged with its payload
-        await save_page(c, page(0, task=2, payload={"v": 2}), KEYS)  # old, task blocked: kept
-        await save_page(c, page(0, task=3, payload={"v": 2}), KEYS)  # old, task closed: purged; payload still used
+        await c.execute(
+            "INSERT INTO raw.archive_manifest (job, month, object_key, rows, bytes, sha256) "
+            "VALUES ('orders', '2026-05-01', 'raw/month=2026-05/job=orders.parquet', 1, 1, sha256('x'))"
+        )
+        await save_page(c, page(0, task=1, payload={"v": 1}), KEYS)  # archived: purged with its payload
+        await save_page(c, page(0, task=2, payload={"v": 2}), KEYS)  # old re-fetch of an archived month: purged
+        await save_page(c, page(0, task=3, payload={"v": 2}), KEYS)  # task blocked: kept, so its payload stays
+        await save_page(c, page(0, task=4, payload={"v": 4}), KEYS)  # month not archived: kept
+        await save_page(c, page(0, task=5, payload={"v": 5}), KEYS)  # another job's month, not archived: kept
         recent = RawPage(
-            task_id=3,
+            task_id=2,
             page_no=1,
             connector=CONNECTOR,
             endpoint=ENDPOINT,
             cursor_in="c1",
             cursor_next=None,
             fetched_at=datetime.now(UTC),
-            payload={"v": 3},
+            payload={"v": 6},
         )
-        await save_page(c, recent, KEYS)  # recent: kept
-        cursor = await c.execute("SELECT * FROM control.purge_raw('PT60H')")
+        await save_page(c, recent, KEYS)  # recent re-fetch of an archived month: kept
+        await c.execute("UPDATE raw.page SET archived_month = '2026-05-01' WHERE task_id = 1")
+        cursor = await c.execute("SELECT * FROM control.purge_raw('P7D')")
         assert await cursor.fetchone() == (2, 1)
         cursor = await c.execute("SELECT task_id, page_no FROM raw.page ORDER BY task_id, page_no")
-        assert await cursor.fetchall() == [(2, 0), (3, 1)]
+        assert await cursor.fetchall() == [(2, 1), (3, 0), (4, 0), (5, 0)]
         cursor = await c.execute("SELECT body FROM raw.payload ORDER BY body->>'v'")
-        assert await cursor.fetchall() == [({"v": 2},), ({"v": 3},)]
-        cursor = await c.execute("SELECT * FROM control.purge_raw('PT60H')")
+        assert await cursor.fetchall() == [({"v": 2},), ({"v": 4},), ({"v": 5},), ({"v": 6},)]
+        cursor = await c.execute("SELECT * FROM control.purge_raw('P7D')")
         assert await cursor.fetchone() == (0, 0)
+
+
+async def test_data_month_reads_a_day_key_or_the_creation_month(pool: Pool) -> None:
+    """Check raw.data_month takes a day key's month, and the UTC creation month for any other key."""
+    async with pool.connection() as c:
+        cursor = await c.execute(
+            "SELECT raw.data_month('2026-05-31', '2026-07-01T00:30+01'), "
+            "raw.data_month('none', '2026-07-01T00:30+01'), raw.data_month('none', '2026-07-01T00:30Z')"
+        )
+        assert await cursor.fetchone() == (date(2026, 5, 1), date(2026, 6, 1), date(2026, 7, 1))

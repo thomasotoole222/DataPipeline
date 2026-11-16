@@ -291,6 +291,7 @@ def job(**attributes: Any) -> BatchJob[Product]:
         "spec": GET,
         "window": "update",
         "partition": "day",
+        "refetch_days": 0,
         "validation": Validation(model=Product),
         "id_source": FromList(spec=SEARCH, id_at=("id",), keep_list_row=True),
     }
@@ -440,3 +441,10 @@ def test_a_task_day_is_refused_under_a_none_partition() -> None:
     """Refuse a model with a TaskDay field in a job with a none partition, which has no day to fill it with."""
     with pytest.raises(ValueError, match="day is a TaskDay, so it needs a day partition, not none"):
         job(validation=Validation(model=ProductDay), id_source=FromQuery("SELECT 1"), partition="none", window=None)
+
+
+@pytest.mark.parametrize("refetch_days", [-1, 1.5, True, None])
+def test_a_job_refuses_a_bad_refetch_horizon(refetch_days: Any) -> None:
+    """Refuse a refetch_days that is not an int of 0 or more: the raw archive waits for it."""
+    with pytest.raises(ValueError, match="refetch_days"):
+        job(refetch_days=refetch_days)
