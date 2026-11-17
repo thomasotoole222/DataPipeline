@@ -17,6 +17,7 @@ Public API:
     object_key: The key a job and month's object is stored under.
     settled_on: The first day a job's month may be written.
     plan_months: Find the months ready to write.
+    Redact: A job's archive redaction: a page's response in, the response to archive out.
     archive_month: Write one job and month, read it back, then record it and mark its pages archived.
     check_manifest: Check every recorded object exists with the size and SHA-256 the manifest holds.
 
@@ -24,9 +25,10 @@ Public API:
 
 import asyncio
 import hashlib
+import json
 import logging
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -57,6 +59,10 @@ _FETCH_ROWS: Final = 200
 #: (job, month) before its first row (``video_daily`` for 2026-06 took over 60 s), and ``_MARK`` updates every page of
 #: it. ``SET LOCAL`` ends with the transaction, so the connection goes back to the pool with the 60 s limit.
 _LONG_STATEMENTS: Final = "SET LOCAL statement_timeout = '30min'"
+
+#: A job's archive redaction (``BatchJob.redact_for_archive``): a page's full response (envelope and payload) as
+#: parsed JSON in, the response to write to the archive out.
+type Redact = Callable[[dict[str, Any]], dict[str, Any]]
 
 #: zstd level for every column; the archive is written once and read rarely.
 _ZSTD_LEVEL: Final = 9
@@ -319,8 +325,12 @@ def _table(rows: list[tuple[Any, ...]], schema: pa.Schema) -> pa.Table:
     )
 
 
-async def _write(pool: Pool, month_key: MonthKey, path: Path) -> tuple[list[int], list[int]]:
-    """Stream the month's pages into a Parquet file at ``path``; return the task ids and page numbers written."""
+async def _write(pool: Pool, month_key: MonthKey, path: Path, redact: Redact | None) -> tuple[list[int], list[int]]:
+    """Stream the month's pages into a Parquet file at ``path``; return the task ids and page numbers written.
+
+    With ``redact``, each page's response is parsed, redacted and written as compact JSON; without it, the response is
+    written as Postgres serialised it, unparsed.
+    """
     task_ids: list[int] = []
     page_nos: list[int] = []
     schema = COLUMNS.with_metadata({"job": month_key.job, "month": f"{month_key.month:%Y-%m}"})
@@ -338,11 +348,12 @@ async def _write(pool: Pool, month_key: MonthKey, path: Path) -> tuple[list[int]
             await conn.execute(_LONG_STATEMENTS)
             await cur.execute(_PAGES, (month_key.job, month_key.month))
             while batch := await cur.fetchmany(_FETCH_ROWS):
-                for row in batch:
+                for fetched in batch:
+                    row = tuple(fetched) if redact is None else (*fetched[:13], _redacted(redact, fetched[13]))
                     if buffered and (row[3] != buffered[-1][3] or buffered_bytes >= ROW_GROUP_BYTES):
                         await asyncio.to_thread(writer.write_table, _table(buffered, schema))
                         buffered, buffered_bytes = [], 0
-                    buffered.append(tuple(row))
+                    buffered.append(row)
                     buffered_bytes += len(row[13])
                     task_ids.append(row[5])
                     page_nos.append(row[6])
@@ -353,14 +364,25 @@ async def _write(pool: Pool, month_key: MonthKey, path: Path) -> tuple[list[int]
     return task_ids, page_nos
 
 
+def _redacted(redact: Redact, response: str) -> str:
+    """Return ``response`` (JSON text) passed through ``redact``, as compact JSON text."""
+    return json.dumps(redact(json.loads(response)), ensure_ascii=False, separators=(",", ":"))
+
+
 async def archive_month(
-    pool: Pool, fence: Fence, store: ObjectStore, month_key: MonthKey, scratch: Path | None = None
+    pool: Pool,
+    fence: Fence,
+    store: ObjectStore,
+    month_key: MonthKey,
+    scratch: Path | None = None,
+    redact: Redact | None = None,
 ) -> Archived:
     """Write one job and month's pages to one object, read it back, then record it and mark its pages archived.
 
     Steps:
         1. Stream the month's unarchived pages of closed tasks out of Postgres, in ``_PAGES``'s order, into a local
-           Parquet file (zstd), a row group per source or per ``ROW_GROUP_BYTES`` of responses.
+           Parquet file (zstd), a row group per source or per ``ROW_GROUP_BYTES`` of responses. With ``redact``, each
+           response is passed through it first, so what it removes never reaches the archive.
         2. Upload it as one object, its SHA-256 stored with it.
         3. Download it again and check its row count (from the Parquet footer), size and SHA-256 against the file
            written, and the SHA-256 the store holds for it.
@@ -381,6 +403,7 @@ async def archive_month(
         store: Where the object is written.
         month_key: The job and month.
         scratch: The directory local files are written in; the system's temporary directory when ``None``.
+        redact: The job's redaction, applied to every response written; ``None`` writes responses as fetched.
 
     Returns:
         The ``Archived`` object.
@@ -395,7 +418,7 @@ async def archive_month(
     key = object_key(month_key.job, month_key.month)
     with tempfile.TemporaryDirectory(prefix="archive-", dir=scratch) as tmp:
         written = Path(tmp) / "written.parquet"
-        task_ids, page_nos = await _write(pool, month_key, written)
+        task_ids, page_nos = await _write(pool, month_key, written, redact)
         rows = len(task_ids)
         if not rows:
             return Archived(key=key, rows=0, size=0, sha256="")

@@ -12,7 +12,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, ClassVar, Self
 
-from pipeline.archive.months import ArchiveCheckFailed, archive_month, check_manifest, plan_months
+from pipeline.archive.months import ArchiveCheckFailed, Redact, archive_month, check_manifest, plan_months
 from pipeline.archive.store import ObjectStore
 from pipeline.db.control import ClaimedTask, TaskReport
 from pipeline.errors import Outcome, PermanentError
@@ -52,15 +52,21 @@ class ArchiveRawJob:
     Attributes:
         name: ``"archive_raw"``.
         refetch_days: Each archived job's longest re-fetch in days of age, by job name, read-only.
+        redactions: The jobs whose responses are redacted before they are archived, by job name, read-only.
 
     """
 
     name: ClassVar[str] = "archive_raw"
 
     def __init__(
-        self, *, refetch_days: Mapping[str, int], store: ObjectStore | None, scratch: Path | None = None
+        self,
+        *,
+        refetch_days: Mapping[str, int],
+        store: ObjectStore | None,
+        scratch: Path | None = None,
+        redactions: Mapping[str, Redact] | None = None,
     ) -> None:
-        """Store the horizons, the store and the scratch directory.
+        """Store the horizons, the redactions, the store and the scratch directory.
 
         Preconditions:
             None.
@@ -70,12 +76,15 @@ class ArchiveRawJob:
             store: Where objects are written; ``None`` when this worker has none, so every task fails with
                 ``ArchiveNotConfigured``.
             scratch: The directory local files are written in; the system's temporary directory when ``None``.
+            redactions: Each redacted job's ``BatchJob.redact_for_archive``, by job name; a job not named is archived
+                as fetched.
 
         Returns:
             None.
 
         Raises:
-            ValueError: A horizon is not an ``int`` of 0 or more, or a job is named ``archive_raw``.
+            ValueError: A horizon is not an ``int`` of 0 or more, a job is named ``archive_raw``, or a redacted job
+                has no horizon.
 
         """
         for job, days in refetch_days.items():
@@ -83,13 +92,19 @@ class ArchiveRawJob:
                 raise ValueError(f"job {job}: refetch_days must be an int of 0 or more, not {days!r}")
         if self.name in refetch_days:
             raise ValueError(f"{self.name} archives other jobs' pages; it has none of its own")
+        redactions = dict(redactions or {})
+        if unknown := sorted(set(redactions) - set(refetch_days)):
+            raise ValueError(f"redacted jobs with no refetch_days: {', '.join(unknown)}")
         self.refetch_days: Mapping[str, int] = MappingProxyType(dict(refetch_days))
+        self.redactions: Mapping[str, Redact] = MappingProxyType(redactions)
         self._store = store
         self._scratch = scratch
 
     @classmethod
     def for_jobs(cls, jobs: Iterable[BatchJob[Any]], store: ObjectStore | None, scratch: Path | None = None) -> Self:
-        """Build the job with each batch job's own ``refetch_days`` as its horizon.
+        """Build the job with each batch job's own ``refetch_days`` as its horizon and its redaction, if it has one.
+
+        A job has a redaction when its class overrides ``BatchJob.redact_for_archive``.
 
         Preconditions:
             None.
@@ -106,7 +121,17 @@ class ArchiveRawJob:
             ValueError: As ``__init__``.
 
         """
-        return cls(refetch_days={job.name: job.refetch_days for job in jobs}, store=store, scratch=scratch)
+        jobs = list(jobs)
+        return cls(
+            refetch_days={job.name: job.refetch_days for job in jobs},
+            store=store,
+            scratch=scratch,
+            redactions={
+                job.name: job.redact_for_archive
+                for job in jobs
+                if type(job).redact_for_archive is not BatchJob.redact_for_archive
+            },
+        )
 
     async def __call__(self, task: ClaimedTask, lease: TaskLease, /) -> None:
         """Archive every ready month, check the manifest, and report the outcome.
@@ -143,7 +168,9 @@ class ArchiveRawJob:
         written = 0
         for month_key in plan.ready:
             try:
-                archived = await archive_month(pool, lease, self._store, month_key, self._scratch)
+                archived = await archive_month(
+                    pool, lease, self._store, month_key, self._scratch, self.redactions.get(month_key.job)
+                )
             except ArchiveCheckFailed as err:
                 _log.error("archive: %s", err)
                 problems.append(str(err))

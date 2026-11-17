@@ -294,3 +294,59 @@ def test_the_job_refuses_a_bad_horizon(days: Any) -> None:
     """Check a horizon that is not an int of 0 or more is refused."""
     with pytest.raises(ValueError, match="refetch_days"):
         ArchiveRawJob(refetch_days={"orders": days}, store=None)
+
+
+def drop_ids(response: dict[str, Any]) -> dict[str, Any]:
+    """Redact each order's ``id`` to ``"x"``: a stand-in for a job's ``redact_for_archive``."""
+    for order in response["data"]["orders"]:
+        order["id"] = "x"
+    return response
+
+
+async def test_a_redacted_month_keeps_only_what_the_redaction_returns(pool: Pool, tmp_path: Path) -> None:
+    """Check every archived response is the redaction's output, while raw.page keeps the response as fetched."""
+    ids = await may_orders(pool)
+    store = DirectoryStore(tmp_path / "bucket")
+    archived = await archive_month(pool, Fenced(pool), store, MonthKey(MAY, "orders"), tmp_path, drop_ids)
+    assert archived.rows == 4
+    frame = pl.read_parquet(tmp_path / "bucket" / archived.key)
+    responses = frame.get_column("response").str.json_decode().to_list()
+    assert {order["id"] for response in responses for order in response["data"]["orders"]} == {"x"}
+    assert responses[0] == {"code": 0, "request_id": f"r{ids['a_may_1']}-0", "data": {"orders": [{"id": "x"}]}}
+    async with pool.connection() as c:
+        kept = await (
+            await c.execute(
+                "SELECT y.body -> 'data' -> 'orders' -> 0 ->> 'id' FROM raw.page p "
+                "JOIN raw.payload y ON y.hash = p.payload_hash WHERE p.task_id = %s AND p.page_no = 0",
+                (ids["a_may_1"],),
+            )
+        ).fetchone()
+    assert kept == ("a1",)
+
+
+async def test_the_job_redacts_only_the_jobs_named(pool: Pool, tmp_path: Path) -> None:
+    """Check a run applies a job's redaction to that job's months and archives other jobs as fetched."""
+    await may_orders(pool)
+    async with pool.connection() as c:
+        other = await task(c, "returns", SHOP_A, "2026-05-04")
+        await land(c, other, 0, {"orders": [{"id": "r1"}]})
+    job = ArchiveRawJob(
+        refetch_days={"orders": 2, "returns": 2},
+        store=DirectoryStore(tmp_path / "bucket"),
+        scratch=tmp_path,
+        redactions={"orders": drop_ids},
+    )
+    await job(claimed(999), Fenced(pool))
+
+    def ids_in(key: str) -> set[str]:
+        frame = pl.read_parquet(tmp_path / "bucket" / key)
+        return {o["id"] for r in frame.get_column("response").str.json_decode().to_list() for o in r["data"]["orders"]}
+
+    assert ids_in(object_key("orders", MAY)) == {"x"}
+    assert ids_in(object_key("returns", MAY)) == {"r1"}
+
+
+def test_the_job_refuses_a_redaction_for_a_job_with_no_horizon() -> None:
+    """Check a redaction must name a job the archive has a horizon for."""
+    with pytest.raises(ValueError, match="redacted jobs with no refetch_days: orders"):
+        ArchiveRawJob(refetch_days={}, store=None, redactions={"orders": drop_ids})

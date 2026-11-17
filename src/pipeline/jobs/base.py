@@ -154,7 +154,8 @@ class BatchJob[R: Record]:
 
     A subclass sets ``name``, ``spec``, ``window``, ``partition``, ``validation`` and ``refetch_days`` as class
     attributes, and
-    ``id_source`` and ``concurrency`` for a fanned-out job, and nothing else; the lifecycle, ``__call__``, is final. An
+    ``id_source`` and ``concurrency`` for a fanned-out job, and may override ``redact_for_archive``, and nothing else;
+    the lifecycle, ``__call__``, is final. An
     instance is the job's ``TaskRunner``. ``__init__`` checks that the attributes are set and agree with each other,
     with the client and with the record model's root target (see ``__init__``).
 
@@ -311,6 +312,29 @@ class BatchJob[R: Record]:
                     f"job {self.name}: {target.table} replaces a partition, which a fan-out cannot: an empty id "
                     "source loads nothing, so the partition would keep rows a load of no records removes"
                 )
+
+    def redact_for_archive(self, response: dict[str, Any]) -> dict[str, Any]:
+        """Return a page's response as the raw archive should keep it; this default keeps it whole.
+
+        A job whose responses hold personal data the archive must not keep overrides this to remove or coarsen it.
+        The archive (``ArchiveRawJob``) calls it on every page of the job it writes, and only for a job whose class
+        overrides it; raw pages in Postgres, and what the job loads, are unchanged.
+
+        Preconditions:
+            None.
+
+        Args:
+            response: One page's full response, envelope and payload, as parsed JSON; the override may change it in
+                place.
+
+        Returns:
+            The response to write to the archive.
+
+        Raises:
+            Nothing in this default.
+
+        """
+        return response
 
     def frame(self, partition_key: str) -> TimeFrame | None:
         """Return the time frame a task's partition key covers.
