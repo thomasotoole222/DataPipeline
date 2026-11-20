@@ -13,15 +13,18 @@ Public API:
     record_lease_loss: Record a lost lease through ``control.record_lease_loss``.
     open_listener: Open a connection that listens on ``TASK_CHANNEL``.
     wait_for_task: Wait for a notification on a listening connection.
+    PublishedJob: One published job: its name, connector and partition.
+    PublishedSource: One published source: its connector, id, label and whether "all" includes it.
+    publish_registry: Replace the published registry through ``control.publish_registry``.
 
 """
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Any, Final, Protocol
+from typing import Any, Final, Literal, Protocol
 from uuid import UUID
 
 import psycopg
@@ -30,7 +33,7 @@ from psycopg.conninfo import make_conninfo
 from psycopg.rows import class_row
 
 from pipeline.config import Settings
-from pipeline.db.pool import DEAD_CONNECTION_PARAMS, Connection, storable_text
+from pipeline.db.pool import DEAD_CONNECTION_PARAMS, Connection, Pool, storable_text
 from pipeline.errors import MAX_RETRY_AFTER, AlreadyReported, LeaseConflict, Outcome, db_errors
 from pipeline.timeutil import ensure_utc
 
@@ -681,3 +684,146 @@ async def wait_for_task(listener: psycopg.AsyncConnection[Any], wait: timedelta)
         async for _ in listener.notifies(timeout=wait.total_seconds(), stop_after=1):
             received = True
     return received
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedJob:
+    """Hold one published job: its name, the connector its endpoint belongs to and how its tasks slice it.
+
+    ``__post_init__`` refuses what ``control.job`` refuses for one row. ``partition`` takes the values of
+    ``pipeline.jobs.base.Partition`` without importing it, since ``pipeline.db`` sits below ``pipeline.jobs``.
+
+    Preconditions:
+        None.
+
+    Args:
+        name: The job's name, as ``control.task.job``; not empty.
+        connector: The connector its endpoint belongs to; not empty.
+        partition: ``"day"`` or ``"none"``.
+
+    Returns:
+        None. The generated ``__init__`` initialises a frozen instance in place.
+
+    Raises:
+        ValueError: If ``name`` or ``connector`` is empty, or ``partition`` is neither ``"day"`` nor ``"none"``.
+
+    """
+
+    name: str  # the job's name, as control.task.job
+    connector: str  # the connector its endpoint belongs to
+    partition: Literal["day", "none"]  # how its tasks slice the endpoint
+
+    def __post_init__(self) -> None:
+        """Refuse an empty name or connector, then an unknown partition.
+
+        Preconditions:
+            Called once, by the generated ``__init__``.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: Under the conditions listed in the ``PublishedJob`` docstring.
+
+        """
+        if not self.name or not self.connector:
+            raise ValueError(f"published job {self.name!r}: the name and the connector must not be empty")
+        if self.partition not in ("day", "none"):
+            raise ValueError(f"published job {self.name}: unknown partition {self.partition!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedSource:
+    """Hold one published source: its connector, its id, its label and whether "all" includes it.
+
+    ``__post_init__`` refuses what ``control.source`` refuses for one row.
+
+    Preconditions:
+        None.
+
+    Args:
+        connector: The connector that serves it; not empty.
+        source_id: The source's id.
+        label: A readable name, shown instead of the UUID; not empty.
+        in_all: ``False`` when only a task that names the source runs on it, never one for "all".
+
+    Returns:
+        None. The generated ``__init__`` initialises a frozen instance in place.
+
+    Raises:
+        ValueError: If ``connector`` or ``label`` is empty.
+
+    """
+
+    connector: str  # the connector that serves it
+    source_id: UUID
+    label: str  # a readable name, shown instead of the UUID
+    in_all: bool  # False: only a task that names it runs on it, never one for "all"
+
+    def __post_init__(self) -> None:
+        """Refuse an empty connector or label.
+
+        Preconditions:
+            Called once, by the generated ``__init__``.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: If ``connector`` or ``label`` is empty.
+
+        """
+        if not self.connector or not self.label:
+            raise ValueError(f"published source {self.source_id}: the connector and the label must not be empty")
+
+
+#: SQL that replaces the published registry through ``control.publish_registry``, taking seven array parameters.
+_PUBLISH: Final = "SELECT control.publish_registry(%s, %s, %s, %s, %s, %s, %s)"
+
+
+async def publish_registry(pool: Pool, jobs: Sequence[PublishedJob], sources: Sequence[PublishedSource]) -> None:
+    """Replace the published registry with ``jobs`` and ``sources`` through ``control.publish_registry``.
+
+    Takes a connection from ``pool`` (autocommit), so the call is one transaction, and sends each field of ``jobs``
+    and of ``sources`` as one array, in the order given. ``db_errors`` covers the pool checkout too, so a pool
+    timeout is ``DatabaseUnavailable``.
+
+    Preconditions:
+        Must be awaited inside a running event loop; ``pool`` is open.
+
+    Args:
+        pool: The pool the connection is taken from.
+        jobs: The jobs to publish; each name once.
+        sources: The sources to publish; each (connector, source id) once.
+
+    Returns:
+        None, once ``control.job`` and ``control.source`` hold exactly ``jobs`` and ``sources``.
+
+    Raises:
+        DatabaseUnavailable: If the warehouse could not be reached or the pool timed out (mapped by ``db_errors``).
+        DatabaseConflict: If the statement raises ``SerializationFailure`` or ``DeadlockDetected`` (mapped by
+            ``db_errors``).
+        psycopg.Error: Any other database error, unchanged, such as ``UniqueViolation`` for a job name or source
+            listed twice.
+
+    """
+    with db_errors():
+        async with pool.connection() as conn:
+            await conn.execute(
+                _PUBLISH,
+                (
+                    [job.name for job in jobs],
+                    [job.connector for job in jobs],
+                    [job.partition for job in jobs],
+                    [source.connector for source in sources],
+                    [source.source_id for source in sources],
+                    [source.label for source in sources],
+                    [source.in_all for source in sources],
+                ),
+            )

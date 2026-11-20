@@ -15,21 +15,22 @@ Public API:
     BuildRegistry: The application package's function that builds its registry.
     run: Read the settings, pin Polars, set up telemetry, build the registry and run the worker until it is stopped.
     main: ``run`` with the framework's settings and no jobs: the smoke run of ``python -m pipeline``.
-    run_worker: Open the pool, check the schema, run the worker and ``/health``, then shut down in order.
+    run_worker: Open the pool, check the schema, publish the registry, run the worker and ``/health``, then shut down
+        in order.
 """
 
 import asyncio
 import contextlib
 import logging
 import signal
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import timedelta
 from typing import Final
 
 import httpx
 
 from pipeline.config import Settings
-from pipeline.db.control import open_listener
+from pipeline.db.control import PublishedJob, PublishedSource, open_listener, publish_registry
 from pipeline.db.pool import check_schema, open_pool
 from pipeline.registry import Registry
 from pipeline.telemetry import Instruments, configure
@@ -269,20 +270,24 @@ async def run_worker(
     *,
     runners: Mapping[str, TaskRunner],
     known_jobs: frozenset[str],
+    jobs: Sequence[PublishedJob],
+    sources: Sequence[PublishedSource],
     health_port: int = HEALTH_PORT,
 ) -> None:
-    """Open the pool, check the schema, run the worker and ``/health`` until stopped, then shut down in order.
+    """Open the pool, check the schema, publish the registry, run the worker and ``/health``, then shut down in order.
 
-    Start-up: open the pool, check the schema revision, open the listener, build the ``Worker``, start ``/health``,
-    then add SIGTERM and SIGINT handlers that call ``Worker.stop`` and start the shutdown deadline. No ``await``
-    separates adding the handlers from starting ``Worker.run``. Shutdown, once ``Worker.run`` has drained or anything
-    raised: close ``/health``, close the listener, close the pool, remove the handlers. Each shutdown step runs even if
-    an earlier one raised, and only the steps whose resource was opened run; the handler removal always runs.
-    ``/health`` stays up during the drain, so it reports the worker as draining. A SIGTERM before the handlers are
-    added has its default effect and ends the process at once; no task has been claimed by then, and the closed
-    sockets end its database sessions. A SIGINT before then reaches ``asyncio.run``'s own handler, which cancels this
-    coroutine, so shutdown unwinds as for any other raise. A signal after the handlers are added only calls
-    ``Worker.stop`` again, so a second SIGTERM or Ctrl-C cannot cut the drain short or move the deadline.
+    Start-up: open the pool, check the schema revision, publish ``jobs`` and ``sources`` with ``publish_registry``
+    (replacing ``control.job`` and ``control.source``, and logging the two counts at ``INFO``), open the listener, build
+    the ``Worker``, start ``/health``, then add SIGTERM and SIGINT handlers that call ``Worker.stop`` and start the
+    shutdown deadline. No ``await`` separates adding the handlers from starting ``Worker.run``. Shutdown, once
+    ``Worker.run`` has drained or anything raised: close ``/health``, close the listener, close the pool, remove the
+    handlers. Each shutdown step runs even if an earlier one raised, and only the steps whose resource was opened run;
+    the handler removal always runs. ``/health`` stays up during the drain, so it reports the worker as draining. A
+    SIGTERM before the handlers are added has its default effect and ends the process at once; no task has been claimed
+    by then, and the closed sockets end its database sessions. A SIGINT before then reaches ``asyncio.run``'s own
+    handler, which cancels this coroutine, so shutdown unwinds as for any other raise. A signal after the handlers are
+    added only calls ``Worker.stop`` again, so a second SIGTERM or Ctrl-C cannot cut the drain short or move the
+    deadline.
 
     The first stop signal starts one deadline, ``SHUTDOWN_TIMEOUT`` later, over ``Worker.run`` (its drain, the
     cut-off after ``DRAIN_TIMEOUT`` and the cut-off tasks' reports) and the three closes. Without a stop signal, for
@@ -300,6 +305,9 @@ async def run_worker(
         instruments: Where the worker records its metrics.
         runners: The runner for each job that can run.
         known_jobs: Every job in the job registry.
+        jobs: The jobs to publish, as ``Registry.published_jobs``; no default, so no caller publishes nothing by
+            leaving it out.
+        sources: The sources to publish, as ``Registry.published_sources``; no default, as ``jobs``.
         health_port: The port ``/health`` listens on; ``_serve`` passes ``Settings.health_port``. Defaults to
             ``HEALTH_PORT``.
 
@@ -311,6 +319,8 @@ async def run_worker(
         DatabaseUnavailable: The pool or the listener could not reach the warehouse (as mapped by ``db_errors``).
         SchemaMismatch: ``alembic_version`` holds no single valid revision, or one below ``REQUIRED_REVISION``.
         OSError: ``/health`` could not bind its port.
+        psycopg.Error: ``publish_registry`` refused the registry, such as ``UniqueViolation`` for a job or source
+            listed twice; the pool is closed first and no task was claimed.
         asyncio.CancelledError: The coroutine was cancelled, for example by a SIGINT before the handlers were added.
         Exception: Anything else start-up, ``Worker.run`` or shutdown raises, unchanged, such as a ``db_errors``
             mapping of a missing ``alembic_version`` table or ``DatabaseConflict`` from the listener's ``LISTEN``. If
@@ -329,6 +339,8 @@ async def run_worker(
         pool = await open_pool(settings)
         shutdown.push_async_callback(deadline.close, "closing the pool", pool.close)
         await check_schema(pool)
+        await publish_registry(pool, jobs, sources)
+        _log.info("published %d jobs and %d sources", len(jobs), len(sources))
         listener = await open_listener(settings)
         shutdown.push_async_callback(deadline.close, "closing the listener", listener.close)
         worker = Worker(
@@ -351,7 +363,8 @@ async def run_worker(
 async def _serve[S: Settings](settings: S, instruments: Instruments, build_registry: BuildRegistry[S]) -> None:
     """Open the shared HTTP client, build the registry with it and run the worker on its jobs, then close the client.
 
-    ``/health`` listens on ``settings.health_port`` (``PIPELINE_HEALTH_PORT``).
+    The worker publishes the registry's ``published_jobs`` and ``published_sources`` at start-up. ``/health``
+    listens on ``settings.health_port`` (``PIPELINE_HEALTH_PORT``).
 
     Preconditions:
         As ``run_worker``.
@@ -365,15 +378,21 @@ async def _serve[S: Settings](settings: S, instruments: Instruments, build_regis
         None, once ``run_worker`` has returned and the client is closed.
 
     Raises:
-        BaseException: Whatever ``build_registry``, ``run_worker`` or closing the client raises, unchanged; the client
-            is closed first.
+        BaseException: Whatever ``build_registry``, ``Registry.published_jobs``, ``run_worker`` or closing the client
+            raises, unchanged; the client is closed first.
 
     """
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as http:
         registry = build_registry(settings, http, instruments)
         runners = registry.runners
         await run_worker(
-            settings, instruments, runners=runners, known_jobs=frozenset(runners), health_port=settings.health_port
+            settings,
+            instruments,
+            runners=runners,
+            known_jobs=frozenset(runners),
+            jobs=registry.published_jobs,
+            sources=registry.published_sources,
+            health_port=settings.health_port,
         )
 
 

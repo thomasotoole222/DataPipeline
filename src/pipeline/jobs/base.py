@@ -193,6 +193,24 @@ class BatchJob[R: Record]:
     id_source: IdSource | None = None  # set: a fanned-out job, spec called per id
     concurrency: int = DEFAULT_CONCURRENCY  # fanned-out calls in flight per task
 
+    @property
+    def connector(self) -> str:
+        """Return the connector the job's tasks are created under: the connector of its spec.
+
+        ``__init__`` has already checked that the client is for the same connector.
+
+        Preconditions:
+            None.
+
+        Returns:
+            ``self.spec.connector``.
+
+        Raises:
+            Nothing.
+
+        """
+        return self.spec.connector
+
     def __init__(self, *, client: ConnectorClient[Any], zone: ZoneInfo, instruments: Instruments) -> None:
         """Check the job's declaration against itself and the client, then store the client, zone and instruments.
 

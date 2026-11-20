@@ -26,7 +26,7 @@ type Connection = AsyncConnection[TupleRow]
 type Pool = AsyncConnectionPool[Connection]
 
 #: Lowest ``alembic_version`` revision of the database schema that this build accepts.
-REQUIRED_REVISION: Final = 0
+REQUIRED_REVISION: Final = 26
 #: Longest ``version_num`` accepted: Alembic revision ids are at most 32 characters (its ``VARCHAR(32)`` column).
 _MAX_REVISION_LENGTH: Final = 32
 

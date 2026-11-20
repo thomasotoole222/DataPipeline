@@ -16,7 +16,7 @@ from pipeline.archive.months import ArchiveCheckFailed, Redact, archive_month, c
 from pipeline.archive.store import ObjectStore
 from pipeline.db.control import ClaimedTask, TaskReport
 from pipeline.errors import Outcome, PermanentError
-from pipeline.jobs.base import BatchJob, TaskLease
+from pipeline.jobs.base import BatchJob, Partition, TaskLease
 from pipeline.timeutil import utc_now
 
 _log = logging.getLogger(__name__)
@@ -51,12 +51,16 @@ class ArchiveRawJob:
 
     Attributes:
         name: ``"archive_raw"``.
+        connector: ``"pipeline"``: its tasks are created for ``PIPELINE_SOURCE``.
+        partition: ``"none"``: one task, key ``none``, covers every job and month.
         refetch_days: Each archived job's longest re-fetch in days of age, by job name, read-only.
         redactions: The jobs whose responses are redacted before they are archived, by job name, read-only.
 
     """
 
     name: ClassVar[str] = "archive_raw"
+    connector: ClassVar[str] = "pipeline"  # its tasks run on the pipeline source, PIPELINE_SOURCE
+    partition: ClassVar[Partition] = "none"  # one task covers every job and month
 
     def __init__(
         self,

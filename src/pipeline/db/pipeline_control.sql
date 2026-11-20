@@ -13,6 +13,15 @@
 --     control.purge_raw: Delete archived raw pages and late re-fetches of archived months, then unused payloads.
 --     control.notify_task: Trigger function that notifies channel control_task with the task's id.
 --     task_notify: Trigger that runs control.notify_task when a task is inserted as, or moved to, pending.
+--     control.job: One row per published job, with its connector and partition.
+--     control.source: One row per published source of a connector, with its label and whether "all" includes it.
+--     control.publish_registry: Replace the published jobs and sources in one statement.
+--     control.create_tasks: Create one task per source and partition key of a run, or return the key's live task.
+--     control.cancel_tasks: Cancel the given tasks that are waiting to run (pending or retry_wait).
+--     control.rerun_task: Re-run one finished or blocked task as a fresh task with full attempts.
+--     control.task_states: Read the key, state and last report of the given tasks, the outcome included.
+--     control.published_jobs: Read every published job with its connector and partition.
+--     control.published_sources: Read the published sources of one connector, or of all.
 --
 -- Create the control schema that holds every object below.
 --
@@ -23,17 +32,19 @@ COMMENT ON SCHEMA control IS 'The task queue the workers claim from, and the rec
 --
 -- state moves pending or retry_wait -> running (claim, once not_before has passed); running -> pending, retry_wait,
 -- blocked, succeeded, failed or dead_lettered (report_outcome); running -> pending or dead_lettered (expire_leases).
--- Nothing on this page moves a task out of blocked, or into cancelled. claim sets lease_token, lease_owner and
--- lease_expires_at; heartbeat and fence reset lease_expires_at; report_outcome and expire_leases clear all three, and
--- only report_outcome copies the released token to last_lease_token. heartbeat_at is set by heartbeat and cleared by
--- claim. started_at is set by claim; finished_at is set by report_outcome and expire_leases and cleared by claim. The
--- report columns (error_class to duration_ms) are written by report_outcome and kept by claim; expire_leases sets
--- error_class to 'LeaseExpired' and clears error_type, error_message, the row counts and duration_ms. Constraints:
--- state is one of the eight listed values, not_before and created_at are finite, and state is 'running' exactly when
--- lease_token and lease_expires_at are both set, so every running task has a lease that expire_leases can see.
--- lease_owner is not constrained. max_attempts is 1 to 100 and attempt is 0 to max_attempts; claim takes only a task
--- with attempts left, so no claim or backoff can overflow, and a row with no attempts left waits for a person instead
--- of blocking the queue. priority is unchecked.
+-- cancel_tasks moves pending or retry_wait -> cancelled, and rerun_task blocked -> cancelled (the control functions,
+-- after task_notify). claim sets lease_token, lease_owner and lease_expires_at; heartbeat and fence reset
+-- lease_expires_at; report_outcome and expire_leases clear all three, and only report_outcome copies the released token
+-- to last_lease_token. heartbeat_at is set by heartbeat and cleared by claim. started_at is set by claim; finished_at
+-- is set by report_outcome and expire_leases and cleared by claim. The report columns (error_class to duration_ms) are
+-- written by report_outcome and kept by claim; expire_leases sets error_class to 'LeaseExpired' and clears error_type,
+-- error_message, the row counts and duration_ms. outcome, added with the control functions, is written by
+-- report_outcome (an Interrupted report keeps it), kept by claim and cleared by expire_leases. Constraints: state is
+-- one of the eight listed values, not_before and created_at are finite, and state is 'running' exactly when lease_token
+-- and lease_expires_at are both set, so every running task has a lease that expire_leases can see. lease_owner is not
+-- constrained. max_attempts is 1 to 100 and attempt is 0 to max_attempts; claim takes only a task with attempts left,
+-- so no claim or backoff can overflow, and a row with no attempts left waits for a person instead of blocking the
+-- queue. priority is unchecked.
 --
 CREATE TABLE control.task (
     id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -520,3 +531,432 @@ CREATE TRIGGER task_notify
 AFTER INSERT OR UPDATE OF state ON control.task
 FOR EACH ROW WHEN (NEW.state = 'pending')
 EXECUTE FUNCTION control.notify_task();
+
+-- The pipeline's control functions and the registry the worker publishes (DataPipeline's pipeline_control.sql, the
+-- part after task_notify). Revision 0026.
+
+-- Hold each task's last reported outcome, as control.report_outcome was given it: 'succeeded', 'retryable',
+-- 'blocked', 'failed' or 'unexpected'. NULL until the first report; an Interrupted report keeps it, control.claim
+-- keeps it, and control.expire_leases sets it to NULL, since no outcome was reported for the attempt it releases.
+ALTER TABLE control.task
+    ADD COLUMN outcome text
+        CONSTRAINT task_outcome CHECK (outcome IN ('succeeded', 'retryable', 'blocked', 'failed', 'unexpected'));
+COMMENT ON COLUMN control.task.outcome IS
+    'The last report''s outcome (succeeded, retryable, blocked, failed or unexpected); NULL until the first report and after an expired lease.';
+
+-- Record an attempt's outcome under a lease, release the lease and return the task's new state.
+--
+-- Locks the task row FOR UPDATE (inside Load's transaction control.fence already holds it). Raises CH002 when
+-- last_lease_token is lease_token, else CH001 when the task is missing, not running, or running under another token,
+-- so a worker that lost its lease cannot overwrite the new holder's work; called last inside Load's transaction, the
+-- raise rolls back that transaction's writes too. As in fence, lease_expires_at is not compared with now(): a lease
+-- that expired but that expire_leases has not yet released is still reported under. Otherwise the next state is,
+-- checked in this order:
+--     error_class = 'Interrupted': 'pending', attempt reduced by 1, not_before kept, whatever outcome is.
+--     outcome 'succeeded', 'failed' or 'blocked': that state.
+--     outcome 'retryable': 'dead_lettered' when attempt >= max_attempts, else 'retry_wait' with not_before = now() +
+--         least(greatest(least(30 s * 2 ^ least(attempt - 1, 7), 1 hour), coalesce(retry_after, 0)), 6 hours); the
+--         exponent is capped at 7 (64 minutes, past the 1-hour cap) so the product never overflows interval.
+--     outcome 'unexpected': 'retry_wait' with not_before = now() + 30 s when attempt <= 1 and attempt < max_attempts,
+--         else 'failed'.
+-- The row then stores the new state, attempt, the report's columns and finished_at = now(), clears lease_token,
+-- lease_owner and lease_expires_at, and keeps the released token in last_lease_token. It stores outcome in
+-- control.task.outcome, except for an Interrupted report, which keeps the outcome stored before.
+--
+-- Preconditions:
+--     outcome is an Outcome value and error_class is NULL exactly when outcome is 'succeeded', as TaskReport
+--     guarantees, so the Interrupted check never overrides a success. Nothing else is checked: the row counts and
+--     duration_ms are stored as given.
+--
+-- Args:
+--     task_id: ID of the task.
+--     lease_token: Token the caller's lease was issued with.
+--     outcome: 'succeeded', 'retryable', 'blocked', 'failed' or 'unexpected'.
+--     error_class: Error class of an unsuccessful run, or NULL; 'Interrupted' marks a shutdown.
+--     error_type: Type name of the exception that ended the run, or NULL; stored as given.
+--     error_message: Error text, or NULL.
+--     retry_after: Smallest wait the source asked for, or NULL; read only for outcome 'retryable'.
+--     rows_fetched: Rows fetched, stored as given.
+--     rows_written: Rows written, stored as given.
+--     rows_rejected: Rows rejected, stored as given.
+--     duration_ms: Run time in milliseconds, stored as given.
+--
+-- Returns:
+--     The task's new state: pending, succeeded, failed, blocked, retry_wait or dead_lettered.
+--
+-- Raises:
+--     CH002: An outcome was already recorded under lease_token.
+--     CH001: The task is missing, not running, or running under another token (or task_id or lease_token is NULL).
+--     invalid_parameter_value (22023): outcome is not one of the five values and error_class is not 'Interrupted'.
+--
+CREATE OR REPLACE FUNCTION control.report_outcome(
+    task_id bigint, lease_token uuid, outcome text, error_class text, error_type text, error_message text,
+    retry_after interval, rows_fetched bigint, rows_written bigint, rows_rejected bigint, duration_ms bigint
+)
+RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    cur        control.task%ROWTYPE;
+    next_state text;
+    wait       interval := interval '0';
+BEGIN
+    SELECT * INTO cur FROM control.task AS t WHERE t.id = report_outcome.task_id FOR UPDATE;
+    IF FOUND AND cur.last_lease_token = report_outcome.lease_token THEN
+        RAISE EXCEPTION 'task % already reported under lease %', report_outcome.task_id, report_outcome.lease_token
+            USING ERRCODE = 'CH002';
+    END IF;
+    IF NOT FOUND OR cur.state <> 'running' OR cur.lease_token IS DISTINCT FROM report_outcome.lease_token THEN
+        RAISE EXCEPTION 'task % is not running under lease %', report_outcome.task_id, report_outcome.lease_token
+            USING ERRCODE = 'CH001';
+    END IF;
+
+    -- Map the outcome to the next state.
+    IF report_outcome.error_class = 'Interrupted' THEN
+        -- The worker stopped before finishing (shutdown): run again at once; the attempt is not counted.
+        next_state := 'pending';
+        cur.attempt := cur.attempt - 1;
+    ELSIF outcome IN ('succeeded', 'failed', 'blocked') THEN
+        next_state := outcome;
+    ELSIF outcome = 'retryable' THEN
+        IF cur.attempt >= cur.max_attempts THEN
+            next_state := 'dead_lettered';
+        ELSE
+            next_state := 'retry_wait';
+            -- 30 s doubling per attempt, capped at 1 hour, but never sooner than the source asked, up to 6 hours.
+            wait := least(greatest(least(interval '30 seconds' * 2 ^ least(cur.attempt - 1, 7), interval '1 hour'),
+                                   coalesce(retry_after, interval '0')),
+                          interval '6 hours');
+        END IF;
+    ELSIF outcome = 'unexpected' THEN
+        -- One more try on the first attempt, after the first backoff step, if max_attempts allows it; then a person
+        -- looks at it.
+        next_state := CASE WHEN cur.attempt <= 1 AND cur.attempt < cur.max_attempts THEN 'retry_wait' ELSE 'failed' END;
+        wait := interval '30 seconds';
+    ELSE
+        RAISE EXCEPTION 'unknown outcome %', outcome USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    UPDATE control.task AS t
+       SET state            = next_state,
+           attempt          = cur.attempt,
+           not_before       = CASE WHEN next_state = 'retry_wait' THEN now() + wait ELSE t.not_before END,
+           lease_token      = NULL,
+           last_lease_token = report_outcome.lease_token,
+           lease_owner      = NULL,
+           lease_expires_at = NULL,
+           outcome          = CASE WHEN report_outcome.error_class = 'Interrupted' THEN t.outcome
+                                   ELSE report_outcome.outcome END,
+           error_class      = report_outcome.error_class,
+           error_type       = report_outcome.error_type,
+           error_message    = report_outcome.error_message,
+           rows_fetched     = report_outcome.rows_fetched,
+           rows_written     = report_outcome.rows_written,
+           rows_rejected    = report_outcome.rows_rejected,
+           duration_ms      = report_outcome.duration_ms,
+           finished_at      = now()
+     WHERE t.id = report_outcome.task_id;
+    RETURN next_state;
+END
+$$;
+
+-- Release every running task whose lease expired and whose row is not locked, log each one, and return how many.
+--
+-- Matches rows with state 'running' and lease_expires_at < now(). SKIP LOCKED passes over a row another transaction
+-- holds, such as a fenced Load, so a lease cannot be taken over while that transaction is open; under READ COMMITTED a
+-- row renewed and committed meanwhile fails the recheck. Each released row becomes 'dead_lettered' when attempt >=
+-- max_attempts, else 'pending'; either way not_before = now(), lease_token, lease_owner and lease_expires_at are
+-- cleared, error_class is 'LeaseExpired', outcome, error_type, error_message, rows_fetched, rows_written,
+-- rows_rejected and duration_ms are NULL, and finished_at is now(), so the report columns describe the attempt whose
+-- lease expired, not an earlier one. attempt and last_lease_token keep their earlier values, so the released token is
+-- not in last_lease_token and its holder gets CH001 from control.fence and control.report_outcome. Each released lease
+-- is logged in control.lease_loss with kind 'expired', its token, its lease_owner as worker and a NULL unwind_ms, since
+-- a worker that died cannot log its own loss. A row moved to 'pending' fires task_notify.
+--
+-- Preconditions:
+--     None.
+--
+-- Args:
+--     None.
+--
+-- Returns:
+--     The number of tasks released; 0 when none.
+--
+-- Raises:
+--     Nothing of its own; database errors propagate.
+--
+CREATE OR REPLACE FUNCTION control.expire_leases()
+RETURNS bigint
+LANGUAGE sql AS $$
+    WITH expired AS (
+        SELECT q.id, q.lease_token, q.lease_owner
+          FROM control.task AS q
+         WHERE q.state = 'running' AND q.lease_expires_at < now()
+           FOR UPDATE SKIP LOCKED
+    ), released AS (
+        UPDATE control.task AS t
+           SET state            = CASE WHEN t.attempt >= t.max_attempts THEN 'dead_lettered' ELSE 'pending' END,
+               not_before       = now(),
+               lease_token      = NULL,
+               lease_owner      = NULL,
+               lease_expires_at = NULL,
+               error_class      = 'LeaseExpired',
+               outcome          = NULL,
+               error_type       = NULL,
+               error_message    = NULL,
+               rows_fetched     = NULL,
+               rows_written     = NULL,
+               rows_rejected    = NULL,
+               duration_ms      = NULL,
+               finished_at      = now()
+          FROM expired AS e
+         WHERE t.id = e.id
+        RETURNING e.id, e.lease_token, e.lease_owner
+    ), logged AS (
+        INSERT INTO control.lease_loss (task_id, lease_token, kind, worker, unwind_ms)
+        SELECT r.id, r.lease_token, 'expired', r.lease_owner, NULL FROM released AS r
+        RETURNING 1
+    )
+    SELECT count(*) FROM logged
+$$;
+
+CREATE TABLE control.job (
+    job       text PRIMARY KEY CHECK (job <> ''),                     -- the job's name, as control.task.job
+    connector text NOT NULL CHECK (connector <> ''),                  -- the connector its endpoint belongs to
+    partition text NOT NULL CHECK (partition IN ('day', 'none'))      -- how its tasks slice the endpoint
+);
+COMMENT ON TABLE control.job IS
+    'Jobs the workers run. Grain: one row per job. Writer: control.publish_registry. Layer: control.';
+
+CREATE TABLE control.source (
+    connector text    NOT NULL CHECK (connector <> ''),
+    source_id uuid    NOT NULL,
+    label     text    NOT NULL CHECK (label <> ''),                   -- a readable name, shown instead of the UUID
+    in_all    boolean NOT NULL,                                       -- false: only a task that names it runs on it
+    PRIMARY KEY (connector, source_id)
+);
+COMMENT ON TABLE control.source IS
+    'Sources the workers serve. Grain: one row per connector and source. Writer: control.publish_registry. Layer: control.';
+
+CREATE FUNCTION control.publish_registry(
+    jobs text[], job_connectors text[], job_partitions text[],
+    source_connectors text[], source_ids uuid[], source_labels text[], source_in_all boolean[]
+)
+RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF jobs IS NULL OR job_connectors IS NULL OR job_partitions IS NULL
+       OR cardinality(jobs) <> cardinality(job_connectors) OR cardinality(jobs) <> cardinality(job_partitions) THEN
+        RAISE EXCEPTION 'the job arrays must be given and of one length'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF source_connectors IS NULL OR source_ids IS NULL OR source_labels IS NULL OR source_in_all IS NULL
+       OR cardinality(source_connectors) <> cardinality(source_ids)
+       OR cardinality(source_connectors) <> cardinality(source_labels)
+       OR cardinality(source_connectors) <> cardinality(source_in_all) THEN
+        RAISE EXCEPTION 'the source arrays must be given and of one length'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    -- One publisher at a time; readers (create_tasks) are not blocked, and a FOR SHARE reader holds it off.
+    LOCK TABLE control.job, control.source IN SHARE ROW EXCLUSIVE MODE;
+    DELETE FROM control.job;
+    DELETE FROM control.source;
+    INSERT INTO control.job (job, connector, partition)
+    SELECT j.job, j.connector, j.partition
+      FROM unnest(publish_registry.jobs, publish_registry.job_connectors, publish_registry.job_partitions)
+           AS j (job, connector, partition);
+    INSERT INTO control.source (connector, source_id, label, in_all)
+    SELECT s.connector, s.source_id, s.label, s.in_all
+      FROM unnest(publish_registry.source_connectors, publish_registry.source_ids, publish_registry.source_labels,
+                  publish_registry.source_in_all)
+           AS s (connector, source_id, label, in_all);
+END
+$$;
+
+CREATE FUNCTION control._check_keys(connector text, job text, source_ids uuid[], partition_keys text[])
+RETURNS text
+LANGUAGE plpgsql AS $$
+#variable_conflict use_column
+DECLARE
+    kind text;
+    bad  text;
+BEGIN
+    SELECT j.partition INTO kind
+      FROM control.job AS j
+     WHERE j.job = _check_keys.job AND j.connector = _check_keys.connector
+       FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'job % is not published for connector %', _check_keys.job, _check_keys.connector
+            USING ERRCODE = 'CH003';
+    END IF;
+
+    SELECT string_agg(coalesce(i.id::text, 'NULL'), ', ' ORDER BY i.id::text) INTO bad
+      FROM (SELECT DISTINCT u.id FROM unnest(_check_keys.source_ids) AS u (id)) AS i
+     WHERE NOT EXISTS (SELECT FROM control.source AS s
+                        WHERE s.connector = _check_keys.connector AND s.source_id = i.id);
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'sources not published for connector %: %', _check_keys.connector, bad
+            USING ERRCODE = 'CH004';
+    END IF;
+    PERFORM FROM control.source AS s
+      WHERE s.connector = _check_keys.connector AND s.source_id = ANY (_check_keys.source_ids)
+        FOR SHARE;
+
+    SELECT string_agg(coalesce(k.key, 'NULL'), ', ' ORDER BY k.key) INTO bad
+      FROM (SELECT DISTINCT u.key FROM unnest(_check_keys.partition_keys) AS u (key)) AS k
+     WHERE k.key IS NULL
+        OR CASE kind
+               WHEN 'none' THEN k.key <> 'none'
+               ELSE NOT (k.key ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                         AND pg_input_is_valid(k.key, 'date')
+                         AND to_char(k.key::date, 'YYYY-MM-DD') = k.key)
+           END;
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'partition keys that do not fit job %''s % partition: %', _check_keys.job, kind, bad
+            USING ERRCODE = 'CH005';
+    END IF;
+    RETURN kind;
+END
+$$;
+
+CREATE FUNCTION control._live_task(
+    run_id bigint, connector text, job text, source_id uuid, partition_key text, priority int, max_attempts int,
+    trace_context text, OUT task_id bigint, OUT created boolean
+)
+LANGUAGE plpgsql AS $$
+#variable_conflict use_column
+BEGIN
+    LOOP
+        INSERT INTO control.task (run_id, connector, job, source_id, partition_key, priority, max_attempts,
+                                  trace_context)
+        VALUES (_live_task.run_id, _live_task.connector, _live_task.job, _live_task.source_id,
+                _live_task.partition_key, _live_task.priority, _live_task.max_attempts, _live_task.trace_context)
+        ON CONFLICT (connector, job, source_id, partition_key)
+           WHERE state IN ('pending', 'running', 'retry_wait', 'blocked')
+           DO NOTHING
+        RETURNING id INTO _live_task.task_id;
+        IF FOUND THEN
+            _live_task.created := true;
+            RETURN;
+        END IF;
+        SELECT t.id INTO _live_task.task_id
+          FROM control.task AS t
+         WHERE t.connector = _live_task.connector AND t.job = _live_task.job
+           AND t.source_id = _live_task.source_id AND t.partition_key = _live_task.partition_key
+           AND t.state IN ('pending', 'running', 'retry_wait', 'blocked');
+        IF FOUND THEN
+            _live_task.created := false;
+            RETURN;
+        END IF;
+        -- The live task finished between the insert and the select: try the insert again.
+    END LOOP;
+END
+$$;
+
+CREATE FUNCTION control.create_tasks(
+    run_id bigint, connector text, job text, source_ids uuid[], partition_keys text[], priorities int[],
+    max_attempts int, trace_context text
+)
+RETURNS TABLE (source_id uuid, partition_key text, task_id bigint, created boolean)
+LANGUAGE plpgsql AS $$
+#variable_conflict use_column
+DECLARE
+    k record;
+    l record;
+BEGIN
+    IF create_tasks.source_ids IS NULL OR create_tasks.partition_keys IS NULL OR create_tasks.priorities IS NULL
+       OR cardinality(create_tasks.partition_keys) <> cardinality(create_tasks.priorities) THEN
+        RAISE EXCEPTION 'source_ids, partition_keys and priorities must be given, one priority per partition key'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    PERFORM control._check_keys(create_tasks.connector, create_tasks.job, create_tasks.source_ids,
+                                create_tasks.partition_keys);
+    FOR k IN
+        SELECT DISTINCT ON (s.id, p.key) s.id, p.key, p.priority
+          FROM unnest(create_tasks.source_ids) AS s (id),
+               unnest(create_tasks.partition_keys, create_tasks.priorities) WITH ORDINALITY AS p (key, priority, n)
+         ORDER BY s.id, p.key, p.n
+    LOOP
+        l := control._live_task(create_tasks.run_id, create_tasks.connector, create_tasks.job, k.id, k.key,
+                                k.priority, create_tasks.max_attempts, create_tasks.trace_context);
+        create_tasks.source_id := k.id;
+        create_tasks.partition_key := k.key;
+        create_tasks.task_id := l.task_id;
+        create_tasks.created := l.created;
+        RETURN NEXT;
+    END LOOP;
+END
+$$;
+
+CREATE FUNCTION control.cancel_tasks(task_ids bigint[])
+RETURNS TABLE (task_id bigint)
+LANGUAGE sql AS $$
+    UPDATE control.task AS t
+       SET state       = 'cancelled',
+           finished_at = now()
+     WHERE t.id = ANY (cancel_tasks.task_ids)
+       AND t.state IN ('pending', 'retry_wait')
+    RETURNING t.id
+$$;
+
+CREATE FUNCTION control.rerun_task(task_id bigint, run_id bigint, trace_context text)
+RETURNS TABLE (new_task_id bigint, created boolean)
+LANGUAGE plpgsql AS $$
+#variable_conflict use_column
+DECLARE
+    prev control.task%ROWTYPE;
+    l    record;
+BEGIN
+    SELECT * INTO prev FROM control.task AS t WHERE t.id = rerun_task.task_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'task % does not exist', rerun_task.task_id USING ERRCODE = 'CH007';
+    END IF;
+    IF prev.state IN ('pending', 'running', 'retry_wait') THEN
+        RAISE EXCEPTION 'task % is %, so it cannot be re-run', rerun_task.task_id, prev.state
+            USING ERRCODE = 'CH006';
+    END IF;
+    PERFORM control._check_keys(prev.connector, prev.job, ARRAY[prev.source_id], ARRAY[prev.partition_key]);
+    IF prev.state = 'blocked' THEN
+        UPDATE control.task AS t
+           SET state = 'cancelled', finished_at = now()
+         WHERE t.id = prev.id;
+    END IF;
+    l := control._live_task(rerun_task.run_id, prev.connector, prev.job, prev.source_id, prev.partition_key,
+                            prev.priority, prev.max_attempts, rerun_task.trace_context);
+    rerun_task.new_task_id := l.task_id;
+    rerun_task.created := l.created;
+    RETURN NEXT;
+END
+$$;
+
+CREATE FUNCTION control.task_states(task_ids bigint[])
+RETURNS TABLE (
+    task_id bigint, connector text, job text, source_id uuid, partition_key text, state text, attempt int,
+    max_attempts int, outcome text, error_class text, error_type text, error_message text, rows_fetched bigint,
+    rows_written bigint, rows_rejected bigint, duration_ms bigint, started_at timestamptz, finished_at timestamptz,
+    trace_context text
+)
+LANGUAGE sql STABLE AS $$
+    SELECT t.id, t.connector, t.job, t.source_id, t.partition_key, t.state, t.attempt, t.max_attempts, t.outcome,
+           t.error_class, t.error_type, t.error_message, t.rows_fetched, t.rows_written, t.rows_rejected,
+           t.duration_ms, t.started_at, t.finished_at, t.trace_context
+      FROM control.task AS t
+     WHERE t.id = ANY (task_states.task_ids)
+     ORDER BY t.id
+$$;
+
+CREATE FUNCTION control.published_jobs()
+RETURNS TABLE (job text, connector text, partition text)
+LANGUAGE sql STABLE AS $$
+    SELECT j.job, j.connector, j.partition
+      FROM control.job AS j
+     ORDER BY j.job
+$$;
+
+CREATE FUNCTION control.published_sources(of_connector text)
+RETURNS TABLE (connector text, source_id uuid, label text, in_all boolean)
+LANGUAGE sql STABLE AS $$
+    SELECT s.connector, s.source_id, s.label, s.in_all
+      FROM control.source AS s
+     WHERE published_sources.of_connector IS NULL OR s.connector = published_sources.of_connector
+     ORDER BY s.connector, s.source_id
+$$;
