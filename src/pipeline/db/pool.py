@@ -32,6 +32,9 @@ _MAX_REVISION_LENGTH: Final = 32
 
 #: Longest wait for the pool to open, and for a connection to be checked out of it.
 _POOL_TIMEOUT: Final = timedelta(seconds=10)
+#: How long a pool connection may sit unused before the pool closes it (one per interval). The pool keeps no minimum,
+#: so an idle worker holds no warehouse connection and its server process's memory is freed (user 2026-11-27).
+_POOL_MAX_IDLE: Final = timedelta(seconds=30)
 #: Server-side ``statement_timeout`` set on every pool connection.
 _STATEMENT_TIMEOUT: Final = timedelta(seconds=60)
 #: Server-side ``idle_in_transaction_session_timeout`` set on every pool connection.
@@ -139,7 +142,7 @@ async def _configure(conn: Connection) -> None:
 
 
 async def open_pool(settings: Settings) -> Pool:
-    """Open the warehouse connection pool and wait until it is ready.
+    """Open the warehouse connection pool and make one connection, so start-up fails when the warehouse is unreachable.
 
     Every connection the pool creates uses autocommit, takes ``settings.worker_id`` as its ``application_name``, and
     sets ``statement_timeout`` and ``idle_in_transaction_session_timeout`` through the ``options`` connection
@@ -159,23 +162,24 @@ async def open_pool(settings: Settings) -> Pool:
 
     Preconditions:
         Must be awaited inside a running event loop. ``settings.concurrency`` is 1 to 4 and ``settings.worker_id``
-        is non-empty, both guaranteed by ``Settings`` validation, so ``max_size`` (2 to 8) is never below
-        ``min_size``. ``settings.warehouse_url`` starts with ``postgresql://`` or ``postgres://`` and sets none of
-        the parameters named above (``Settings``).
+        is non-empty, both guaranteed by ``Settings`` validation, so ``max_size`` is 2 to 8.
+        ``settings.warehouse_url`` starts with ``postgresql://`` or ``postgres://`` and sets none of the parameters
+        named above (``Settings``).
 
     Args:
         settings: Supplies the connection string (``warehouse_url``), the pool's maximum size
             (``2 * concurrency``) and each connection's ``application_name`` (``worker_id``).
 
     Returns:
-        The opened pool, named ``"warehouse"``, with ``min_size`` 1, ``max_size`` ``2 * settings.concurrency`` and a
-        checkout timeout of ``_POOL_TIMEOUT``.
+        The opened pool, named ``"warehouse"``, with ``min_size`` 0, ``max_size`` ``2 * settings.concurrency``, a
+        checkout timeout of ``_POOL_TIMEOUT`` and ``max_idle`` ``_POOL_MAX_IDLE``: an unused connection is closed after
+        it, so an idle worker holds no warehouse connection.
 
     Raises:
         Exception: Any error from the ``AsyncConnectionPool`` constructor, unchanged, since it runs outside
             ``db_errors``.
-        DatabaseUnavailable: When ``pool.open`` does not have ``min_size`` connections within ``_POOL_TIMEOUT``
-            (``PoolTimeout``), or raises another error in ``db_errors``' unavailable set or a bare
+        DatabaseUnavailable: When the first connection is not made within ``_POOL_TIMEOUT`` (``PoolTimeout``), or
+            ``pool.open`` or that connection raises another error in ``db_errors``' unavailable set or a bare
             ``psycopg.OperationalError``, after ``pool.close``.
         BaseException: Any other exception from ``pool.open``, ``asyncio.CancelledError`` included, after ``db_errors``
             and then ``pool.close`` have run. If ``pool.close`` itself raises, its exception propagates instead, with
@@ -188,8 +192,9 @@ async def open_pool(settings: Settings) -> Pool:
     )
     pool = AsyncConnectionPool(
         settings.warehouse_url.get_secret_value(),
-        min_size=1,
+        min_size=0,
         max_size=2 * settings.concurrency,
+        max_idle=_POOL_MAX_IDLE.total_seconds(),
         timeout=_POOL_TIMEOUT.total_seconds(),
         kwargs={
             "autocommit": True,
@@ -204,7 +209,9 @@ async def open_pool(settings: Settings) -> Pool:
     )
     try:
         with db_errors():
-            await pool.open(wait=True, timeout=_POOL_TIMEOUT.total_seconds())
+            await pool.open()
+            async with pool.connection(timeout=_POOL_TIMEOUT.total_seconds()):
+                pass
     except BaseException:
         await pool.close()
         raise
